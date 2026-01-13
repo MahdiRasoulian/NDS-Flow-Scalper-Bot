@@ -701,8 +701,10 @@ class GoldNDSAnalyzer:
             stop_loss = None
             take_profit = None
             entry_type = "NONE"
+            entry_model = "MARKET"
             entry_source = None
             entry_context = {}
+            entry_idea: Dict[str, Any] = {}
             if signal in ["BUY", "SELL"]:
                 if scalping_mode:
                     flow_entry = self._select_flow_entry(
@@ -716,63 +718,44 @@ class GoldNDSAnalyzer:
                         scalping_mode=scalping_mode,
                         signal_context=signal_context,
                     )
-                    entry_price = flow_entry.get("entry_price")
-                    stop_loss = flow_entry.get("stop_loss")
-                    take_profit = flow_entry.get("take_profit")
+                    entry_price = flow_entry.get("entry_level")
                     entry_type = flow_entry.get("entry_type", "NONE")
+                    entry_model = flow_entry.get("entry_model", "MARKET")
                     entry_source = flow_entry.get("entry_source")
                     entry_context = flow_entry.get("entry_context", {}) or {}
+                    entry_idea = {
+                        "signal": flow_entry.get("signal", "NONE"),
+                        "entry_type": entry_type,
+                        "entry_model": entry_model,
+                        "entry_level": entry_price,
+                        "zone": entry_source,
+                        "confidence": flow_entry.get("entry_confidence", 0.0),
+                        "reason": flow_entry.get("entry_reason", "-"),
+                    }
                     if flow_entry.get("entry_reason"):
                         reasons.append(flow_entry["entry_reason"])
 
-                    metrics = None
-                    if entry_price is not None:
-                        metrics = calculate_distance_metrics(
-                            entry_price=entry_price,
-                            current_price=current_close,
-                            point_size=self._get_point_size(),
-                            atr_value=atr_for_scoring,
-                        )
-                        self._log_info(
-                            "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f dist_price=%.4f point=%.4f "
-                            "dist_points=%.2f dist_pips=%.2f dist_usd=%.4f dist_atr=%s",
-                            entry_type,
-                            float(entry_price),
-                            float(current_close),
-                            float(metrics.get("dist_price") or 0.0),
-                            float(metrics.get("point_size") or 0.0),
-                            float(metrics.get("dist_points") or 0.0),
-                            float(metrics.get("dist_pips") or 0.0),
-                            float(metrics.get("dist_usd") or 0.0),
-                            metrics.get("dist_atr"),
-                        )
-
                     self._log_info(
-                        "[NDS][FLOW_ENTRY] type=%s signal=%s reason=%s conf=%.1f",
+                        "[NDS][FLOW_ENTRY] type=%s model=%s signal=%s reason=%s conf=%.1f",
                         entry_type,
+                        entry_model,
                         flow_entry.get("signal", "NONE"),
                         flow_entry.get("entry_reason", "-"),
                         confidence,
                     )
 
-                    if entry_price is None or stop_loss is None or take_profit is None:
+                    if entry_price is None:
                         self._log_info(
-                            "[NDS][FLOW_ENTRY] trade skipped: missing entry (entry=%s stop=%s tp=%s)",
+                            "[NDS][FLOW_ENTRY] trade skipped: missing entry_level (entry=%s)",
                             entry_price,
-                            stop_loss,
-                            take_profit,
                         )
                         signal = "NONE"
                         entry_price = None
-                        stop_loss = None
-                        take_profit = None
                         entry_type = "NONE"
+                        entry_model = "MARKET"
                         entry_source = None
                         reasons.append("Trade skipped: no eligible Flow zone or momentum breakout.")
                         result_payload["signal"] = "NONE"
-                    else:
-                        if metrics:
-                            entry_context.update(metrics)
                 else:
                     entry_idea = self._build_entry_idea(
                         signal=signal,
@@ -784,27 +767,23 @@ class GoldNDSAnalyzer:
                         current_price=current_close,
                         adx_value=adx_v,
                     )
-                    entry_price = entry_idea.get("entry_price")
-                    stop_loss = entry_idea.get("stop_loss")
-                    take_profit = entry_idea.get("take_profit")
-                    entry_type = entry_idea.get("source", "LEGACY")
+                    entry_price = entry_idea.get("entry_level")
+                    entry_type = entry_idea.get("entry_type", "LEGACY")
+                    entry_model = entry_idea.get("entry_model", "MARKET")
                     entry_source = entry_idea.get("zone_meta")
                     entry_context = entry_idea.get("metrics", {}) or {}
                     if entry_idea.get("reason"):
                         reasons.append(entry_idea["reason"])
 
-                    if entry_price is None or stop_loss is None or take_profit is None:
+                    if entry_price is None:
                         self._log_info(
-                            "[NDS][ENTRY_IDEA] trade skipped: missing zone (entry=%s stop=%s tp=%s) -> signal NONE",
+                            "[NDS][ENTRY_IDEA] trade skipped: missing zone (entry=%s) -> signal NONE",
                             entry_price,
-                            stop_loss,
-                            take_profit,
                         )
                         signal = "NONE"
                         entry_price = None
-                        stop_loss = None
-                        take_profit = None
                         entry_type = "NONE"
+                        entry_model = "MARKET"
                         entry_source = None
                         reasons.append("Trade skipped: no valid entry zone (FVG/OB) and fallback not allowed.")
                         result_payload["signal"] = "NONE"
@@ -814,13 +793,28 @@ class GoldNDSAnalyzer:
                     confidence,
                 )
 
+            if not entry_idea:
+                entry_idea = {
+                    "signal": "NONE",
+                    "entry_type": "NONE",
+                    "entry_model": "MARKET",
+                    "entry_level": None,
+                    "zone": None,
+                    "confidence": 0.0,
+                    "reason": "no_entry",
+                }
+
             try:
                 if "context" not in result_payload or result_payload.get("context") is None:
                     result_payload["context"] = {}
                 result_payload["entry_type"] = entry_type
+                result_payload["entry_model"] = entry_model
+                result_payload["entry_idea"] = entry_idea
                 result_payload["entry_source"] = entry_source
                 result_payload["entry_context"] = entry_context
                 result_payload["context"]["entry_type"] = entry_type
+                result_payload["context"]["entry_model"] = entry_model
+                result_payload["context"]["entry_idea"] = entry_idea
                 result_payload["context"]["entry_source"] = entry_source
                 result_payload["context"]["entry_context"] = entry_context
             except Exception as _ctx_e:
@@ -901,7 +895,15 @@ class GoldNDSAnalyzer:
         except Exception:
             return 0.001
 
-    def _is_time_in_window(self, ts: datetime, start_str: str, end_str: str) -> bool:
+    def _normalize_session_name(self, session_name: str) -> str:
+        if not session_name:
+            return "OTHER"
+        normalized = SESSION_MAPPING.get(session_name, session_name)
+        if normalized == "OVERLAP_PEAK":
+            normalized = "OVERLAP"
+        return normalized
+
+    def _is_time_in_window(self, ts: datetime, start_str: str, end_str: str) -> Tuple[bool, Optional[str]]:
         """Check if timestamp is within [start, end) window (supports midnight wrap)."""
         try:
             start_parts = [int(p) for p in str(start_str).split(":")]
@@ -911,14 +913,14 @@ class GoldNDSAnalyzer:
             start_t = time(start_h, start_m)
             end_t = time(end_h, end_m)
             now_t = ts.time()
-        except Exception:
-            return True
+        except Exception as exc:
+            return False, f"time_parse_failed:{exc}"
 
         if start_t == end_t:
-            return False
+            return False, "time_window_zero"
         if start_t < end_t:
-            return start_t <= now_t < end_t
-        return now_t >= start_t or now_t < end_t
+            return (start_t <= now_t < end_t), None
+        return (now_t >= start_t or now_t < end_t), None
 
     def _compute_scalping_sl_tp(
         self,
@@ -1020,10 +1022,9 @@ class GoldNDSAnalyzer:
             return {
                 "signal": "NONE",
                 "entry_type": "NONE",
+                "entry_model": "MARKET",
+                "entry_level": None,
                 "entry_source": None,
-                "entry_price": None,
-                "stop_loss": None,
-                "take_profit": None,
                 "entry_reason": "signal=NONE",
                 "entry_context": {},
             }
@@ -1031,6 +1032,20 @@ class GoldNDSAnalyzer:
         settings = self.GOLD_SETTINGS
         point_size = self._get_point_size()
         entry_context: Dict[str, Any] = {}
+
+        recent_slice = self.df.tail(2)
+        recent_low = float(recent_slice["low"].min()) if not recent_slice.empty else None
+        recent_high = float(recent_slice["high"].max()) if not recent_slice.empty else None
+
+        spread = volume_analysis.get("spread")
+        spread_buffer = 0.0
+        if spread is not None:
+            try:
+                spread_buffer = float(spread) * 1.2
+            except Exception:
+                spread_buffer = 0.0
+        atr_buffer = float(atr_value) * 0.05 if atr_value else 0.0
+        buffer_price = max(spread_buffer, atr_buffer)
 
         breakers = getattr(structure, "breakers", []) or []
         ifvgs = getattr(structure, "inversion_fvgs", []) or []
@@ -1050,9 +1065,32 @@ class GoldNDSAnalyzer:
                 age = int(zone.get("age_bars", 9999))
                 if dist_atr <= max_dist_atr and age <= max_age:
                     confidence = float(zone.get("confidence", 0.0))
+                    touch_count = int(zone.get("touch_count", 1))
+                    freshness_penalty = float(settings.get("FLOW_TOUCH_PENALTY", 0.55))
                     util = confidence - (0.5 * dist_atr) - (0.1 * (age / max_age if max_age > 0 else 1.0))
+                    if touch_count > 1:
+                        util *= freshness_penalty
                     candidates.append({**zone, "dist_atr": dist_atr, "util": util})
             return candidates
+
+        def _resolve_entry_model(side: str, top: float, bottom: float) -> Tuple[str, float, str]:
+            if side == "BUY":
+                if bottom <= current_price <= top:
+                    return "MARKET", float(current_price), "price_inside_zone"
+                if current_price < bottom:
+                    stop_level = float(bottom) + buffer_price
+                    if stop_level <= current_price:
+                        return "MARKET", float(current_price), "stop_below_market"
+                    return "STOP", stop_level, "price_below_zone"
+                return "MARKET", float(current_price), "price_above_zone"
+            if bottom <= current_price <= top:
+                return "MARKET", float(current_price), "price_inside_zone"
+            if current_price > top:
+                stop_level = float(top) - buffer_price
+                if stop_level >= current_price:
+                    return "MARKET", float(current_price), "stop_above_market"
+                return "STOP", stop_level, "price_above_zone"
+            return "MARKET", float(current_price), "price_below_zone"
 
         brk_max_dist = float(settings.get("BRK_MAX_DIST_ATR", 0.5))
         brk_max_age = int(settings.get("BRK_MAX_AGE_BARS", 60))
@@ -1086,32 +1124,46 @@ class GoldNDSAnalyzer:
 
         entry_type = "NONE"
         entry_source = None
-        entry_price = None
+        entry_model = "MARKET"
+        entry_level = None
         entry_reason = "no_zone"
+        tier = "NONE"
+        entry_confidence = 0.0
 
         if brk_candidates:
             pick = max(brk_candidates, key=lambda z: float(z.get("util", 0.0)))
             entry_type = "BREAKER"
-            entry_price = float(pick.get("mid"))
             entry_source = pick
-            entry_reason = "tier=A breaker retest"
+            entry_model, entry_level, entry_reason = _resolve_entry_model(signal, float(pick.get("top")), float(pick.get("bottom")))
+            entry_reason = f"tier=A breaker retest ({entry_reason})"
+            tier = "A"
+            entry_confidence = float(pick.get("confidence", 0.0))
         elif ifvg_candidates:
             pick = max(ifvg_candidates, key=lambda z: float(z.get("util", 0.0)))
             entry_type = "IFVG"
-            entry_price = float(pick.get("mid"))
             entry_source = pick
-            entry_reason = "tier=B inversion fvg"
+            entry_model, entry_level, entry_reason = _resolve_entry_model(signal, float(pick.get("top")), float(pick.get("bottom")))
+            entry_reason = f"tier=B inversion fvg ({entry_reason})"
+            tier = "B"
+            entry_confidence = float(pick.get("confidence", 0.0))
 
         momentum_reason = None
-        if entry_price is None:
+        if entry_level is None:
             momo_adx_min = float(settings.get("MOMO_ADX_MIN", 35.0))
             time_start = settings.get("MOMO_TIME_START", "10:00")
             time_end = settings.get("MOMO_TIME_END", "18:00")
             session_only = bool(settings.get("MOMO_SESSION_ONLY", True))
 
             now_ts = self.df["time"].iloc[-1]
-            in_window = self._is_time_in_window(now_ts, time_start, time_end)
-            session_name = getattr(session_analysis, "current_session", "OTHER")
+            in_window, time_error = self._is_time_in_window(now_ts, time_start, time_end)
+            if time_error:
+                momentum_reason = f"time_block:{time_error}"
+                self._log_info("[NDS][FLOW_TIER] tier=C momentum blocked (%s)", momentum_reason)
+                in_window = False
+
+            session_name = self._normalize_session_name(
+                getattr(session_analysis, "current_session", "OTHER")
+            )
             session_ok = True
             if session_only:
                 session_ok = session_name in {"LONDON", "NEW_YORK", "OVERLAP"}
@@ -1121,29 +1173,35 @@ class GoldNDSAnalyzer:
             if market_status in {"CLOSED", "HALTED"}:
                 liquidity_ok = False
 
-            if adx_value >= momo_adx_min and in_window and session_ok and liquidity_ok:
+            strong_trend = bool(signal_context.get("strong_trend"))
+            time_ok = in_window or (strong_trend and time_error is None)
+
+            if adx_value >= momo_adx_min and time_ok and (session_ok or strong_trend) and liquidity_ok:
                 buffer_atr = float(settings.get("MOMO_BUFFER_ATR_MULT", 0.1))
                 buffer_min_pips = float(settings.get("MOMO_BUFFER_MIN_PIPS", 1.0))
                 buffer_price = pips_to_price(buffer_min_pips, point_size)
                 if atr_value > 0:
                     buffer_price = max(buffer_price, float(atr_value) * buffer_atr)
-
-                spread = volume_analysis.get("spread")
-                if spread is not None:
-                    try:
-                        buffer_price = max(buffer_price, float(spread))
-                    except Exception:
-                        pass
-
                 prev_high = float(self.df["high"].iloc[-2])
                 prev_low = float(self.df["low"].iloc[-2])
                 if signal == "BUY":
-                    entry_price = prev_high + buffer_price
+                    entry_level = prev_high + buffer_price
+                    if current_price >= entry_level:
+                        entry_model = "MARKET"
+                        entry_reason = "tier=C momentum triggered"
+                    else:
+                        entry_model = "STOP"
+                        entry_reason = "tier=C momentum breakout"
                 else:
-                    entry_price = prev_low - buffer_price
+                    entry_level = prev_low - buffer_price
+                    if current_price <= entry_level:
+                        entry_model = "MARKET"
+                        entry_reason = "tier=C momentum triggered"
+                    else:
+                        entry_model = "STOP"
+                        entry_reason = "tier=C momentum breakout"
 
                 entry_type = "MOMENTUM"
-                entry_reason = "tier=C momentum breakout"
                 entry_source = {
                     "type": "MOMENTUM_BREAKOUT",
                     "prev_high": prev_high,
@@ -1152,6 +1210,8 @@ class GoldNDSAnalyzer:
                     "time_window": f"{time_start}-{time_end}",
                     "session": session_name,
                 }
+                tier = "C"
+                entry_confidence = min(1.0, max(0.35, float(adx_value) / max(momo_adx_min, 1.0)))
             else:
                 momentum_reason = (
                     f"adx={adx_value:.1f}/{momo_adx_min:.1f} "
@@ -1159,39 +1219,48 @@ class GoldNDSAnalyzer:
                 )
                 self._log_debug("[NDS][FLOW_TIER] tier=C momentum skipped (%s)", momentum_reason)
 
-        if entry_price is None:
+        if entry_level is None:
             entry_reason = entry_reason if momentum_reason is None else f"{entry_reason}; momo_block={momentum_reason}"
 
-        stop_loss = None
-        take_profit = None
-        tp2_price = None
-        tp2_pips = None
-        if entry_price is not None:
-            sl_tp = self._compute_scalping_sl_tp(signal, entry_price, atr_value)
-            stop_loss = sl_tp.get("stop_loss")
-            take_profit = sl_tp.get("take_profit")
-            tp2_price = sl_tp.get("tp2_price")
-            tp2_pips = sl_tp.get("tp2_pips")
-            entry_context.update(sl_tp)
+        if entry_level is not None:
+            entry_context.update(
+                self._calc_entry_distance_metrics(
+                    entry_price=float(entry_level),
+                    current_price=float(current_price),
+                    symbol_meta={"point_size": point_size},
+                    atr_value=atr_value,
+                )
+            )
 
         entry_context.update(
             {
                 "point_size": point_size,
                 "momentum_reason": momentum_reason,
+                "buffer_price": buffer_price,
+                "recent_low": recent_low,
+                "recent_high": recent_high,
             }
         )
 
+        allowed = entry_level is not None
+        self._log_info(
+            "[NDS][FLOW_DECISION] tier=%s type=%s entry_model=%s allowed=%s reason=%s",
+            tier,
+            entry_type,
+            entry_model,
+            allowed,
+            entry_reason,
+        )
+
         return {
-            "signal": signal if entry_price is not None else "NONE",
-            "entry_type": entry_type if entry_price is not None else "NONE",
+            "signal": signal if entry_level is not None else "NONE",
+            "entry_type": entry_type if entry_level is not None else "NONE",
+            "entry_model": entry_model,
+            "entry_level": entry_level,
             "entry_source": entry_source,
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "tp2_price": tp2_price,
-            "tp2_pips": tp2_pips,
             "entry_reason": entry_reason,
             "entry_context": entry_context,
+            "entry_confidence": entry_confidence,
         }
 
     def _calc_entry_distance_metrics(
@@ -2491,9 +2560,10 @@ class GoldNDSAnalyzer:
         """
 
         idea = {
+            "entry_level": None,
             "entry_price": None,
-            "stop_loss": None,
-            "take_profit": None,
+            "entry_model": "MARKET",
+            "entry_type": "LEGACY",
             "reason": None,
         }
 
@@ -2650,90 +2720,36 @@ class GoldNDSAnalyzer:
         # -------------------------
         # Finalize trade (کد شما حفظ شده)
         # -------------------------
-        def finalize_trade(entry: float, stop: float, target: Optional[float], reason: str) -> Dict[str, Optional[float]]:
-            """Finalize and validate trade idea geometry.
-
-            Hard guarantees:
-            BUY:  stop < entry < target
-            SELL: target < entry < stop
-
-            If SL is on the wrong side due to swing-anchor/structure issues, we correct it to a
-            minimum ATR-based distance. If geometry still invalid, we invalidate the idea.
-            """
-            if entry is None or stop is None:
-                idea["reason"] = "Invalid entry/stop (None)"
+        def finalize_trade(entry: float, reason: str) -> Dict[str, Optional[float]]:
+            """Finalize entry idea without execution/risk calculations."""
+            if entry is None:
+                idea["reason"] = "Invalid entry (None)"
                 self._log_info("[NDS][ENTRY_IDEA][INVALID] %s", idea["reason"])
                 return idea
 
             entry = float(entry)
-            stop = float(stop)
-
-            # Minimum stop distance (guardrail)
-            min_stop = self._min_stop_distance(atr_value)
-
-            # Enforce SL side (correct if needed)
-            if signal == "BUY":
-                if stop >= entry - 1e-9:
-                    corrected = entry - min_stop
-                    self._log_info(
-                        "[NDS][ENTRY_IDEA][FIX] BUY stop was not below entry: stop=%.2f entry=%.2f -> stop=%.2f (min_stop=%.2f)",
-                        stop,
-                        entry,
-                        corrected,
-                        min_stop,
-                    )
-                    stop = corrected
-            else:  # SELL
-                if stop <= entry + 1e-9:
-                    corrected = entry + min_stop
-                    self._log_info(
-                        "[NDS][ENTRY_IDEA][FIX] SELL stop was not above entry: stop=%.2f entry=%.2f -> stop=%.2f (min_stop=%.2f)",
-                        stop,
-                        entry,
-                        corrected,
-                        min_stop,
-                    )
-                    stop = corrected
-
-            risk = abs(entry - stop)
-            if risk <= 0:
-                idea["reason"] = f"Invalid risk: entry={entry:.2f} stop={stop:.2f}"
-                self._log_info("[NDS][ENTRY_IDEA][INVALID] %s", idea["reason"])
-                return idea
-
-            # Build/adjust TP
-            if target is None:
-                if signal == "BUY":
-                    target = entry + risk * tp_multiplier
-                else:
-                    target = entry - risk * tp_multiplier
-
-            target = float(target)
-
-            # Enforce minimum RR
-            rr_target = entry + risk * min_rr if signal == "BUY" else entry - risk * min_rr
-            if signal == "BUY":
-                target = max(target, rr_target)
-            else:
-                target = min(target, rr_target)
-
-            # Final geometry validation
-            if signal == "BUY":
-                valid = (stop < entry < target)
-            else:
-                valid = (target < entry < stop)
-
-            if not valid:
-                idea["reason"] = f"Invalid geometry for {signal}: tp={target:.2f} entry={entry:.2f} sl={stop:.2f}"
-                self._log_info("[NDS][ENTRY_IDEA][INVALID] %s", idea["reason"])
-                return idea
-
+            idea["entry_level"] = entry
             idea["entry_price"] = entry
-            idea["stop_loss"] = stop
-            idea["take_profit"] = target
             idea["reason"] = reason
 
-            # محاسبه فاصله entry از قیمت جاری
+            zone_meta = idea.get("zone_meta") or {}
+            top = zone_meta.get("top")
+            bottom = zone_meta.get("bottom")
+            if top is None:
+                top = zone_meta.get("high")
+            if bottom is None:
+                bottom = zone_meta.get("low")
+            if top is not None and bottom is not None:
+                try:
+                    top_f = float(top)
+                    bottom_f = float(bottom)
+                    if bottom_f <= float(current_price) <= top_f:
+                        idea["entry_model"] = "MARKET"
+                    else:
+                        idea["entry_model"] = "STOP"
+                except Exception:
+                    pass
+
             entry_metrics = self._calc_entry_distance_metrics(
                 entry_price=entry,
                 current_price=current_price,
@@ -2759,17 +2775,12 @@ class GoldNDSAnalyzer:
                 entry_metrics.get("dist_atr"),
             )
 
-            # لاگ تکمیلی برای Deviation
             self._log_info(
-                "[NDS][ENTRY_IDEA] finalized signal=%s src=%s entry=%.2f sl=%.2f tp=%.2f "
-                "risk=%.2f rr=%.2f dist_pips=%s dist_atr=%s reason=%s",
+                "[NDS][ENTRY_IDEA] finalized signal=%s src=%s entry=%.2f model=%s dist_pips=%s dist_atr=%s reason=%s",
                 signal,
                 idea.get("source", "NONE"),
                 entry,
-                stop,
-                target,
-                risk,
-                (abs(target - entry) / risk) if risk > 0 else 0.0,
+                idea.get("entry_model", "MARKET"),
                 idea.get("entry_distance_pips"),
                 idea.get("entry_distance_atr"),
                 reason,
@@ -2925,6 +2936,7 @@ class GoldNDSAnalyzer:
 
                 # متادیتا
                 idea["source"] = "FVG"
+                idea["entry_type"] = "FVG"
                 idea["zone_meta"] = {
                     "type": (getattr(f, "type").value if hasattr(getattr(f, "type", None), "value") else str(getattr(f, "type", "FVG"))),
                     "index": best_fvg_meta["index"],
@@ -2937,20 +2949,15 @@ class GoldNDSAnalyzer:
                     "util": float(best_fvg_meta["util"]),
                 }
 
-                # entry/stop/target همان منطق شما
                 fvg_height = abs(float(best_fvg_meta["top"]) - float(best_fvg_meta["bottom"]))
                 entry = float(best_fvg_meta["top"]) - (fvg_height * float(entry_factor))
-                stop = (float(swing_anchor) - float(atr_value) * float(buffer_mult)) if swing_anchor else float(best_fvg_meta["bottom"]) - (float(atr_value) * 0.5)
-                target = float(best_fvg_meta["top"]) + (fvg_height * float(tp_multiplier))
 
                 self._log_debug(
-                    "[NDS][ENTRY_IDEA][PRE] src=FVG signal=BUY entry=%.2f stop=%.2f target=%.2f fvg_height=%.2f",
+                    "[NDS][ENTRY_IDEA][PRE] src=FVG signal=BUY entry=%.2f fvg_height=%.2f",
                     entry,
-                    stop,
-                    target,
                     fvg_height,
                 )
-                return finalize_trade(entry, stop, target, f"Bullish FVG idea (util={best_fvg_meta['util']:.3f}, strength={best_fvg_meta['strength']:.1f})")
+                return finalize_trade(entry, f"Bullish FVG idea (util={best_fvg_meta['util']:.3f}, strength={best_fvg_meta['strength']:.1f})")
 
             # ---------- OB BUY selection (distance/age/stale aware) ----------
             ob_rej = {}
@@ -3025,6 +3032,7 @@ class GoldNDSAnalyzer:
                 )
 
                 idea["source"] = "OB"
+                idea["entry_type"] = "OB"
                 idea["zone_meta"] = {
                     "type": getattr(ob, "type", "BULLISH_OB"),
                     "index": best_ob_meta["index"],
@@ -3038,16 +3046,11 @@ class GoldNDSAnalyzer:
                 }
 
                 entry = float(best_ob_meta["low"]) + (float(best_ob_meta["high"]) - float(best_ob_meta["low"])) * 0.3
-                stop = (float(swing_anchor) - float(atr_value) * float(buffer_mult)) if swing_anchor else float(best_ob_meta["low"]) - (float(atr_value) * 0.5)
-                target = float(best_ob_meta["high"]) + (float(best_ob_meta["high"]) - float(best_ob_meta["low"])) * float(tp_multiplier)
-
                 self._log_debug(
-                    "[NDS][ENTRY_IDEA][PRE] src=OB signal=BUY entry=%.2f stop=%.2f target=%.2f",
+                    "[NDS][ENTRY_IDEA][PRE] src=OB signal=BUY entry=%.2f",
                     entry,
-                    stop,
-                    target,
                 )
-                return finalize_trade(entry, stop, target, f"Bullish OB idea (util={best_ob_meta['util']:.3f}, strength={best_ob_meta['strength']:.1f})")
+                return finalize_trade(entry, f"Bullish OB idea (util={best_ob_meta['util']:.3f}, strength={best_ob_meta['strength']:.1f})")
 
             # ---------- No zone found => fallback handling (حفظ منطق) ----------
             self._log_debug(
@@ -3067,19 +3070,17 @@ class GoldNDSAnalyzer:
                 return idea
 
             idea["source"] = "FALLBACK"
+            idea["entry_type"] = "FALLBACK"
             idea["zone_meta"] = {"mode": "strong_structure_only", "side": "BUY", "policy": {"max_dist_atr": max_dist_atr, "max_age_bars": max_age_bars}}
 
             fallback_entry = float(current_price) - (float(atr_value) * 0.3)
-            stop = (float(swing_anchor) - float(atr_value) * float(buffer_mult)) if swing_anchor else (float(current_price) - (float(atr_value) * 1.2))
-
             self._log_info(
-                "[NDS][ENTRY_IDEA][BUY][FALLBACK] entry=%.2f stop=%.2f (atr=%.2f) allow_fallback=%s",
+                "[NDS][ENTRY_IDEA][BUY][FALLBACK] entry=%.2f (atr=%.2f) allow_fallback=%s",
                 fallback_entry,
-                stop,
                 float(atr_value),
                 allow_fallback,
             )
-            return finalize_trade(fallback_entry, stop, None, "Fallback bullish idea (only allowed in strong structure)")
+            return finalize_trade(fallback_entry, "Fallback bullish idea (only allowed in strong structure)")
 
         # -------------------------
         # SELL branch
@@ -3176,6 +3177,7 @@ class GoldNDSAnalyzer:
                 )
 
                 idea["source"] = "FVG"
+                idea["entry_type"] = "FVG"
                 idea["zone_meta"] = {
                     "type": (getattr(f, "type").value if hasattr(getattr(f, "type", None), "value") else str(getattr(f, "type", "FVG"))),
                     "index": best_fvg_meta["index"],
@@ -3190,17 +3192,13 @@ class GoldNDSAnalyzer:
 
                 fvg_height = abs(float(best_fvg_meta["top"]) - float(best_fvg_meta["bottom"]))
                 entry = float(best_fvg_meta["bottom"]) + (fvg_height * float(entry_factor))
-                stop = (float(swing_anchor) + float(atr_value) * float(buffer_mult)) if swing_anchor else float(best_fvg_meta["top"]) + (float(atr_value) * 0.5)
-                target = float(best_fvg_meta["bottom"]) - (fvg_height * float(tp_multiplier))
 
                 self._log_debug(
-                    "[NDS][ENTRY_IDEA][PRE] src=FVG signal=SELL entry=%.2f stop=%.2f target=%.2f fvg_height=%.2f",
+                    "[NDS][ENTRY_IDEA][PRE] src=FVG signal=SELL entry=%.2f fvg_height=%.2f",
                     entry,
-                    stop,
-                    target,
                     fvg_height,
                 )
-                return finalize_trade(entry, stop, target, f"Bearish FVG idea (util={best_fvg_meta['util']:.3f}, strength={best_fvg_meta['strength']:.1f})")
+                return finalize_trade(entry, f"Bearish FVG idea (util={best_fvg_meta['util']:.3f}, strength={best_fvg_meta['strength']:.1f})")
 
             # ---------- OB SELL selection (distance/age/stale aware) ----------
             ob_rej = {}
@@ -3275,6 +3273,7 @@ class GoldNDSAnalyzer:
                 )
 
                 idea["source"] = "OB"
+                idea["entry_type"] = "OB"
                 idea["zone_meta"] = {
                     "type": getattr(ob, "type", "BEARISH_OB"),
                     "index": best_ob_meta["index"],
@@ -3288,16 +3287,11 @@ class GoldNDSAnalyzer:
                 }
 
                 entry = float(best_ob_meta["high"]) - (float(best_ob_meta["high"]) - float(best_ob_meta["low"])) * 0.3
-                stop = (float(swing_anchor) + float(atr_value) * float(buffer_mult)) if swing_anchor else float(best_ob_meta["high"]) + (float(atr_value) * 0.5)
-                target = float(best_ob_meta["low"]) - (float(best_ob_meta["high"]) - float(best_ob_meta["low"])) * float(tp_multiplier)
-
                 self._log_debug(
-                    "[NDS][ENTRY_IDEA][PRE] src=OB signal=SELL entry=%.2f stop=%.2f target=%.2f",
+                    "[NDS][ENTRY_IDEA][PRE] src=OB signal=SELL entry=%.2f",
                     entry,
-                    stop,
-                    target,
                 )
-                return finalize_trade(entry, stop, target, f"Bearish OB idea (util={best_ob_meta['util']:.3f}, strength={best_ob_meta['strength']:.1f})")
+                return finalize_trade(entry, f"Bearish OB idea (util={best_ob_meta['util']:.3f}, strength={best_ob_meta['strength']:.1f})")
 
             # ---------- No zone found => fallback handling ----------
             self._log_debug(
@@ -3318,19 +3312,17 @@ class GoldNDSAnalyzer:
                 return idea
 
             idea["source"] = "FALLBACK"
+            idea["entry_type"] = "FALLBACK"
             idea["zone_meta"] = {"mode": "strong_structure_only", "side": "SELL", "policy": {"max_dist_atr": max_dist_atr, "max_age_bars": max_age_bars}}
 
             fallback_entry = float(current_price) + (float(atr_value) * 0.3)
-            stop = (float(swing_anchor) + float(atr_value) * float(buffer_mult)) if swing_anchor else (float(current_price) + (float(atr_value) * 1.2))
-
             self._log_info(
-                "[NDS][ENTRY_IDEA][SELL][FALLBACK] entry=%.2f stop=%.2f (atr=%.2f) allow_fallback=%s",
+                "[NDS][ENTRY_IDEA][SELL][FALLBACK] entry=%.2f (atr=%.2f) allow_fallback=%s",
                 fallback_entry,
-                stop,
                 float(atr_value),
                 allow_fallback,
             )
-            return finalize_trade(fallback_entry, stop, None, "Fallback bearish idea (only allowed in strong structure)")
+            return finalize_trade(fallback_entry, "Fallback bearish idea (only allowed in strong structure)")
 
         return idea
 
