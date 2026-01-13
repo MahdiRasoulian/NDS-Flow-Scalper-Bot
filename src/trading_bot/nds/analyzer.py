@@ -17,7 +17,7 @@ Config keys (whitelisted via ANALYSIS_CONFIG_KEYS):
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any, Dict, List, Optional, Tuple
 
 from collections import deque
@@ -38,6 +38,12 @@ from .models import (
 )
 from .indicators import IndicatorCalculator
 from .smc import SMCAnalyzer
+from .distance_utils import (
+    calculate_distance_metrics,
+    pips_to_price,
+    price_to_points,
+    points_to_pips,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +540,16 @@ class GoldNDSAnalyzer:
             )
 
             self._log_info("[NDS][SMC][STRUCTURE] %s", structure)
+            try:
+                breakers = getattr(structure, "breakers", []) or []
+                ifvgs = getattr(structure, "inversion_fvgs", []) or []
+                self._log_info(
+                    "[NDS][FLOW_ZONES] detected breakers=%s ifvg=%s",
+                    len(breakers),
+                    len(ifvgs),
+                )
+            except Exception as _flow_e:
+                self._log_debug("[NDS][FLOW_ZONES] detection log failed: %s", _flow_e)
 
             final_structure = self._apply_adx_override(structure, adx_v, plus_di, minus_di)
 
@@ -628,6 +644,15 @@ class GoldNDSAnalyzer:
 
             result_payload["signal_context"] = signal_context
 
+            try:
+                if "analysis_data" in result_payload and isinstance(result_payload["analysis_data"], dict):
+                    result_payload["analysis_data"]["flow_zones"] = {
+                        "breakers": getattr(final_structure, "breakers", []) or [],
+                        "inversion_fvgs": getattr(final_structure, "inversion_fvgs", []) or [],
+                    }
+            except Exception as _flow_e:
+                self._log_debug("[NDS][FLOW_ZONES] failed to attach flow zones: %s", _flow_e)
+
             pre_filter_signal = result_payload.get("signal")
             result_payload = self._apply_final_filters(result_payload, scalping_mode)
             post_filter_signal = result_payload.get("signal")
@@ -675,72 +700,131 @@ class GoldNDSAnalyzer:
             entry_price = None
             stop_loss = None
             take_profit = None
+            entry_type = "NONE"
+            entry_source = None
+            entry_context = {}
             if signal in ["BUY", "SELL"]:
-                entry_idea = self._build_entry_idea(
-                    signal=signal,
-                    fvgs=fvgs,
-                    order_blocks=order_blocks,
-                    structure=final_structure,
-                    atr_value=atr_for_scoring,
-                    entry_factor=entry_factor,
-                    current_price=current_close,
-                    adx_value=adx_v,
-                )
-                entry_price = entry_idea.get("entry_price")
-                stop_loss = entry_idea.get("stop_loss")
-                take_profit = entry_idea.get("take_profit")
-                if entry_idea.get("reason"):
-                    reasons.append(entry_idea["reason"])
-
-                # ------------------------------------------------------------------
-                # ✅ افزودنی (بدون حذف/تغییر منطق موجود):
-                # 1) لاگ کلیدی برای ردیابی منبع entry و فاصله آن از قیمت جاری
-                # 2) ذخیره همین مقادیر داخل context (result_payload) برای CSV در bot
-                # ------------------------------------------------------------------
-                self._log_info(
-                    "[NDS][SIGNAL] signal=%s score=%.1f conf=%.1f src=%s entry=%.2f cur=%.2f dist_pips=%s dist_points=%s dist_usd=%s dist_atr=%s",
-                    signal,
-                    score,
-                    confidence,
-                    entry_idea.get("source"),
-                    entry_idea.get("entry_price") or 0.0,
-                    current_close,
-                    entry_idea.get("entry_distance_pips"),
-                    entry_idea.get("entry_distance_points"),
-                    entry_idea.get("entry_distance_usd"),
-                    entry_idea.get("entry_distance_atr"),
-                )
-
-                # ذخیره در context برای استفاده‌ی bot و CSV
-                # (اگر result_payload.context وجود نداشت، همان dict را روی result_payload می‌نویسیم)
-                try:
-                    if "context" not in result_payload or result_payload.get("context") is None:
-                        result_payload["context"] = {}
-                    result_payload["context"]["entry_source"] = entry_idea.get("source")
-                    result_payload["context"]["entry_distance_pips"] = entry_idea.get("entry_distance_pips")
-                    result_payload["context"]["entry_distance_points"] = entry_idea.get("entry_distance_points")
-                    result_payload["context"]["entry_distance_usd"] = entry_idea.get("entry_distance_usd")
-                    result_payload["context"]["entry_distance_atr"] = entry_idea.get("entry_distance_atr")
-                    result_payload["context"]["zone_meta"] = entry_idea.get("zone_meta")
-                except Exception as _ctx_e:
-                    # لاگ نرم برای جلوگیری از شکست تحلیل
-                    self._log_debug("[NDS][SIGNAL][CONTEXT] failed to attach entry context: %s", _ctx_e)
-                # ------------------------------------------------------------------
-
-                # --- تغییر کلیدی: اگر Entry Zone نداریم، معامله را کامل کنسل کن ---
-                if entry_price is None or stop_loss is None or take_profit is None:
-                    self._log_info(
-                        "[NDS][ENTRY_IDEA] trade skipped: missing zone (entry=%s stop=%s tp=%s) -> signal NONE",
-                        entry_price,
-                        stop_loss,
-                        take_profit,
+                if scalping_mode:
+                    flow_entry = self._select_flow_entry(
+                        signal=signal,
+                        structure=final_structure,
+                        current_price=current_close,
+                        atr_value=atr_for_scoring,
+                        adx_value=adx_v,
+                        session_analysis=session_analysis,
+                        volume_analysis=volume_analysis,
+                        scalping_mode=scalping_mode,
+                        signal_context=signal_context,
                     )
-                    signal = "NONE"
-                    entry_price = None
-                    stop_loss = None
-                    take_profit = None
-                    reasons.append("Trade skipped: no valid entry zone (FVG/OB) and fallback not allowed.")
-                    result_payload["signal"] = "NONE"
+                    entry_price = flow_entry.get("entry_price")
+                    stop_loss = flow_entry.get("stop_loss")
+                    take_profit = flow_entry.get("take_profit")
+                    entry_type = flow_entry.get("entry_type", "NONE")
+                    entry_source = flow_entry.get("entry_source")
+                    entry_context = flow_entry.get("entry_context", {}) or {}
+                    if flow_entry.get("entry_reason"):
+                        reasons.append(flow_entry["entry_reason"])
+
+                    metrics = None
+                    if entry_price is not None:
+                        metrics = calculate_distance_metrics(
+                            entry_price=entry_price,
+                            current_price=current_close,
+                            point_size=self._get_point_size(),
+                            atr_value=atr_for_scoring,
+                        )
+                        self._log_info(
+                            "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f dist_price=%.4f point=%.4f "
+                            "dist_points=%.2f dist_pips=%.2f dist_usd=%.4f dist_atr=%s",
+                            entry_type,
+                            float(entry_price),
+                            float(current_close),
+                            float(metrics.get("dist_price") or 0.0),
+                            float(metrics.get("point_size") or 0.0),
+                            float(metrics.get("dist_points") or 0.0),
+                            float(metrics.get("dist_pips") or 0.0),
+                            float(metrics.get("dist_usd") or 0.0),
+                            metrics.get("dist_atr"),
+                        )
+
+                    self._log_info(
+                        "[NDS][FLOW_ENTRY] type=%s signal=%s reason=%s conf=%.1f",
+                        entry_type,
+                        flow_entry.get("signal", "NONE"),
+                        flow_entry.get("entry_reason", "-"),
+                        confidence,
+                    )
+
+                    if entry_price is None or stop_loss is None or take_profit is None:
+                        self._log_info(
+                            "[NDS][FLOW_ENTRY] trade skipped: missing entry (entry=%s stop=%s tp=%s)",
+                            entry_price,
+                            stop_loss,
+                            take_profit,
+                        )
+                        signal = "NONE"
+                        entry_price = None
+                        stop_loss = None
+                        take_profit = None
+                        entry_type = "NONE"
+                        entry_source = None
+                        reasons.append("Trade skipped: no eligible Flow zone or momentum breakout.")
+                        result_payload["signal"] = "NONE"
+                    else:
+                        if metrics:
+                            entry_context.update(metrics)
+                else:
+                    entry_idea = self._build_entry_idea(
+                        signal=signal,
+                        fvgs=fvgs,
+                        order_blocks=order_blocks,
+                        structure=final_structure,
+                        atr_value=atr_for_scoring,
+                        entry_factor=entry_factor,
+                        current_price=current_close,
+                        adx_value=adx_v,
+                    )
+                    entry_price = entry_idea.get("entry_price")
+                    stop_loss = entry_idea.get("stop_loss")
+                    take_profit = entry_idea.get("take_profit")
+                    entry_type = entry_idea.get("source", "LEGACY")
+                    entry_source = entry_idea.get("zone_meta")
+                    entry_context = entry_idea.get("metrics", {}) or {}
+                    if entry_idea.get("reason"):
+                        reasons.append(entry_idea["reason"])
+
+                    if entry_price is None or stop_loss is None or take_profit is None:
+                        self._log_info(
+                            "[NDS][ENTRY_IDEA] trade skipped: missing zone (entry=%s stop=%s tp=%s) -> signal NONE",
+                            entry_price,
+                            stop_loss,
+                            take_profit,
+                        )
+                        signal = "NONE"
+                        entry_price = None
+                        stop_loss = None
+                        take_profit = None
+                        entry_type = "NONE"
+                        entry_source = None
+                        reasons.append("Trade skipped: no valid entry zone (FVG/OB) and fallback not allowed.")
+                        result_payload["signal"] = "NONE"
+            else:
+                self._log_info(
+                    "[NDS][FLOW_ENTRY] type=NONE signal=NONE reason=no_base_signal conf=%.1f",
+                    confidence,
+                )
+
+            try:
+                if "context" not in result_payload or result_payload.get("context") is None:
+                    result_payload["context"] = {}
+                result_payload["entry_type"] = entry_type
+                result_payload["entry_source"] = entry_source
+                result_payload["entry_context"] = entry_context
+                result_payload["context"]["entry_type"] = entry_type
+                result_payload["context"]["entry_source"] = entry_source
+                result_payload["context"]["entry_context"] = entry_context
+            except Exception as _ctx_e:
+                self._log_debug("[NDS][SIGNAL][CONTEXT] failed to attach flow entry context: %s", _ctx_e)
 
             return self._build_analysis_result(
                 signal=signal,
@@ -810,6 +894,306 @@ class GoldNDSAnalyzer:
             k = 0.35
         return max(0.01, float(atr_value) * k)
 
+    def _get_point_size(self) -> float:
+        """Return configured point size with default."""
+        try:
+            return float(self.GOLD_SETTINGS.get("POINT_SIZE", 0.001))
+        except Exception:
+            return 0.001
+
+    def _is_time_in_window(self, ts: datetime, start_str: str, end_str: str) -> bool:
+        """Check if timestamp is within [start, end) window (supports midnight wrap)."""
+        try:
+            start_parts = [int(p) for p in str(start_str).split(":")]
+            end_parts = [int(p) for p in str(end_str).split(":")]
+            start_h, start_m = (start_parts + [0, 0])[:2]
+            end_h, end_m = (end_parts + [0, 0])[:2]
+            start_t = time(start_h, start_m)
+            end_t = time(end_h, end_m)
+            now_t = ts.time()
+        except Exception:
+            return True
+
+        if start_t == end_t:
+            return False
+        if start_t < end_t:
+            return start_t <= now_t < end_t
+        return now_t >= start_t or now_t < end_t
+
+    def _compute_scalping_sl_tp(
+        self,
+        signal: str,
+        entry_price: float,
+        atr_value: Optional[float],
+    ) -> Dict[str, Any]:
+        """Compute scalping SL/TP using ATR and recent candle references."""
+        settings = self.GOLD_SETTINGS
+        point_size = self._get_point_size()
+
+        atr_mult = float(settings.get("SCALP_ATR_SL_MULT", 1.5))
+        sl_min_pips = float(settings.get("SL_MIN_PIPS", 10.0))
+        sl_max_pips = float(settings.get("SL_MAX_PIPS", 40.0))
+        tp1_pips = float(settings.get("TP1_PIPS", 35.0))
+        tp2_pips = float(settings.get("TP2_PIPS", tp1_pips * 2.0))
+
+        recent_slice = self.df.tail(2)
+        recent_low = float(recent_slice["low"].min()) if not recent_slice.empty else None
+        recent_high = float(recent_slice["high"].max()) if not recent_slice.empty else None
+
+        atr_value = float(atr_value) if atr_value is not None else 0.0
+        atr_distance = atr_value * atr_mult if atr_value > 0 else 0.0
+
+        ref_distance = 0.0
+        if signal == "BUY" and recent_low is not None:
+            ref_distance = max(0.0, float(entry_price) - float(recent_low))
+        elif signal == "SELL" and recent_high is not None:
+            ref_distance = max(0.0, float(recent_high) - float(entry_price))
+
+        if atr_distance > 0 and ref_distance > 0:
+            sl_distance = min(atr_distance, ref_distance)
+        else:
+            sl_distance = max(atr_distance, ref_distance)
+
+        if sl_distance <= 0:
+            sl_distance = pips_to_price(sl_min_pips, point_size)
+
+        sl_points = price_to_points(sl_distance, point_size)
+        sl_pips = points_to_pips(sl_points)
+        clamp_reason = None
+
+        if sl_pips < sl_min_pips:
+            sl_pips = sl_min_pips
+            sl_distance = pips_to_price(sl_pips, point_size)
+            clamp_reason = "min"
+        elif sl_pips > sl_max_pips:
+            sl_pips = sl_max_pips
+            sl_distance = pips_to_price(sl_pips, point_size)
+            clamp_reason = "max"
+
+        if clamp_reason:
+            self._log_info(
+                "[NDS][SL_CLAMP] reason=%s sl_pips=%.2f bounds=[%.2f,%.2f]",
+                clamp_reason,
+                sl_pips,
+                sl_min_pips,
+                sl_max_pips,
+            )
+
+        if signal == "BUY":
+            stop_loss = float(entry_price) - sl_distance
+            take_profit = float(entry_price) + pips_to_price(tp1_pips, point_size)
+            tp2_price = float(entry_price) + pips_to_price(tp2_pips, point_size)
+        else:
+            stop_loss = float(entry_price) + sl_distance
+            take_profit = float(entry_price) - pips_to_price(tp1_pips, point_size)
+            tp2_price = float(entry_price) - pips_to_price(tp2_pips, point_size)
+
+        return {
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "tp1_pips": tp1_pips,
+            "tp2_pips": tp2_pips,
+            "tp2_price": tp2_price,
+            "sl_pips": sl_pips,
+            "sl_distance": sl_distance,
+            "atr_distance": atr_distance,
+            "ref_distance": ref_distance,
+            "point_size": point_size,
+            "recent_low": recent_low,
+            "recent_high": recent_high,
+        }
+
+    def _select_flow_entry(
+        self,
+        signal: str,
+        structure: MarketStructure,
+        current_price: float,
+        atr_value: float,
+        adx_value: float,
+        session_analysis: SessionAnalysis,
+        volume_analysis: Dict[str, Any],
+        scalping_mode: bool,
+        signal_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Select entry tier (Breaker/IFVG/Momentum) with strict hierarchy."""
+        if signal not in {"BUY", "SELL"}:
+            return {
+                "signal": "NONE",
+                "entry_type": "NONE",
+                "entry_source": None,
+                "entry_price": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "entry_reason": "signal=NONE",
+                "entry_context": {},
+            }
+
+        settings = self.GOLD_SETTINGS
+        point_size = self._get_point_size()
+        entry_context: Dict[str, Any] = {}
+
+        breakers = getattr(structure, "breakers", []) or []
+        ifvgs = getattr(structure, "inversion_fvgs", []) or []
+
+        def _tier_candidates(zones: List[Dict[str, Any]], side: str, max_dist_atr: float, max_age: int) -> List[Dict[str, Any]]:
+            candidates = []
+            for zone in zones:
+                z_type = str(zone.get("type", ""))
+                if side == "BUY" and "BULLISH" not in z_type:
+                    continue
+                if side == "SELL" and "BEARISH" not in z_type:
+                    continue
+                mid = float(zone.get("mid", 0.0))
+                if mid <= 0:
+                    continue
+                dist_atr = abs(float(current_price) - mid) / float(atr_value) if atr_value > 0 else 999.0
+                age = int(zone.get("age_bars", 9999))
+                if dist_atr <= max_dist_atr and age <= max_age:
+                    confidence = float(zone.get("confidence", 0.0))
+                    util = confidence - (0.5 * dist_atr) - (0.1 * (age / max_age if max_age > 0 else 1.0))
+                    candidates.append({**zone, "dist_atr": dist_atr, "util": util})
+            return candidates
+
+        brk_max_dist = float(settings.get("BRK_MAX_DIST_ATR", 0.5))
+        brk_max_age = int(settings.get("BRK_MAX_AGE_BARS", 60))
+        brk_candidates = _tier_candidates(breakers, signal, brk_max_dist, brk_max_age)
+        if not brk_candidates:
+            self._log_debug(
+                "[NDS][FLOW_TIER] tier=A breakers skipped (zones=%d max_dist_atr=%.2f max_age=%d)",
+                len(breakers),
+                brk_max_dist,
+                brk_max_age,
+            )
+
+        ifvg_max_dist = float(settings.get("IFVG_MAX_DIST_ATR", 0.5))
+        ifvg_max_age = int(settings.get("IFVG_MAX_AGE_BARS", 60))
+        ifvg_candidates = _tier_candidates(ifvgs, signal, ifvg_max_dist, ifvg_max_age)
+        if not ifvg_candidates:
+            self._log_debug(
+                "[NDS][FLOW_TIER] tier=B ifvg skipped (zones=%d max_dist_atr=%.2f max_age=%d)",
+                len(ifvgs),
+                ifvg_max_dist,
+                ifvg_max_age,
+            )
+
+        self._log_info(
+            "[NDS][FLOW_ZONES] breakers=%d eligible=%d ifvg=%d eligible=%d",
+            len(breakers),
+            len(brk_candidates),
+            len(ifvgs),
+            len(ifvg_candidates),
+        )
+
+        entry_type = "NONE"
+        entry_source = None
+        entry_price = None
+        entry_reason = "no_zone"
+
+        if brk_candidates:
+            pick = max(brk_candidates, key=lambda z: float(z.get("util", 0.0)))
+            entry_type = "BREAKER"
+            entry_price = float(pick.get("mid"))
+            entry_source = pick
+            entry_reason = "tier=A breaker retest"
+        elif ifvg_candidates:
+            pick = max(ifvg_candidates, key=lambda z: float(z.get("util", 0.0)))
+            entry_type = "IFVG"
+            entry_price = float(pick.get("mid"))
+            entry_source = pick
+            entry_reason = "tier=B inversion fvg"
+
+        momentum_reason = None
+        if entry_price is None:
+            momo_adx_min = float(settings.get("MOMO_ADX_MIN", 35.0))
+            time_start = settings.get("MOMO_TIME_START", "10:00")
+            time_end = settings.get("MOMO_TIME_END", "18:00")
+            session_only = bool(settings.get("MOMO_SESSION_ONLY", True))
+
+            now_ts = self.df["time"].iloc[-1]
+            in_window = self._is_time_in_window(now_ts, time_start, time_end)
+            session_name = getattr(session_analysis, "current_session", "OTHER")
+            session_ok = True
+            if session_only:
+                session_ok = session_name in {"LONDON", "NEW_YORK", "OVERLAP"}
+
+            liquidity_ok = bool(getattr(session_analysis, "is_active_session", True))
+            market_status = str(volume_analysis.get("market_status", "") or "").upper()
+            if market_status in {"CLOSED", "HALTED"}:
+                liquidity_ok = False
+
+            if adx_value >= momo_adx_min and in_window and session_ok and liquidity_ok:
+                buffer_atr = float(settings.get("MOMO_BUFFER_ATR_MULT", 0.1))
+                buffer_min_pips = float(settings.get("MOMO_BUFFER_MIN_PIPS", 1.0))
+                buffer_price = pips_to_price(buffer_min_pips, point_size)
+                if atr_value > 0:
+                    buffer_price = max(buffer_price, float(atr_value) * buffer_atr)
+
+                spread = volume_analysis.get("spread")
+                if spread is not None:
+                    try:
+                        buffer_price = max(buffer_price, float(spread))
+                    except Exception:
+                        pass
+
+                prev_high = float(self.df["high"].iloc[-2])
+                prev_low = float(self.df["low"].iloc[-2])
+                if signal == "BUY":
+                    entry_price = prev_high + buffer_price
+                else:
+                    entry_price = prev_low - buffer_price
+
+                entry_type = "MOMENTUM"
+                entry_reason = "tier=C momentum breakout"
+                entry_source = {
+                    "type": "MOMENTUM_BREAKOUT",
+                    "prev_high": prev_high,
+                    "prev_low": prev_low,
+                    "buffer_price": buffer_price,
+                    "time_window": f"{time_start}-{time_end}",
+                    "session": session_name,
+                }
+            else:
+                momentum_reason = (
+                    f"adx={adx_value:.1f}/{momo_adx_min:.1f} "
+                    f"window={in_window} session_ok={session_ok} liquidity_ok={liquidity_ok}"
+                )
+                self._log_debug("[NDS][FLOW_TIER] tier=C momentum skipped (%s)", momentum_reason)
+
+        if entry_price is None:
+            entry_reason = entry_reason if momentum_reason is None else f"{entry_reason}; momo_block={momentum_reason}"
+
+        stop_loss = None
+        take_profit = None
+        tp2_price = None
+        tp2_pips = None
+        if entry_price is not None:
+            sl_tp = self._compute_scalping_sl_tp(signal, entry_price, atr_value)
+            stop_loss = sl_tp.get("stop_loss")
+            take_profit = sl_tp.get("take_profit")
+            tp2_price = sl_tp.get("tp2_price")
+            tp2_pips = sl_tp.get("tp2_pips")
+            entry_context.update(sl_tp)
+
+        entry_context.update(
+            {
+                "point_size": point_size,
+                "momentum_reason": momentum_reason,
+            }
+        )
+
+        return {
+            "signal": signal if entry_price is not None else "NONE",
+            "entry_type": entry_type if entry_price is not None else "NONE",
+            "entry_source": entry_source,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "tp2_price": tp2_price,
+            "tp2_pips": tp2_pips,
+            "entry_reason": entry_reason,
+            "entry_context": entry_context,
+        }
+
     def _calc_entry_distance_metrics(
         self,
         entry_price: float,
@@ -818,57 +1202,21 @@ class GoldNDSAnalyzer:
         atr_value: Optional[float] = None,
     ) -> Dict[str, Optional[float]]:
         """Calculate entry distance metrics with explicit points/pips/ATR mapping."""
-        metrics: Dict[str, Optional[float]] = {
-            "dist_price": None,
-            "point_size": None,
-            "dist_points": None,
-            "dist_pips": None,
-            "dist_usd": None,
-            "dist_atr": None,
-        }
-        try:
-            entry_f = float(entry_price)
-            price_f = float(current_price)
-        except Exception:
-            self._log_debug("[NDS][ENTRY_METRICS] invalid entry/current for distance calc")
-            return metrics
-
         meta = symbol_meta if isinstance(symbol_meta, dict) else {}
-        point_size = meta.get("point_size", None)
+        point_size = meta.get("point_size")
         if point_size is None:
             point_size = self.GOLD_SETTINGS.get("POINT_SIZE", 0.001)
-        try:
-            point_size = float(point_size)
-        except Exception:
-            point_size = 0.001
-        if not point_size or point_size <= 0:
-            point_size = 0.001
-
-        dist_price = abs(entry_f - price_f)
-        dist_points = dist_price / point_size
-        dist_pips = dist_points / 100.0
-
         atr_source = atr_value
         if atr_source is None and meta:
             atr_source = meta.get("atr")
         if atr_source is None:
             atr_source = self.atr
-        dist_atr = None
-        if atr_source and atr_source > 0:
-            dist_atr = dist_price / float(atr_source)
-
-        metrics.update(
-            {
-                "dist_price": dist_price,
-                "point_size": point_size,
-                "dist_points": dist_points,
-                "dist_pips": dist_pips,
-                "dist_usd": dist_price,
-                "dist_atr": dist_atr,
-            }
+        return calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=current_price,
+            point_size=point_size,
+            atr_value=atr_source,
         )
-
-        return metrics
 
     def _apply_adx_override(
         self,
@@ -2038,7 +2386,7 @@ class GoldNDSAnalyzer:
             sanity_reject_adx_max = float(settings.get('SANITY_ADX_REJECT_MAX', 18.0))
             sanity_reject_structure = float(settings.get('SANITY_STRUCTURE_REJECT_SCORE', 40.0))
 
-            if scalping_mode and analysis_result.get('signal', 'NONE') != 'NONE':
+            if (not scalping_mode) and analysis_result.get('signal', 'NONE') != 'NONE':
                 if bos_v == 'NONE' and choch_v == 'NONE' and adx_v < sanity_reject_adx_max and structure_score < sanity_reject_structure:
                     analysis_result['signal'] = 'NONE'
                     self._append_reason(
@@ -2060,11 +2408,22 @@ class GoldNDSAnalyzer:
             )
 
             if structure_score < min_structure_score:
-                analysis_result['signal'] = 'NONE'
-                self._append_reason(
-                    reasons,
-                    f"Weak market structure (Score: {structure_score:.1f} < {min_structure_score})"
-                )
+                if scalping_mode:
+                    self._append_reason(
+                        reasons,
+                        f"Weak structure noted (Score: {structure_score:.1f} < {min_structure_score})"
+                    )
+                    self._log_debug(
+                        "[NDS][FILTER] scalping mode keeps signal despite weak structure score=%.1f min=%.1f",
+                        structure_score,
+                        min_structure_score,
+                    )
+                else:
+                    analysis_result['signal'] = 'NONE'
+                    self._append_reason(
+                        reasons,
+                        f"Weak market structure (Score: {structure_score:.1f} < {min_structure_score})"
+                    )
 
             if analysis_result.get('signal') in {'BUY', 'SELL'}:
                 context = analysis_result.get("context") or {}
