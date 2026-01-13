@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# Reports / outputs
+trade_reports/
+*.xlsx
+*.png
+
+*.log
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+
+# Binary / wheels
+*.whl
+
+mt5_credentials.json

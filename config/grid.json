@@ -1,0 +1,16 @@
+{
+  "grid": {
+    "technical_settings.ENTRY_FACTOR": [0.15],
+    "technical_settings.ATR_SL_MULTIPLIER": [2.8],
+    "technical_settings.SCALPING_MIN_CONFIDENCE": [9],
+    "risk_manager_config.MIN_CONFIDENCE": [9],
+    "risk_settings.MIN_CONFIDENCE": [9],
+
+    "trading_rules.MIN_CANDLES_BETWEEN_TRADES": [10],
+    "risk_settings.MAX_PRICE_DEVIATION_PIPS": [50],
+    "risk_settings.RISK_AMOUNT_USD": [35],
+
+    "technical_settings.SCALPING_BUY_THRESHOLD": [50.2],
+    "technical_settings.SCALPING_SELL_THRESHOLD": [49.8]
+  }
+}

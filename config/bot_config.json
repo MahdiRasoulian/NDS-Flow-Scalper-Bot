@@ -1,0 +1,374 @@
+{
+  "bot_name": "NDS Trading Bot Pro",
+  "version": "5.0",
+  "ACCOUNT_BALANCE": 873.53,
+  "trading_rules": {
+    "MIN_CANDLES_BETWEEN_TRADES": 10,
+    "MAX_POSITIONS": 5,
+    "ALLOW_MULTIPLE_POSITIONS": true,
+    "WAIT_FOR_CLOSE_BEFORE_NEW_TRADE": false,
+    "DAILY_MAX_TRADES": 40,
+    "MAX_CONSECUTIVE_LOSSES": 3,
+    "MIN_CANDLES_BETWEEN": 10,
+    "MIN_TIME_BETWEEN_TRADES_MINUTES": 150
+  },
+  "risk_settings": {
+    "RISK_PERCENT": 1.2,
+    "MIN_CONFIDENCE": 39.0,
+    "HIGH_CONFIDENCE": 85.0,
+    "MAX_DAILY_RISK_PERCENT": 6.0,
+    "MIN_STOP_DISTANCE": 6.5,
+    "RISK_AMOUNT_USD": 60.0,
+    "MIN_RISK_DOLLARS": 5.5,
+    "MIN_RISK_REWARD": 0.55,
+    "DEFAULT_RISK_REWARD": 0.9,
+    "MAX_RISK_REWARD": 2.1,
+    "SCALPING_MIN_RR": 0.9,
+    "SCALPING_RR": 0.9,
+    "MAX_ENTRY_ATR_DEVIATION": 2.8,
+    "MAX_PRICE_DEVIATION_PIPS": 70.0,
+    "LIMIT_ORDER_MIN_CONFIDENCE": 55.0
+  },
+  "trading_settings": {
+    "ENABLE_AUTO_TRADING": true,
+    "ENABLE_DRY_RUN": false,
+    "ENABLE_RISK_MANAGER": true,
+    "SYMBOL": "XAUUSD!",
+    "TIMEFRAME": "M15",
+    "ANALYSIS_INTERVAL_MINUTES": 0.1,
+    "BARS_TO_FETCH": 800,
+    "TICK_UPDATE_INTERVAL": 1.0,
+    "GOLD_SPECIFICATIONS": {
+      "CONTRACT_SIZE": 100,
+      "TICK_VALUE_PER_LOT": 100,
+      "POINT": 0.1,
+      "MIN_LOT": 0.01,
+      "MAX_LOT": 2.0,
+      "LOT_STEP": 0.01,
+      "DIGITS": 2,
+      "TYPICAL_SPREAD": 0.25,
+      "TYPICAL_SLIPPAGE": 0.1,
+      "OVERNIGHT_FEE_LONG": -5.0,
+      "OVERNIGHT_FEE_SHORT": -8.0,
+      "SCALPING_BUY_THRESHOLD": 52,
+      "SCALPING_SELL_THRESHOLD": 48
+    },
+    "MODE": "live"
+  },
+  "technical_settings": {
+    "ATR_WINDOW": 10,
+    "SWING_PERIOD": 5,
+    "ADX_WINDOW": 14,
+    "ADX_THRESHOLD_WEAK": 25,
+    "ADX_THRESHOLD_STRONG": 35,
+    "MIN_ATR_DISTANCE_MULTIPLIER": 1.0,
+    "FVG_MIN_SIZE_MULTIPLIER": 0.1,
+    "ENTRY_FACTOR": 0.2,
+    "RANGE_TOLERANCE": 0.1,
+    "FIXED_BUFFER": 0.05,
+    "MAX_SL_DISTANCE": 50.0,
+    "MIN_SL_DISTANCE": 5.0,
+    "SCALPING_MIN_CONFIDENCE": 38,
+    "MIN_CONFIDENCE": 39.0,
+    "OB_MIN_SIZE_MULTIPLIER": 0.2,
+    "MIN_SWEEP_PENETRATION_MULTIPLIER": 0.15,
+    "MIN_CANDLE_RANGE_MULTIPLIER": 0.6,
+    "MIN_RVOL_SCALPING": 0.35,
+    "RVOL_THRESHOLD": 1.8,
+    "SWING_MIN_CONFIDENCE": 50.0,
+    "ATR_SL_MULTIPLIER": 2.8,
+    "SCALPING_MAX_BARS_BACK": 70,
+    "SCALPING_MAX_DISTANCE_ATR": 1.8,
+    "SCALPING_MIN_FVG_SIZE_ATR": 0.2,
+    "MIN_STRUCTURE_SCORE": 10.0,
+    "DEBUG_ANALYZER": false,
+    "DAILY_ATR_FACTOR": 4.8,
+    "ATR_MULTIPLIER": 2.8,
+    "ENTRY_MAX_DISTANCE_ATR_SCALP": 0.8,
+    "ENTRY_MAX_DISTANCE_ATR_NORMAL": 1.5,
+    "ENTRY_MAX_AGE_BARS_SCALP": 35,
+    "ENTRY_MAX_AGE_BARS_NORMAL": 200,
+    "ENTRY_DIST_PENALTY": 0.65,
+    "ENTRY_AGE_PENALTY": 0.15,
+    "FVG_VOLUME_CONFIRMATION": true,
+    "TIMEFRAME_SPECIFICS": {
+      "M15": {
+        "ATR_WINDOW": 10,
+        "SWING_PERIOD": 5,
+        "DAILY_CANDLES_REQUIRED": 96,
+        "DAILY_ATR_FACTOR": 4.8,
+        "SESSION_WEIGHTS": {
+          "LONDON": 1.3,
+          "NEW_YORK": 1.4,
+          "OVERLAP": 1.6,
+          "ASIA": 0.7
+        }
+      },
+      "H1": {
+        "ATR_WINDOW": 10,
+        "SWING_PERIOD": 15,
+        "DAILY_CANDLES_REQUIRED": 24,
+        "DAILY_ATR_FACTOR": 2.4,
+        "SESSION_WEIGHTS": {
+          "LONDON": 1.2,
+          "NEW_YORK": 1.3,
+          "OVERLAP": 1.5,
+          "ASIA": 0.8
+        }
+      },
+      "M5": {
+        "ATR_WINDOW": 20,
+        "SWING_PERIOD": 5,
+        "DAILY_CANDLES_REQUIRED": 288,
+        "DAILY_ATR_FACTOR": 12.0,
+        "SESSION_WEIGHTS": {
+          "LONDON": 1.1,
+          "NEW_YORK": 1.2,
+          "OVERLAP": 1.4,
+          "ASIA": 0.9
+        }
+      }
+    },
+    "SWING_PERIOD_MAP": {
+      "D1": 35,
+      "H4": 25,
+      "H1": 18,
+      "M30": 12,
+      "M15": 8,
+      "M5": 5,
+      "M1": 3
+    },
+    "FALLBACK_ATR_PCT": {
+      "M1": 0.08,
+      "M5": 0.1,
+      "M15": 0.15,
+      "M30": 0.2,
+      "H1": 0.25,
+      "H4": 0.35,
+      "D1": 0.5
+    },
+    "VOLATILITY_STATES": {
+      "HIGH_VOLATILITY": {
+        "threshold": 1.3,
+        "color": "🔴"
+      },
+      "MODERATE_VOLATILITY": {
+        "threshold": 0.8,
+        "color": "🟡"
+      },
+      "LOW_VOLATILITY": {
+        "threshold": 0.0,
+        "color": "🟢"
+      }
+    },
+    "VOLUME_ZONES": {
+      "VERY_HIGH": {
+        "threshold": 2.0,
+        "color": "🟢"
+      },
+      "HIGH": {
+        "threshold": 1.5,
+        "color": "🟡"
+      },
+      "NORMAL": {
+        "threshold": 0.8,
+        "color": "⚪"
+      },
+      "LOW": {
+        "threshold": 0.5,
+        "color": "🟠"
+      },
+      "VERY_LOW": {
+        "threshold": 0.0,
+        "color": "🔴"
+      }
+    },
+    "MARKET_TREND_THRESHOLDS": {
+      "STRONG_UPTREND": {
+        "ADX": 30,
+        "DI_DIFF": 10
+      },
+      "WEAK_UPTREND": {
+        "ADX": 20,
+        "DI_DIFF": 5
+      },
+      "RANGING": {
+        "ADX": 20,
+        "DI_DIFF": 5
+      },
+      "WEAK_DOWNTREND": {
+        "ADX": 20,
+        "DI_DIFF": -5
+      },
+      "STRONG_DOWNTREND": {
+        "ADX": 30,
+        "DI_DIFF": -10
+      }
+    }
+  },
+  "sessions_config": {
+    "TRADING_SESSIONS": {
+      "LONDON_OPEN": {
+        "start": 10,
+        "end": 19,
+        "weight": 0.9
+      },
+      "LONDON_CORE": {
+        "start": 10,
+        "end": 12,
+        "weight": 0.8
+      },
+      "NY_OPEN": {
+        "start": 15,
+        "end": 22,
+        "weight": 0.9
+      },
+      "OVERLAP_PEAK": {
+        "start": 15,
+        "end": 19,
+        "weight": 1.0
+      },
+      "NY_CORE": {
+        "start": 17,
+        "end": 20,
+        "weight": 0.8
+      },
+      "ASIA": {
+        "start": 2,
+        "end": 11,
+        "weight": 0.4
+      },
+      "DEAD_ZONE": {
+        "start": 23,
+        "end": 2,
+        "weight": 0.4
+      }
+    },
+    "SCALPING_SESSION_ADJUSTMENT": {
+      "OVERLAP_PEAK": 1.5,
+      "NY_OPEN": 0.9,
+      "LONDON_OPEN": 0.9,
+      "LONDON_CORE": 0.8,
+      "NY_CORE": 0.8,
+      "LONDON_TO_NY": 0.7,
+      "ASIA_TO_LONDON": 0.6,
+      "ASIA_CORE": 0.4,
+      "NY_CLOSE": 0.3,
+      "DEAD_ZONE": 0.3
+    },
+    "MIN_SESSION_WEIGHT": 0.3,
+    "BASE_TRADING_SESSIONS": {
+      "LONDON": {
+        "start": 8,
+        "end": 17,
+        "weight": 1.2
+      },
+      "NEW_YORK": {
+        "start": 13,
+        "end": 22,
+        "weight": 1.3
+      },
+      "OVERLAP": {
+        "start": 13,
+        "end": 17,
+        "weight": 1.5
+      },
+      "ASIA": {
+        "start": 7,
+        "end": 10,
+        "weight": 0.8
+      },
+      "OTHER": {
+        "start": 2,
+        "end": 7,
+        "weight": 0.35
+      }
+    },
+    "SCALPING_SESSIONS": {
+      "ASIA_CORE": {
+        "start": 1,
+        "end": 4,
+        "weight": 0.4
+      },
+      "ASIA_TO_LONDON": {
+        "start": 6,
+        "end": 8,
+        "weight": 0.6
+      },
+      "LONDON_OPEN": {
+        "start": 8,
+        "end": 10,
+        "weight": 0.9
+      },
+      "LONDON_CORE": {
+        "start": 10,
+        "end": 12,
+        "weight": 0.8
+      },
+      "LONDON_TO_NY": {
+        "start": 12,
+        "end": 13,
+        "weight": 0.7
+      },
+      "NY_OPEN": {
+        "start": 13,
+        "end": 15,
+        "weight": 0.9
+      },
+      "OVERLAP_PEAK": {
+        "start": 15,
+        "end": 17,
+        "weight": 1.0
+      },
+      "NY_CORE": {
+        "start": 17,
+        "end": 20,
+        "weight": 0.8
+      },
+      "NY_CLOSE": {
+        "start": 20,
+        "end": 22,
+        "weight": 0.3
+      },
+      "DEAD_ZONE": {
+        "start": 22,
+        "end": 1,
+        "weight": 0.1
+      }
+    },
+    "SCALPING_HOLDING_TIMES": {
+      "ASIA_CORE": 60,
+      "ASIA_TO_LONDON": 60,
+      "LONDON_OPEN": 60,
+      "LONDON_CORE": 60,
+      "LONDON_TO_NY": 60,
+      "NY_OPEN": 60,
+      "OVERLAP_PEAK": 60,
+      "NY_CORE": 60,
+      "NY_CLOSE": 60,
+      "DEAD_ZONE": 60
+    }
+  },
+  "risk_manager_config": {
+    "MAX_RISK_PERCENT": 1.2,
+    "MIN_RISK_PERCENT": 1.0,
+    "MAX_DAILY_RISK_PERCENT": 6.0,
+    "MAX_POSITIONS": 5,
+    "MAX_DAILY_TRADES": 20,
+    "MIN_CONFIDENCE": 39,
+    "HIGH_CONFIDENCE": 85,
+    "MAX_SL_DISTANCE": 90.0,
+    "MIN_SL_DISTANCE": 12.0,
+    "ATR_SL_MULTIPLIER": 2.8,
+    "MIN_RR_RATIO": 0.5,
+    "TARGET_RR_RATIO": 0.65,
+    "MAX_LEVERAGE": 100,
+    "MAX_LOT_SIZE": 2.0,
+    "MAX_LOT": 2.0,
+    "MIN_RISK_USD": 5.0,
+    "MAX_RISK_USD": 25.0,
+    "POSITION_TIMEOUT_MINUTES": 300
+  },
+  "LOG_LEVEL": "INFO",
+  "DEBUG_LOG_FILE": "debug.log"
+}
