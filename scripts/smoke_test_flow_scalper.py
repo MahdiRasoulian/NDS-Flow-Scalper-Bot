@@ -31,13 +31,16 @@ def run(csv_path: str, limit: int | None) -> int:
     if limit:
         df = df.tail(limit).reset_index(drop=True)
 
-    entry_counts: Dict[str, int] = {"BREAKER": 0, "IFVG": 0, "MOMENTUM": 0, "NONE": 0}
+    entry_counts: Dict[str, int] = {"BREAKER": 0, "IFVG": 0, "MOMENTUM": 0, "LEGACY": 0, "NONE": 0}
+    tier_counts: Dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0, "NONE": 0}
     entry_model_counts: Dict[str, int] = {"MARKET": 0, "STOP": 0}
     sl_pips_list: List[float] = []
     tp_pips_list: List[float] = []
     rejection_reasons: Dict[str, int] = {}
+    zone_rejections: Dict[str, int] = {"too_far": 0, "too_old": 0, "too_many_touches": 0, "stale": 0}
     non_fresh_zones = 0
     strong_trend_cycles = 0
+    ifvg_zone_count = 0
 
     risk_manager = ScalpingRiskManager()
 
@@ -49,29 +52,40 @@ def run(csv_path: str, limit: int | None) -> int:
 
         entry_type = "NONE"
         entry_model = "MARKET"
+        entry_tier = "NONE"
         entry_level = None
         entry_context = {}
         signal_context = {}
         flow_zones = {}
 
         if result.context:
-            entry_type = result.context.get("entry_type", "NONE") or "NONE"
-            entry_model = result.context.get("entry_model", "MARKET") or "MARKET"
             entry_idea = result.context.get("entry_idea", {}) or {}
+            entry_type = entry_idea.get("entry_type", "NONE") or "NONE"
+            entry_model = entry_idea.get("entry_model", "MARKET") or "MARKET"
+            entry_tier = entry_idea.get("tier", "NONE") or "NONE"
             entry_level = entry_idea.get("entry_level") or result.entry_price
-            entry_context = result.context.get("entry_context", {}) or {}
-            signal_context = result.context.get("signal_context", {}) or {}
-            flow_zones = result.context.get("flow_zones", {}) or {}
+            entry_context = entry_idea.get("metrics", {}) or result.context.get("entry_context", {}) or {}
+            signal_context = result.context.get("analysis_signal_context", {}) or {}
+            analysis_data = result.context.get("analysis_data", {}) or {}
+            flow_zones = analysis_data.get("flow_zones", {}) or {}
+            rejections = entry_context.get("zone_rejections", {}) or {}
+            for key in zone_rejections.keys():
+                zone_rejections[key] += int(rejections.get(key, 0) or 0)
 
         if signal_context.get("strong_trend"):
             strong_trend_cycles += 1
 
         entry_counts.setdefault(entry_type, 0)
         entry_counts[entry_type] += 1
+        tier_counts.setdefault(entry_tier, 0)
+        tier_counts[entry_tier] += 1
         entry_model_counts.setdefault(entry_model, 0)
         entry_model_counts[entry_model] += 1
 
-        for zone in (flow_zones.get("breakers") or []) + (flow_zones.get("inversion_fvgs") or []):
+        breakers = flow_zones.get("breakers") or []
+        inversion_fvgs = flow_zones.get("inversion_fvgs") or []
+        ifvg_zone_count += len(inversion_fvgs)
+        for zone in breakers + inversion_fvgs:
             if zone and not zone.get("fresh", True):
                 non_fresh_zones += 1
 
@@ -100,11 +114,18 @@ def run(csv_path: str, limit: int | None) -> int:
     tp_avg = sum(tp_pips_list) / len(tp_pips_list) if tp_pips_list else 0.0
 
     print("Entry type counts:")
-    for key in ["BREAKER", "IFVG", "MOMENTUM", "NONE"]:
+    for key in ["BREAKER", "IFVG", "MOMENTUM", "LEGACY", "NONE"]:
         print(f"  {key}: {entry_counts.get(key, 0)}")
+    print("Tier counts:")
+    for key in ["A", "B", "C", "D", "NONE"]:
+        print(f"  {key}: {tier_counts.get(key, 0)}")
     print("Entry model counts:")
     for key in ["MARKET", "STOP"]:
         print(f"  {key}: {entry_model_counts.get(key, 0)}")
+    print("Zone rejections:")
+    for key in ["too_many_touches", "stale", "too_far", "too_old"]:
+        print(f"  {key}: {zone_rejections.get(key, 0)}")
+    print(f"Detected IFVG zones: {ifvg_zone_count}")
     print(f"Non-fresh zones observed: {non_fresh_zones}")
     print(f"Average SL pips: {sl_avg:.2f}")
     print(f"Average TP pips: {tp_avg:.2f}")
@@ -129,6 +150,9 @@ def run(csv_path: str, limit: int | None) -> int:
     if entry_model_counts.get("MARKET", 0) == 0 or entry_model_counts.get("STOP", 0) == 0:
         failed = True
         diagnostics.append("Entry model is not diversified (missing MARKET or STOP).")
+    if ifvg_zone_count == 0:
+        failed = True
+        diagnostics.append("IFVG detection is zero (possible inversion FVG bug).")
     if tp_pips_list and max(tp_pips_list) > 100:
         failed = True
         diagnostics.append(f"TP pips exceeded 100 (max={max(tp_pips_list):.2f})")

@@ -162,17 +162,105 @@ class SMCAnalyzer:
             "ok": ok,
         }
 
-    def _is_zone_touch(self, high: float, low: float, top: float, bottom: float) -> bool:
-        return low <= top and high >= bottom
+    def _zone_penetration(self, atr_value: float) -> float:
+        try:
+            penetration_atr = float(self.settings.get("FLOW_TOUCH_PENETRATION_ATR", 0.05))
+        except Exception:
+            penetration_atr = 0.05
+        return float(atr_value) * penetration_atr if atr_value else 0.0
 
-    def _count_zone_touches(self, df: pd.DataFrame, start_idx: int, top: float, bottom: float) -> int:
+    def _is_zone_touch(
+        self,
+        high: float,
+        low: float,
+        close: float,
+        top: float,
+        bottom: float,
+        atr_value: float,
+    ) -> bool:
+        penetration = self._zone_penetration(atr_value)
+        close_in_zone = bottom <= close <= top
+        wick_from_above = high >= top and low <= top - penetration
+        wick_from_below = low <= bottom and high >= bottom + penetration
+        mid = (top + bottom) / 2.0
+        mid_touched = abs(close - mid) <= penetration
+        return close_in_zone or wick_from_above or wick_from_below or mid_touched
+
+    def _count_zone_touches(
+        self,
+        df: pd.DataFrame,
+        start_idx: int,
+        top: float,
+        bottom: float,
+        atr_value: float,
+    ) -> int:
         touches = 0
         for j in range(start_idx, len(df)):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
-            if self._is_zone_touch(high, low, top, bottom):
+            close = float(df["close"].iloc[j])
+            if self._is_zone_touch(high, low, close, top, bottom, atr_value):
                 touches += 1
         return touches
+
+    def _scan_zone_touches(
+        self,
+        df: pd.DataFrame,
+        start_idx: int,
+        top: float,
+        bottom: float,
+        zone_type: str,
+        atr_value: float,
+        retest_policy: str,
+    ) -> Tuple[Optional[int], Optional[int], int, bool, str]:
+        touch_indices: List[int] = []
+        confirmed_hits: List[Tuple[int, str]] = []
+        first_touch_idx = None
+
+        for j in range(start_idx, len(df)):
+            high = float(df["high"].iloc[j])
+            low = float(df["low"].iloc[j])
+            close = float(df["close"].iloc[j])
+            if self._is_zone_touch(high, low, close, top, bottom, atr_value):
+                if first_touch_idx is None:
+                    first_touch_idx = j
+                touch_indices.append(j)
+                confirmed, reason = self._confirm_retest(
+                    df=df,
+                    retest_idx=j,
+                    zone_type=zone_type,
+                    top=top,
+                    bottom=bottom,
+                    atr_value=atr_value,
+                )
+                if confirmed:
+                    confirmed_hits.append((j, reason))
+
+        touch_count = len(touch_indices)
+        retest_idx = None
+        retest_reason = "NO_TOUCH"
+        eligible = False
+
+        if touch_count == 0:
+            return first_touch_idx, retest_idx, touch_count, eligible, retest_reason
+
+        retest_policy = str(retest_policy or "").upper()
+        if retest_policy == "FIRST_TOUCH":
+            retest_idx = first_touch_idx
+            if confirmed_hits and confirmed_hits[0][0] == first_touch_idx:
+                eligible = True
+                retest_reason = confirmed_hits[0][1]
+            else:
+                retest_reason = "FIRST_TOUCH_UNCONFIRMED"
+        else:
+            if confirmed_hits:
+                retest_idx, retest_reason = confirmed_hits[-1]
+                eligible = True
+            else:
+                retest_idx = touch_indices[-1]
+                retest_reason = "NO_CONFIRMED_TOUCH"
+
+        return first_touch_idx, retest_idx, touch_count, eligible, retest_reason
 
     def _confirm_retest(
         self,
@@ -196,7 +284,7 @@ class SMCAnalyzer:
         direction = "BULLISH" if "BULLISH" in zone_type else "BEARISH"
         mid = (top + bottom) / 2.0
 
-        if not self._is_zone_touch(high, low, top, bottom):
+        if not self._is_zone_touch(high, low, close, top, bottom, atr_value):
             return False, "NO_TOUCH"
 
         if direction == "BULLISH" and low <= top and close > top:
@@ -297,26 +385,19 @@ class SMCAnalyzer:
                 continue
 
             retest_idx = None
-            for j in range(break_idx + 1, len(df)):
-                high = float(df["high"].iloc[j])
-                low = float(df["low"].iloc[j])
-                if self._is_zone_touch(high, low, ob_high, ob_low):
-                    retest_idx = j
-                    break
-
-            if retest_idx is None:
-                continue
-
             zone_type = "BULLISH_BREAKER" if ob["type"] == "BEARISH_OB" else "BEARISH_BREAKER"
-            confirmed, retest_reason = self._confirm_retest(
+            retest_policy = str(self.settings.get("FLOW_RETEST_POLICY", "FIRST_TOUCH"))
+            first_touch_idx, retest_idx, touch_count, eligible, retest_reason = self._scan_zone_touches(
                 df=df,
-                retest_idx=retest_idx,
-                zone_type=zone_type,
+                start_idx=break_idx + 1,
                 top=ob_high,
                 bottom=ob_low,
+                zone_type=zone_type,
                 atr_value=atr_value,
+                retest_policy=retest_policy,
             )
-            if not confirmed:
+
+            if touch_count == 0 or retest_idx is None:
                 self._log_info(
                     "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
                     zone_type,
@@ -325,14 +406,21 @@ class SMCAnalyzer:
                 )
                 continue
 
-            touch_count = self._count_zone_touches(df, retest_idx, ob_high, ob_low)
-            fresh = touch_count <= 1
-            max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 1))
+            if not eligible:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
+                    zone_type,
+                    retest_idx,
+                    retest_reason,
+                )
+                continue
+
+            max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
             touch_penalty = float(self.settings.get("FLOW_TOUCH_PENALTY", 0.55))
 
             if touch_count > max_touches:
                 self._log_info(
-                    "[NDS][FLOW][RETEST_REJECT] type=%s idx=%s touch_count=%s max=%s",
+                    "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
                     zone_type,
                     retest_idx,
                     touch_count,
@@ -340,6 +428,7 @@ class SMCAnalyzer:
                 )
                 continue
 
+            fresh = touch_count == 1
             age_bars = max(0, last_idx - retest_idx)
             confidence = float(disp_meta.get("score", 0.0))
             confidence *= max(0.3, 1.0 - (age_bars / 200.0))
@@ -357,9 +446,11 @@ class SMCAnalyzer:
                     "disp_atr": disp_meta.get("disp_atr", 0.0),
                     "confidence": confidence,
                     "source_ob_index": ob_idx,
-                    "first_touch_index": retest_idx,
+                    "first_touch_index": first_touch_idx,
+                    "retest_index": retest_idx,
                     "touch_count": touch_count,
                     "fresh": fresh,
+                    "eligible": True,
                     "notes": f"break_idx={break_idx} retest_idx={retest_idx}",
                 }
             )
@@ -408,6 +499,7 @@ class SMCAnalyzer:
             bottom = float(fvg.bottom)
             break_idx = None
             disp_meta = None
+            zone_type = None
 
             if fvg.type == FVGType.BULLISH:
                 for j in range(fvg_idx + 1, len(df)):
@@ -421,19 +513,8 @@ class SMCAnalyzer:
                         )
                         if disp_meta["ok"]:
                             break_idx = j
+                            zone_type = "BEARISH_IFVG"
                             break
-            if break_idx is None:
-                continue
-                retest_idx = None
-                for j in range(break_idx + 1, len(df)):
-                    high = float(df["high"].iloc[j])
-                    low = float(df["low"].iloc[j])
-                    if self._is_zone_touch(high, low, top, bottom):
-                        retest_idx = j
-                        break
-                if retest_idx is None:
-                    continue
-                zone_type = "BEARISH_IFVG"
             else:
                 for j in range(fvg_idx + 1, len(df)):
                     close = float(df["close"].iloc[j])
@@ -446,29 +527,24 @@ class SMCAnalyzer:
                         )
                         if disp_meta["ok"]:
                             break_idx = j
+                            zone_type = "BULLISH_IFVG"
                             break
-                if break_idx is None:
-                    continue
-                retest_idx = None
-                for j in range(break_idx + 1, len(df)):
-                    high = float(df["high"].iloc[j])
-                    low = float(df["low"].iloc[j])
-                    if self._is_zone_touch(high, low, top, bottom):
-                        retest_idx = j
-                        break
-                if retest_idx is None:
-                    continue
-                zone_type = "BULLISH_IFVG"
 
-            confirmed, retest_reason = self._confirm_retest(
+            if break_idx is None or zone_type is None:
+                continue
+
+            retest_policy = str(self.settings.get("FLOW_RETEST_POLICY", "FIRST_TOUCH"))
+            first_touch_idx, retest_idx, touch_count, eligible, retest_reason = self._scan_zone_touches(
                 df=df,
-                retest_idx=retest_idx,
-                zone_type=zone_type,
+                start_idx=break_idx + 1,
                 top=top,
                 bottom=bottom,
+                zone_type=zone_type,
                 atr_value=atr_value,
+                retest_policy=retest_policy,
             )
-            if not confirmed:
+
+            if touch_count == 0 or retest_idx is None:
                 self._log_info(
                     "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
                     zone_type,
@@ -477,13 +553,20 @@ class SMCAnalyzer:
                 )
                 continue
 
-            touch_count = self._count_zone_touches(df, retest_idx, top, bottom)
-            fresh = touch_count <= 1
-            max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 1))
+            if not eligible:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
+                    zone_type,
+                    retest_idx,
+                    retest_reason,
+                )
+                continue
+
+            max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
             touch_penalty = float(self.settings.get("FLOW_TOUCH_PENALTY", 0.55))
             if touch_count > max_touches:
                 self._log_info(
-                    "[NDS][FLOW][RETEST_REJECT] type=%s idx=%s touch_count=%s max=%s",
+                    "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
                     zone_type,
                     retest_idx,
                     touch_count,
@@ -491,6 +574,7 @@ class SMCAnalyzer:
                 )
                 continue
 
+            fresh = touch_count == 1
             age_bars = max(0, last_idx - retest_idx)
             confidence = float(disp_meta.get("score", 0.0))
             confidence *= max(0.3, 1.0 - (age_bars / 200.0))
@@ -506,9 +590,11 @@ class SMCAnalyzer:
                     "age_bars": age_bars,
                     "disp_atr": disp_meta.get("disp_atr", 0.0),
                     "confidence": confidence,
-                    "first_touch_index": retest_idx,
+                    "first_touch_index": first_touch_idx,
+                    "retest_index": retest_idx,
                     "touch_count": touch_count,
                     "fresh": fresh,
+                    "eligible": True,
                     "notes": f"break_idx={break_idx} retest_idx={retest_idx}",
                 }
             )

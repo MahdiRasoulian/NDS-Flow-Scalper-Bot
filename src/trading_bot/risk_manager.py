@@ -1093,7 +1093,8 @@ class ScalpingRiskManager:
             deviation_pips=deviation_pips,
             decision_notes=decision_notes,
             is_trade_allowed=True,
-            reject_reason=None
+            reject_reason=None,
+            tp2=tp2_price,
         )
 
 
