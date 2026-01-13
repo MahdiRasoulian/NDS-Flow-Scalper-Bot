@@ -99,6 +99,290 @@ class SMCAnalyzer:
         disp_atr = displacement / atr_value if atr_value > 0 else 0.0
         return displacement, disp_atr
 
+    def _displacement_score(
+        self,
+        candle: pd.Series,
+        atr_value: float,
+        rvol: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Score displacement quality for a candle (0..1).
+
+        Returns:
+          {
+            "disp_atr": float,
+            "body_ratio": float,
+            "wick_ratio": float,
+            "rvol_factor": float,
+            "score": float,
+            "ok": bool
+          }
+        """
+        try:
+            open_ = float(candle["open"])
+            high = float(candle["high"])
+            low = float(candle["low"])
+            close = float(candle["close"])
+        except Exception:
+            return {
+                "disp_atr": 0.0,
+                "body_ratio": 0.0,
+                "wick_ratio": 1.0,
+                "rvol_factor": 1.0,
+                "score": 0.0,
+                "ok": False,
+            }
+
+        candle_range = max(1e-6, high - low)
+        body = abs(close - open_)
+        body_ratio = body / candle_range
+        upper_wick = high - max(open_, close)
+        lower_wick = min(open_, close) - low
+        wick_ratio = (upper_wick + lower_wick) / candle_range
+
+        atr_value = float(atr_value) if atr_value else 0.0
+        disp_atr = (body / atr_value) if atr_value > 0 else 0.0
+
+        rvol_factor = self._volume_factor(rvol) if rvol is not None else 1.0
+        disp_component = min(1.0, disp_atr / 1.2) if disp_atr > 0 else 0.0
+        wick_component = max(0.0, 1.0 - wick_ratio)
+
+        base_score = (0.45 * disp_component) + (0.35 * body_ratio) + (0.2 * wick_component)
+        score = min(1.0, base_score * min(1.15, rvol_factor))
+
+        min_score = float(self.settings.get("DISPLACEMENT_SCORE_MIN", 0.55))
+        ok = score >= min_score
+
+        return {
+            "disp_atr": disp_atr,
+            "body_ratio": body_ratio,
+            "wick_ratio": wick_ratio,
+            "rvol_factor": rvol_factor,
+            "score": score,
+            "ok": ok,
+        }
+
+    def _find_breaker_blocks(self, df: pd.DataFrame, swings: List[SwingPoint]) -> List[Dict[str, Any]]:
+        """Identify breaker blocks (OB -> displacement break -> inversion retest)."""
+        breakers: List[Dict[str, Any]] = []
+        if df is None or len(df) < 6:
+            return breakers
+
+        atr_value = float(self.atr) if self.atr else 0.0
+        min_move_mult = float(self.settings.get("BRK_MIN_MOVE_ATR", 0.8))
+        min_move = atr_value * min_move_mult if atr_value > 0 else 0.0
+        lookback = int(self.settings.get("BRK_LOOKBACK_BARS", 180))
+        start_idx = max(2, len(df) - lookback)
+        last_idx = len(df) - 1
+
+        raw_obs: List[Dict[str, Any]] = []
+        for i in range(start_idx, len(df) - 2):
+            candle_a = df.iloc[i]
+            candle_b = df.iloc[i + 1]
+            a_open = float(candle_a["open"])
+            a_close = float(candle_a["close"])
+            a_high = float(candle_a["high"])
+            a_low = float(candle_a["low"])
+            b_close = float(candle_b["close"])
+            b_open = float(candle_b["open"])
+
+            is_red = a_close < a_open
+            is_green = a_close > a_open
+
+            move_up = b_close - a_high
+            move_down = a_low - b_close
+
+            if is_red and b_close > a_high and (move_up >= min_move):
+                raw_obs.append(
+                    {"type": "BEARISH_OB", "high": a_high, "low": a_low, "index": i}
+                )
+            if is_green and b_close < a_low and (move_down >= min_move):
+                raw_obs.append(
+                    {"type": "BULLISH_OB", "high": a_high, "low": a_low, "index": i}
+                )
+
+        for ob in raw_obs:
+            ob_high = float(ob["high"])
+            ob_low = float(ob["low"])
+            ob_idx = int(ob["index"])
+            break_idx = None
+            disp_meta = None
+
+            for j in range(ob_idx + 1, len(df)):
+                candle = df.iloc[j]
+                close = float(candle["close"])
+                if ob["type"] == "BEARISH_OB" and close > ob_high:
+                    disp_meta = self._displacement_score(
+                        candle,
+                        atr_value,
+                        rvol=candle.get("rvol") if "rvol" in df.columns else None,
+                    )
+                    if disp_meta["ok"]:
+                        break_idx = j
+                        break
+                if ob["type"] == "BULLISH_OB" and close < ob_low:
+                    disp_meta = self._displacement_score(
+                        candle,
+                        atr_value,
+                        rvol=candle.get("rvol") if "rvol" in df.columns else None,
+                    )
+                    if disp_meta["ok"]:
+                        break_idx = j
+                        break
+
+            if break_idx is None:
+                continue
+
+            retest_idx = None
+            for j in range(break_idx + 1, len(df)):
+                high = float(df["high"].iloc[j])
+                low = float(df["low"].iloc[j])
+                if (low <= ob_high) and (high >= ob_low):
+                    retest_idx = j
+
+            if retest_idx is None:
+                continue
+
+            age_bars = max(0, last_idx - retest_idx)
+            zone_type = "BULLISH_BREAKER" if ob["type"] == "BEARISH_OB" else "BEARISH_BREAKER"
+            confidence = float(disp_meta.get("score", 0.0))
+            confidence *= max(0.3, 1.0 - (age_bars / 200.0))
+
+            breakers.append(
+                {
+                    "type": zone_type,
+                    "top": ob_high,
+                    "bottom": ob_low,
+                    "mid": (ob_high + ob_low) / 2.0,
+                    "index": retest_idx,
+                    "age_bars": age_bars,
+                    "disp_atr": disp_meta.get("disp_atr", 0.0),
+                    "confidence": confidence,
+                    "source_ob_index": ob_idx,
+                    "notes": f"break_idx={break_idx} retest_idx={retest_idx}",
+                }
+            )
+
+        self._log_info("[NDS][SMC][BREAKER] detected=%s", len(breakers))
+        if self.debug_smc and breakers:
+            for z in breakers[:6]:
+                self._log_verbose(
+                    "[NDS][SMC][BREAKER] %s idx=%s age=%s zone=[%.2f-%.2f] disp_atr=%.2f conf=%.2f",
+                    z.get("type"),
+                    z.get("index"),
+                    z.get("age_bars"),
+                    float(z.get("bottom", 0.0)),
+                    float(z.get("top", 0.0)),
+                    float(z.get("disp_atr", 0.0)),
+                    float(z.get("confidence", 0.0)),
+                )
+
+        return breakers
+
+    def _find_inversion_fvgs(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Identify inversion FVGs (FVG broken then retested as inverse zone).
+
+        Definitions:
+        - Bullish IFVG: bearish FVG is broken upward (close > top) and later retested as support.
+        - Bearish IFVG: bullish FVG is broken downward (close < bottom) and later retested as resistance.
+        """
+        ifvgs: List[Dict[str, Any]] = []
+        if df is None or len(df) < 6:
+            return ifvgs
+
+        atr_value = float(self.atr) if self.atr else 0.0
+        fvgs = self.detect_fvgs()
+        last_idx = len(df) - 1
+
+        for fvg in fvgs:
+            fvg_idx = int(getattr(fvg, "index", 0))
+            top = float(fvg.top)
+            bottom = float(fvg.bottom)
+            break_idx = None
+            disp_meta = None
+
+            if fvg.type == FVGType.BULLISH:
+                for j in range(fvg_idx + 1, len(df)):
+                    close = float(df["close"].iloc[j])
+                    if close < bottom:
+                        candle = df.iloc[j]
+                        disp_meta = self._displacement_score(
+                            candle,
+                            atr_value,
+                            rvol=candle.get("rvol") if "rvol" in df.columns else None,
+                        )
+                        if disp_meta["ok"]:
+                            break_idx = j
+                            break
+                if break_idx is None:
+                    continue
+                retest_idx = None
+                for j in range(break_idx + 1, len(df)):
+                    high = float(df["high"].iloc[j])
+                    low = float(df["low"].iloc[j])
+                    if (low <= top) and (high >= bottom):
+                        retest_idx = j
+                if retest_idx is None:
+                    continue
+                zone_type = "BEARISH_IFVG"
+            else:
+                for j in range(fvg_idx + 1, len(df)):
+                    close = float(df["close"].iloc[j])
+                    if close > top:
+                        candle = df.iloc[j]
+                        disp_meta = self._displacement_score(
+                            candle,
+                            atr_value,
+                            rvol=candle.get("rvol") if "rvol" in df.columns else None,
+                        )
+                        if disp_meta["ok"]:
+                            break_idx = j
+                            break
+                if break_idx is None:
+                    continue
+                retest_idx = None
+                for j in range(break_idx + 1, len(df)):
+                    high = float(df["high"].iloc[j])
+                    low = float(df["low"].iloc[j])
+                    if (low <= top) and (high >= bottom):
+                        retest_idx = j
+                if retest_idx is None:
+                    continue
+                zone_type = "BULLISH_IFVG"
+
+            age_bars = max(0, last_idx - retest_idx)
+            confidence = float(disp_meta.get("score", 0.0))
+            confidence *= max(0.3, 1.0 - (age_bars / 200.0))
+            ifvgs.append(
+                {
+                    "type": zone_type,
+                    "top": top,
+                    "bottom": bottom,
+                    "mid": (top + bottom) / 2.0,
+                    "index": retest_idx,
+                    "age_bars": age_bars,
+                    "disp_atr": disp_meta.get("disp_atr", 0.0),
+                    "confidence": confidence,
+                    "notes": f"break_idx={break_idx} retest_idx={retest_idx}",
+                }
+            )
+
+        self._log_info("[NDS][SMC][IFVG] detected=%s", len(ifvgs))
+        if self.debug_smc and ifvgs:
+            for z in ifvgs[:6]:
+                self._log_verbose(
+                    "[NDS][SMC][IFVG] %s idx=%s age=%s zone=[%.2f-%.2f] disp_atr=%.2f conf=%.2f",
+                    z.get("type"),
+                    z.get("index"),
+                    z.get("age_bars"),
+                    float(z.get("bottom", 0.0)),
+                    float(z.get("top", 0.0)),
+                    float(z.get("disp_atr", 0.0)),
+                    float(z.get("confidence", 0.0)),
+                )
+
+        return ifvgs
+
     def _extract_candle_metrics(self) -> Dict[str, float]:
         try:
             candle = self.df.iloc[-1]
@@ -1206,6 +1490,14 @@ class SMCAnalyzer:
             structure.structure_score_breakdown = structure_score_breakdown
         except Exception:
             pass
+
+        try:
+            breakers = self._find_breaker_blocks(self.df, swings)
+            inversion_fvgs = self._find_inversion_fvgs(self.df)
+            setattr(structure, "breakers", breakers)
+            setattr(structure, "inversion_fvgs", inversion_fvgs)
+        except Exception as e:
+            self._log_debug("[NDS][SMC][FLOW_ZONES] detection failed: %s", e)
 
         self._log_info(
             "[NDS][SMC][STRUCTURE] Trend=%s BOS=%s CHOCH=%s Conf=%.1f%% TrendConf=%.1f%% Score=%.1f",
