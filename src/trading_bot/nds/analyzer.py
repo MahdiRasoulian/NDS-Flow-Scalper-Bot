@@ -133,6 +133,12 @@ class GoldNDSAnalyzer:
             'ADX_OVERRIDE_THRESHOLD': float,
             'ADX_OVERRIDE_PERSISTENCE_BARS': int,
             'ADX_OVERRIDE_REQUIRE_BOS': bool,
+            'ENABLE_LEGACY_SWING_ENTRY': bool,
+            'FLOW_STOP_BUFFER_ATR': float,
+            'FLOW_RETEST_POLICY': str,
+            'FLOW_TOUCH_PENETRATION_ATR': float,
+            'FLOW_MAX_TOUCHES': int,
+            'FLOW_TOUCH_PENALTY': float,
         }
 
         validated_config: Dict[str, Any] = {}
@@ -575,7 +581,7 @@ class GoldNDSAnalyzer:
                 sweeps=sweeps,
             )
 
-            signal_context = self._build_signal_context(
+            analysis_signal_context = self._build_signal_context(
                 structure=final_structure,
                 score=score,
                 confidence=confidence,
@@ -589,12 +595,12 @@ class GoldNDSAnalyzer:
 
             self._log_info(
                 "[NDS][BIAS] bias=%s trend=%s adx=%.2f di=%.2f/%.2f structure_score=%.1f",
-                signal_context.get("bias"),
-                signal_context.get("trend"),
+                analysis_signal_context.get("bias"),
+                analysis_signal_context.get("trend"),
                 float(adx_v),
                 float(plus_di),
                 float(minus_di),
-                float(signal_context.get("structure_score", 0.0)),
+                float(analysis_signal_context.get("structure_score", 0.0)),
             )
 
             signal = self._determine_signal(
@@ -602,7 +608,7 @@ class GoldNDSAnalyzer:
                 confidence,
                 volatility_state,
                 scalping_mode,
-                context=signal_context,
+                context=analysis_signal_context,
             )
 
             self._log_info(
@@ -638,11 +644,11 @@ class GoldNDSAnalyzer:
             try:
                 if "context" not in result_payload or result_payload.get("context") is None:
                     result_payload["context"] = {}
-                result_payload["context"]["signal_context"] = signal_context
+                result_payload["context"]["analysis_signal_context"] = analysis_signal_context
             except Exception as _ctx_e:
                 self._log_debug("[NDS][SIGNAL][CONTEXT] failed to attach signal context: %s", _ctx_e)
 
-            result_payload["signal_context"] = signal_context
+            result_payload["analysis_signal_context"] = analysis_signal_context
 
             try:
                 if "analysis_data" in result_payload and isinstance(result_payload["analysis_data"], dict):
@@ -661,10 +667,10 @@ class GoldNDSAnalyzer:
 
             ct_blocked = False
             ct_reason = "-"
-            if signal in {"BUY", "SELL"} and signal_context:
-                bias = signal_context.get("bias")
-                strong_trend = bool(signal_context.get("strong_trend"))
-                reversal_ok = bool(signal_context.get("reversal_ok"))
+            if signal in {"BUY", "SELL"} and analysis_signal_context:
+                bias = analysis_signal_context.get("bias")
+                strong_trend = bool(analysis_signal_context.get("strong_trend"))
+                reversal_ok = bool(analysis_signal_context.get("reversal_ok"))
                 counter_trend = (
                     (bias == "BULLISH" and signal == "SELL")
                     or (bias == "BEARISH" and signal == "BUY")
@@ -701,108 +707,42 @@ class GoldNDSAnalyzer:
             stop_loss = None
             take_profit = None
             entry_type = "NONE"
-            entry_model = "MARKET"
+            entry_model = "NONE"
             entry_source = None
             entry_context = {}
             entry_idea: Dict[str, Any] = {}
-            if signal in ["BUY", "SELL"]:
-                if scalping_mode:
-                    flow_entry = self._select_flow_entry(
-                        signal=signal,
-                        structure=final_structure,
-                        current_price=current_close,
-                        atr_value=atr_for_scoring,
-                        adx_value=adx_v,
-                        session_analysis=session_analysis,
-                        volume_analysis=volume_analysis,
-                        scalping_mode=scalping_mode,
-                        signal_context=signal_context,
-                    )
-                    entry_price = flow_entry.get("entry_level")
-                    entry_type = flow_entry.get("entry_type", "NONE")
-                    entry_model = flow_entry.get("entry_model", "MARKET")
-                    entry_source = flow_entry.get("entry_source")
-                    entry_context = flow_entry.get("entry_context", {}) or {}
-                    entry_idea = {
-                        "signal": flow_entry.get("signal", "NONE"),
-                        "entry_type": entry_type,
-                        "entry_model": entry_model,
-                        "entry_level": entry_price,
-                        "zone": entry_source,
-                        "confidence": flow_entry.get("entry_confidence", 0.0),
-                        "reason": flow_entry.get("entry_reason", "-"),
-                    }
-                    if flow_entry.get("entry_reason"):
-                        reasons.append(flow_entry["entry_reason"])
 
-                    self._log_info(
-                        "[NDS][FLOW_ENTRY] type=%s model=%s signal=%s reason=%s conf=%.1f",
-                        entry_type,
-                        entry_model,
-                        flow_entry.get("signal", "NONE"),
-                        flow_entry.get("entry_reason", "-"),
-                        confidence,
-                    )
+            entry_idea = self.select_entry_idea(
+                df=self.df,
+                structure=final_structure,
+                market_metrics={
+                    "atr": atr_v,
+                    "atr_short": atr_short_value,
+                    "adx": adx_v,
+                    "plus_di": plus_di,
+                    "minus_di": minus_di,
+                    "current_price": current_close,
+                    "signal": signal,
+                },
+                session_analysis=session_analysis,
+                signal_context=analysis_signal_context,
+                volume_analysis=volume_analysis,
+                scalping_mode=scalping_mode,
+                entry_factor=entry_factor,
+                fvgs=fvgs,
+                order_blocks=order_blocks,
+            )
 
-                    if entry_price is None:
-                        self._log_info(
-                            "[NDS][FLOW_ENTRY] trade skipped: missing entry_level (entry=%s)",
-                            entry_price,
-                        )
-                        signal = "NONE"
-                        entry_price = None
-                        entry_type = "NONE"
-                        entry_model = "MARKET"
-                        entry_source = None
-                        reasons.append("Trade skipped: no eligible Flow zone or momentum breakout.")
-                        result_payload["signal"] = "NONE"
-                else:
-                    entry_idea = self._build_entry_idea(
-                        signal=signal,
-                        fvgs=fvgs,
-                        order_blocks=order_blocks,
-                        structure=final_structure,
-                        atr_value=atr_for_scoring,
-                        entry_factor=entry_factor,
-                        current_price=current_close,
-                        adx_value=adx_v,
-                    )
-                    entry_price = entry_idea.get("entry_level")
-                    entry_type = entry_idea.get("entry_type", "LEGACY")
-                    entry_model = entry_idea.get("entry_model", "MARKET")
-                    entry_source = entry_idea.get("zone_meta")
-                    entry_context = entry_idea.get("metrics", {}) or {}
-                    if entry_idea.get("reason"):
-                        reasons.append(entry_idea["reason"])
+            entry_price = entry_idea.get("entry_level")
+            entry_type = entry_idea.get("entry_type", "NONE")
+            entry_model = entry_idea.get("entry_model", "NONE")
+            entry_source = entry_idea.get("zone")
+            entry_context = entry_idea.get("metrics", {}) or {}
+            if entry_idea.get("reason"):
+                reasons.append(entry_idea["reason"])
 
-                    if entry_price is None:
-                        self._log_info(
-                            "[NDS][ENTRY_IDEA] trade skipped: missing zone (entry=%s) -> signal NONE",
-                            entry_price,
-                        )
-                        signal = "NONE"
-                        entry_price = None
-                        entry_type = "NONE"
-                        entry_model = "MARKET"
-                        entry_source = None
-                        reasons.append("Trade skipped: no valid entry zone (FVG/OB) and fallback not allowed.")
-                        result_payload["signal"] = "NONE"
-            else:
-                self._log_info(
-                    "[NDS][FLOW_ENTRY] type=NONE signal=NONE reason=no_base_signal conf=%.1f",
-                    confidence,
-                )
-
-            if not entry_idea:
-                entry_idea = {
-                    "signal": "NONE",
-                    "entry_type": "NONE",
-                    "entry_model": "MARKET",
-                    "entry_level": None,
-                    "zone": None,
-                    "confidence": 0.0,
-                    "reason": "no_entry",
-                }
+            signal = entry_idea.get("signal", "NONE") or "NONE"
+            result_payload["signal"] = signal
 
             try:
                 if "context" not in result_payload or result_payload.get("context") is None:
@@ -817,6 +757,8 @@ class GoldNDSAnalyzer:
                 result_payload["context"]["entry_idea"] = entry_idea
                 result_payload["context"]["entry_source"] = entry_source
                 result_payload["context"]["entry_context"] = entry_context
+                result_payload["signal_context"] = entry_idea
+                result_payload["context"]["signal_context"] = entry_idea
             except Exception as _ctx_e:
                 self._log_debug("[NDS][SIGNAL][CONTEXT] failed to attach flow entry context: %s", _ctx_e)
 
@@ -898,7 +840,17 @@ class GoldNDSAnalyzer:
     def _normalize_session_name(self, session_name: str) -> str:
         if not session_name:
             return "OTHER"
-        normalized = SESSION_MAPPING.get(session_name, session_name)
+        raw = str(session_name).upper()
+        alias_map = {
+            "OVERLAP_PEAK": "OVERLAP",
+            "LONDON_NY_OVERLAP": "OVERLAP",
+            "NY_OVERLAP": "OVERLAP",
+            "NEWYORK": "NEW_YORK",
+            "NEWYORK_SESSION": "NEW_YORK",
+        }
+        if raw in alias_map:
+            return alias_map[raw]
+        normalized = SESSION_MAPPING.get(raw, raw)
         if normalized == "OVERLAP_PEAK":
             normalized = "OVERLAP"
         return normalized
@@ -1005,6 +957,128 @@ class GoldNDSAnalyzer:
             "recent_high": recent_high,
         }
 
+    def select_entry_idea(
+        self,
+        df: pd.DataFrame,
+        structure: MarketStructure,
+        market_metrics: Dict[str, Any],
+        session_analysis: SessionAnalysis,
+        signal_context: Dict[str, Any],
+        volume_analysis: Dict[str, Any],
+        scalping_mode: bool,
+        entry_factor: float,
+        fvgs: List[FVG],
+        order_blocks: List[OrderBlock],
+    ) -> Dict[str, Any]:
+        """Single authoritative entry idea selector for Flow-tier logic."""
+        base_signal = str(market_metrics.get("signal", "NONE") or "NONE")
+        if base_signal not in {"BUY", "SELL"}:
+            self._log_info(
+                "[NDS][FLOW_DECISION] tier=NONE type=NONE allowed=false reject=BASE_SIGNAL_NONE reason=no_base_signal",
+            )
+            return {
+                "signal": "NONE",
+                "tier": "NONE",
+                "entry_type": "NONE",
+                "entry_model": "NONE",
+                "entry_level": None,
+                "zone": None,
+                "confidence": 0.0,
+                "reason": "no_base_signal",
+                "reject_reason": "BASE_SIGNAL_NONE",
+                "metrics": {},
+            }
+
+        flow_entry = self._select_flow_entry(
+            signal=base_signal,
+            structure=structure,
+            current_price=float(market_metrics.get("current_price", 0.0) or 0.0),
+            atr_value=float(market_metrics.get("atr_short") or market_metrics.get("atr") or 0.0),
+            adx_value=float(market_metrics.get("adx") or 0.0),
+            session_analysis=session_analysis,
+            volume_analysis=volume_analysis,
+            scalping_mode=scalping_mode,
+            signal_context=signal_context,
+        )
+        if flow_entry.get("signal") in {"BUY", "SELL"}:
+            return flow_entry
+
+        allow_legacy = bool(self.GOLD_SETTINGS.get("ENABLE_LEGACY_SWING_ENTRY", False))
+        if not allow_legacy:
+            return flow_entry
+
+        legacy_entry = self._select_legacy_entry_idea(
+            signal=base_signal,
+            fvgs=fvgs,
+            order_blocks=order_blocks,
+            structure=structure,
+            atr_value=float(market_metrics.get("atr_short") or market_metrics.get("atr") or 0.0),
+            entry_factor=entry_factor,
+            current_price=float(market_metrics.get("current_price", 0.0) or 0.0),
+            adx_value=float(market_metrics.get("adx") or 0.0),
+        )
+        if legacy_entry.get("signal") in {"BUY", "SELL"}:
+            return legacy_entry
+
+        return flow_entry
+
+    def _select_legacy_entry_idea(
+        self,
+        signal: str,
+        fvgs: List[FVG],
+        order_blocks: List[OrderBlock],
+        structure: MarketStructure,
+        atr_value: float,
+        entry_factor: float,
+        current_price: float,
+        adx_value: float,
+    ) -> Dict[str, Any]:
+        """Legacy swing fallback, disabled by default."""
+        idea = self._build_entry_idea(
+            signal=signal,
+            fvgs=fvgs,
+            order_blocks=order_blocks,
+            structure=structure,
+            atr_value=atr_value,
+            entry_factor=entry_factor,
+            current_price=current_price,
+            adx_value=adx_value,
+        )
+        entry_level = idea.get("entry_level")
+        if entry_level is None:
+            return {
+                "signal": "NONE",
+                "tier": "D",
+                "entry_type": "LEGACY",
+                "entry_model": "NONE",
+                "entry_level": None,
+                "zone": idea.get("zone_meta"),
+                "confidence": float(idea.get("confidence", 0.0) or 0.0),
+                "reason": "legacy_no_entry",
+                "reject_reason": "LEGACY_NO_ENTRY",
+                "metrics": idea.get("metrics", {}) or {},
+            }
+
+        self._log_info(
+            "[NDS][FLOW_DECISION] tier=D type=LEGACY model=%s signal=%s allowed=true reason=%s conf=%.2f",
+            idea.get("entry_model", "MARKET"),
+            signal,
+            idea.get("reason", "-"),
+            float(idea.get("confidence", 0.0) or 0.0),
+        )
+        return {
+            "signal": signal,
+            "tier": "D",
+            "entry_type": "LEGACY",
+            "entry_model": idea.get("entry_model", "MARKET"),
+            "entry_level": entry_level,
+            "zone": idea.get("zone_meta"),
+            "confidence": float(idea.get("confidence", 0.0) or 0.0),
+            "reason": idea.get("reason", "legacy_entry"),
+            "reject_reason": None,
+            "metrics": idea.get("metrics", {}) or {},
+        }
+
     def _select_flow_entry(
         self,
         signal: str,
@@ -1021,12 +1095,15 @@ class GoldNDSAnalyzer:
         if signal not in {"BUY", "SELL"}:
             return {
                 "signal": "NONE",
+                "tier": "NONE",
                 "entry_type": "NONE",
-                "entry_model": "MARKET",
+                "entry_model": "NONE",
                 "entry_level": None,
-                "entry_source": None,
-                "entry_reason": "signal=NONE",
-                "entry_context": {},
+                "zone": None,
+                "confidence": 0.0,
+                "reason": "signal=NONE",
+                "reject_reason": "BASE_SIGNAL_NONE",
+                "metrics": {},
             }
 
         settings = self.GOLD_SETTINGS
@@ -1044,53 +1121,67 @@ class GoldNDSAnalyzer:
                 spread_buffer = float(spread) * 1.2
             except Exception:
                 spread_buffer = 0.0
-        atr_buffer = float(atr_value) * 0.05 if atr_value else 0.0
+        buffer_atr = float(settings.get("FLOW_STOP_BUFFER_ATR", 0.05))
+        atr_buffer = float(atr_value) * buffer_atr if atr_value else 0.0
         buffer_price = max(spread_buffer, atr_buffer)
 
         breakers = getattr(structure, "breakers", []) or []
         ifvgs = getattr(structure, "inversion_fvgs", []) or []
 
+        rejection_counts = {
+            "too_far": 0,
+            "too_old": 0,
+            "too_many_touches": 0,
+            "stale": 0,
+            "ineligible": 0,
+        }
+
         def _tier_candidates(zones: List[Dict[str, Any]], side: str, max_dist_atr: float, max_age: int) -> List[Dict[str, Any]]:
             candidates = []
+            max_touches = int(settings.get("FLOW_MAX_TOUCHES", 2))
             for zone in zones:
+                if not bool(zone.get("eligible", True)):
+                    rejection_counts["ineligible"] += 1
+                    continue
                 z_type = str(zone.get("type", ""))
                 if side == "BUY" and "BULLISH" not in z_type:
                     continue
                 if side == "SELL" and "BEARISH" not in z_type:
+                    continue
+                if zone.get("stale"):
+                    rejection_counts["stale"] += 1
                     continue
                 mid = float(zone.get("mid", 0.0))
                 if mid <= 0:
                     continue
                 dist_atr = abs(float(current_price) - mid) / float(atr_value) if atr_value > 0 else 999.0
                 age = int(zone.get("age_bars", 9999))
-                if dist_atr <= max_dist_atr and age <= max_age:
-                    confidence = float(zone.get("confidence", 0.0))
-                    touch_count = int(zone.get("touch_count", 1))
-                    freshness_penalty = float(settings.get("FLOW_TOUCH_PENALTY", 0.55))
-                    util = confidence - (0.5 * dist_atr) - (0.1 * (age / max_age if max_age > 0 else 1.0))
-                    if touch_count > 1:
-                        util *= freshness_penalty
-                    candidates.append({**zone, "dist_atr": dist_atr, "util": util})
+                if dist_atr > max_dist_atr:
+                    rejection_counts["too_far"] += 1
+                    continue
+                if age > max_age:
+                    rejection_counts["too_old"] += 1
+                    continue
+                touch_count = int(zone.get("touch_count", 1))
+                if touch_count > max_touches:
+                    rejection_counts["too_many_touches"] += 1
+                    continue
+                confidence = float(zone.get("confidence", 0.0))
+                freshness_penalty = float(settings.get("FLOW_TOUCH_PENALTY", 0.55))
+                util = confidence - (0.5 * dist_atr) - (0.1 * (age / max_age if max_age > 0 else 1.0))
+                if touch_count > 1:
+                    util *= freshness_penalty
+                candidates.append({**zone, "dist_atr": dist_atr, "util": util})
             return candidates
 
         def _resolve_entry_model(side: str, top: float, bottom: float) -> Tuple[str, float, str]:
             if side == "BUY":
                 if bottom <= current_price <= top:
                     return "MARKET", float(current_price), "price_inside_zone"
-                if current_price < bottom:
-                    stop_level = float(bottom) + buffer_price
-                    if stop_level <= current_price:
-                        return "MARKET", float(current_price), "stop_below_market"
-                    return "STOP", stop_level, "price_below_zone"
-                return "MARKET", float(current_price), "price_above_zone"
+                return "STOP", float(top) + buffer_price, "price_outside_zone"
             if bottom <= current_price <= top:
                 return "MARKET", float(current_price), "price_inside_zone"
-            if current_price > top:
-                stop_level = float(top) - buffer_price
-                if stop_level >= current_price:
-                    return "MARKET", float(current_price), "stop_above_market"
-                return "STOP", stop_level, "price_above_zone"
-            return "MARKET", float(current_price), "price_below_zone"
+            return "STOP", float(bottom) - buffer_price, "price_outside_zone"
 
         brk_max_dist = float(settings.get("BRK_MAX_DIST_ATR", 0.5))
         brk_max_age = int(settings.get("BRK_MAX_AGE_BARS", 60))
@@ -1124,11 +1215,12 @@ class GoldNDSAnalyzer:
 
         entry_type = "NONE"
         entry_source = None
-        entry_model = "MARKET"
+        entry_model = "NONE"
         entry_level = None
         entry_reason = "no_zone"
         tier = "NONE"
         entry_confidence = 0.0
+        reject_reason = "NO_ELIGIBLE_ZONE"
 
         if brk_candidates:
             pick = max(brk_candidates, key=lambda z: float(z.get("util", 0.0)))
@@ -1138,6 +1230,7 @@ class GoldNDSAnalyzer:
             entry_reason = f"tier=A breaker retest ({entry_reason})"
             tier = "A"
             entry_confidence = float(pick.get("confidence", 0.0))
+            reject_reason = None
         elif ifvg_candidates:
             pick = max(ifvg_candidates, key=lambda z: float(z.get("util", 0.0)))
             entry_type = "IFVG"
@@ -1146,6 +1239,7 @@ class GoldNDSAnalyzer:
             entry_reason = f"tier=B inversion fvg ({entry_reason})"
             tier = "B"
             entry_confidence = float(pick.get("confidence", 0.0))
+            reject_reason = None
 
         momentum_reason = None
         if entry_level is None:
@@ -1176,7 +1270,10 @@ class GoldNDSAnalyzer:
             strong_trend = bool(signal_context.get("strong_trend"))
             time_ok = in_window or (strong_trend and time_error is None)
 
-            if adx_value >= momo_adx_min and time_ok and (session_ok or strong_trend) and liquidity_ok:
+            bias = str(signal_context.get("bias", "") or "")
+            bias_ok = (bias == "BULLISH" and signal == "BUY") or (bias == "BEARISH" and signal == "SELL") or not bias
+
+            if adx_value >= momo_adx_min and time_ok and (session_ok or strong_trend) and liquidity_ok and bias_ok:
                 buffer_atr = float(settings.get("MOMO_BUFFER_ATR_MULT", 0.1))
                 buffer_min_pips = float(settings.get("MOMO_BUFFER_MIN_PIPS", 1.0))
                 buffer_price = pips_to_price(buffer_min_pips, point_size)
@@ -1212,15 +1309,18 @@ class GoldNDSAnalyzer:
                 }
                 tier = "C"
                 entry_confidence = min(1.0, max(0.35, float(adx_value) / max(momo_adx_min, 1.0)))
+                reject_reason = None
             else:
                 momentum_reason = (
                     f"adx={adx_value:.1f}/{momo_adx_min:.1f} "
-                    f"window={in_window} session_ok={session_ok} liquidity_ok={liquidity_ok}"
+                    f"window={in_window} session_ok={session_ok} liquidity_ok={liquidity_ok} bias_ok={bias_ok}"
                 )
                 self._log_debug("[NDS][FLOW_TIER] tier=C momentum skipped (%s)", momentum_reason)
 
         if entry_level is None:
             entry_reason = entry_reason if momentum_reason is None else f"{entry_reason}; momo_block={momentum_reason}"
+            if reject_reason is None:
+                reject_reason = "NO_ENTRY"
 
         if entry_level is not None:
             entry_context.update(
@@ -1239,28 +1339,41 @@ class GoldNDSAnalyzer:
                 "buffer_price": buffer_price,
                 "recent_low": recent_low,
                 "recent_high": recent_high,
+                "zone_rejections": dict(rejection_counts),
             }
         )
 
         allowed = entry_level is not None
-        self._log_info(
-            "[NDS][FLOW_DECISION] tier=%s type=%s entry_model=%s allowed=%s reason=%s",
-            tier,
-            entry_type,
-            entry_model,
-            allowed,
-            entry_reason,
-        )
+        if allowed:
+            self._log_info(
+                "[NDS][FLOW_DECISION] tier=%s type=%s model=%s signal=%s allowed=true reason=%s conf=%.2f",
+                tier,
+                entry_type,
+                entry_model,
+                signal,
+                entry_reason,
+                entry_confidence,
+            )
+        else:
+            self._log_info(
+                "[NDS][FLOW_DECISION] tier=%s type=%s allowed=false reject=%s reason=%s",
+                tier,
+                entry_type,
+                reject_reason,
+                entry_reason,
+            )
 
         return {
             "signal": signal if entry_level is not None else "NONE",
+            "tier": tier if entry_level is not None else "NONE",
             "entry_type": entry_type if entry_level is not None else "NONE",
-            "entry_model": entry_model,
+            "entry_model": entry_model if entry_level is not None else "NONE",
             "entry_level": entry_level,
-            "entry_source": entry_source,
-            "entry_reason": entry_reason,
-            "entry_context": entry_context,
-            "entry_confidence": entry_confidence,
+            "zone": entry_source,
+            "confidence": entry_confidence,
+            "reason": entry_reason,
+            "reject_reason": reject_reason,
+            "metrics": entry_context,
         }
 
     def _calc_entry_distance_metrics(
@@ -2496,7 +2609,7 @@ class GoldNDSAnalyzer:
 
             if analysis_result.get('signal') in {'BUY', 'SELL'}:
                 context = analysis_result.get("context") or {}
-                signal_context = context.get("signal_context", {}) if isinstance(context, dict) else {}
+                signal_context = context.get("analysis_signal_context", {}) if isinstance(context, dict) else {}
                 bias = signal_context.get("bias")
                 strong_trend = bool(signal_context.get("strong_trend"))
                 reversal_ok = bool(signal_context.get("reversal_ok"))

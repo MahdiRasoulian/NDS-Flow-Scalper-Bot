@@ -209,3 +209,4 @@ class FinalizedOrderParams:
     decision_notes: List[str]
     is_trade_allowed: bool
     reject_reason: Optional[str] = None
+    tp2: Optional[float] = None
