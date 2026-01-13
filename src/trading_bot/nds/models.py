@@ -43,7 +43,7 @@ class SwingPoint:
     time: datetime
     type: SwingType
     side: str
-    
+
     def __str__(self):
         return f"{self.type.value} @ {self.price:.2f} ({self.time.strftime('%Y-%m-%d %H:%M')})"
 
@@ -58,11 +58,11 @@ class FVG:
     filled: bool = False
     size: float = 0.0
     strength: float = 1.0  # قدرت FVG از 0.5 تا 2.0
-    
+
     @property
     def height(self) -> float:
         return abs(self.top - self.bottom)
-    
+
     def is_price_in_fvg(self, price: float) -> bool:
         return min(self.top, self.bottom) <= price <= max(self.top, self.bottom)
 
@@ -74,7 +74,7 @@ class OrderBlock:
     time: datetime
     index: int
     strength: float = 1.0
-    
+
     @property
     def mid(self) -> float:
         return (self.high + self.low) / 2
@@ -104,28 +104,28 @@ class MarketStructure:
     volatility_state: Optional[str] = None  # 🔥 جدید: وضعیت نوسان
     adx_value: Optional[float] = None  # 🔥 جدید: قدرت روند
     structure_score: float = 0.0  # 🔥 جدید: امتیاز کلی ساختار
-    
+
     def __str__(self):
         confidence_str = f"Confidence: {self.bos_choch_confidence:.1%}" if self.bos_choch_confidence > 0 else "Confidence: N/A"
         return (f"Trend: {self.trend.value}, BOS: {self.bos}, CHoCH: {self.choch}, "
                 f"{confidence_str}, Range: {self.range_width or 0:.2f}, "
                 f"Score: {self.structure_score:.1f}")
-    
+
     def is_valid_structure(self) -> bool:
         """بررسی اعتبار ساختار شناسایی شده"""
         if self.bos == "NONE" and self.choch == "NONE":
             return False
-        
+
         # حداقل اطمینان ۴۰٪
         if self.bos_choch_confidence < 0.4:
             return False
-        
+
         # رنج معتبر (برای طلا حداقل ۲ ATR)
         if self.range_width and self.range_width < (self.current_price * 0.001):
             return False
-        
+
         return True
-    
+
     def get_structure_priority(self) -> int:
         """اولویت‌بندی ساختار برای معامله"""
         priority_map = {
@@ -196,18 +196,21 @@ class LivePriceSnapshot:
 
 @dataclass
 class FinalizedOrderParams:
+    # NOTE: In dataclasses, all non-default fields must come before default fields.
     signal: str
     order_type: str
     symbol: str
     entry_price: float
     stop_loss: float
     take_profit: float
-    take_profit2: Optional[float] = None
     lot_size: float
     risk_amount_usd: float
     rr_ratio: float
     deviation_pips: float
     decision_notes: List[str]
     is_trade_allowed: bool
+
+    # Optional / default fields (must be after non-default fields)
     reject_reason: Optional[str] = None
+    take_profit2: Optional[float] = None
     tp2: Optional[float] = None
