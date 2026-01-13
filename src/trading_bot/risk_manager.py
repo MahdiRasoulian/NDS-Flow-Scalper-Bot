@@ -550,7 +550,7 @@ class ScalpingRiskManager:
         recent_high: Optional[float],
         config_payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Compute scalping SL/TP with ATR and recent candle reference."""
+        """Compute scalping SL/TP with ATR and recent candle extrema reference."""
         settings = self.settings
         point_size = self._get_point_size(config_payload)
 
@@ -571,28 +571,28 @@ class ScalpingRiskManager:
 
         if atr_distance > 0 and ref_distance > 0:
             sl_distance = min(atr_distance, ref_distance)
+        elif atr_distance > 0:
+            sl_distance = atr_distance
         else:
-            sl_distance = max(atr_distance, ref_distance)
+            sl_distance = ref_distance
 
         if sl_distance <= 0:
             sl_distance = pips_to_price(sl_min_pips, point_size)
 
         sl_points = price_to_points(sl_distance, point_size)
         sl_pips = points_to_pips(sl_points)
-        clamp_reason = None
+        raw_sl_pips = sl_pips
         if sl_pips < sl_min_pips:
             sl_pips = sl_min_pips
             sl_distance = pips_to_price(sl_pips, point_size)
-            clamp_reason = "min"
         elif sl_pips > sl_max_pips:
             sl_pips = sl_max_pips
             sl_distance = pips_to_price(sl_pips, point_size)
-            clamp_reason = "max"
 
-        if clamp_reason:
+        if raw_sl_pips != sl_pips:
             self._logger.info(
-                "[NDS][SL_CLAMP] reason=%s sl_pips=%.2f bounds=[%.2f,%.2f]",
-                clamp_reason,
+                "[NDS][SL_CLAMP] raw=%.2f clamped=%.2f bounds=[%.2f,%.2f]",
+                raw_sl_pips,
                 sl_pips,
                 sl_min_pips,
                 sl_max_pips,
@@ -619,6 +619,58 @@ class ScalpingRiskManager:
             "ref_distance": ref_distance,
             "point_size": point_size,
         }
+
+    def _distance_sanity_check(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        point_size: float,
+        atr_value: Optional[float],
+    ) -> Tuple[bool, str]:
+        """Validate distance conversions across pips/points/usd/atr."""
+        tol_price = float(self.settings.get("DIST_SANITY_TOLERANCE_PRICE", 0.05))
+        tol_ratio = float(self.settings.get("DIST_SANITY_TOLERANCE_RATIO", 0.02))
+
+        metrics_sl = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=stop_loss,
+            point_size=point_size,
+            atr_value=atr_value,
+        )
+        metrics_tp = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=take_profit,
+            point_size=point_size,
+            atr_value=atr_value,
+        )
+
+        def _validate(metrics: Dict[str, Any], label: str) -> Optional[str]:
+            dist_price = float(metrics.get("dist_price") or 0.0)
+            dist_points = float(metrics.get("dist_points") or 0.0)
+            dist_pips = float(metrics.get("dist_pips") or 0.0)
+            dist_atr = metrics.get("dist_atr")
+
+            expected_price = pips_to_price(dist_pips, point_size)
+            expected_points = price_to_points(dist_price, point_size)
+
+            if abs(expected_price - dist_price) > tol_price:
+                return f"{label}:price_mismatch raw={dist_price:.4f} expected={expected_price:.4f}"
+            if abs(expected_points - dist_points) > (dist_points * tol_ratio + 1e-6):
+                return f"{label}:points_mismatch raw={dist_points:.4f} expected={expected_points:.4f}"
+            if dist_atr is not None and atr_value:
+                expected_atr = dist_price / float(atr_value) if float(atr_value) > 0 else None
+                if expected_atr is not None and abs(float(dist_atr) - expected_atr) > tol_ratio:
+                    return f"{label}:atr_mismatch raw={dist_atr:.4f} expected={expected_atr:.4f}"
+            return None
+
+        sl_issue = _validate(metrics_sl, "SL")
+        if sl_issue:
+            return False, sl_issue
+        tp_issue = _validate(metrics_tp, "TP")
+        if tp_issue:
+            return False, tp_issue
+        return True, "ok"
 
     def finalize_order(
         self,
@@ -655,25 +707,9 @@ class ScalpingRiskManager:
             )
 
         planned_entry = analysis_payload.get('entry_price')
-        stop_loss = analysis_payload.get('stop_loss')
-        take_profit = analysis_payload.get('take_profit')
+        stop_loss = None
+        take_profit = None
         confidence = analysis_payload.get('confidence')
-        if planned_entry is None:
-            return FinalizedOrderParams(
-                signal=signal,
-                order_type='NONE',
-                symbol=symbol,
-                entry_price=planned_entry or 0.0,
-                stop_loss=stop_loss or 0.0,
-                take_profit=take_profit or 0.0,
-                lot_size=0.0,
-                risk_amount_usd=0.0,
-                rr_ratio=0.0,
-                deviation_pips=0.0,
-                decision_notes=["Missing entry/SL/TP from analyzer."],
-                is_trade_allowed=False,
-                reject_reason="Analyzer did not provide entry."
-            )
 
         if confidence is None:
             confidence = 0.0
@@ -724,23 +760,52 @@ class ScalpingRiskManager:
                 reject_reason="Spread too high."
             )
 
-        risk_settings = config.get('risk_settings', {})
-        trading_settings = config.get('trading_settings', {})
-        risk_manager_config = config.get('risk_manager_config', {})
+        analysis_context = analysis_payload.get('context', {}) or {}
+        entry_idea = (
+            analysis_payload.get("entry_idea")
+            or analysis_context.get("entry_idea", {})
+            or {}
+        )
+        entry_model = entry_idea.get("entry_model") or analysis_payload.get("entry_model") or "MARKET"
+        planned_entry = entry_idea.get("entry_level")
+        market_metrics = analysis_payload.get('market_metrics') or analysis_context.get('market_metrics', {})
+        atr_value = market_metrics.get('atr_short') or market_metrics.get('atr')
 
-        max_deviation_pips = risk_settings.get('MAX_PRICE_DEVIATION_PIPS')
-        limit_min_confidence = risk_settings.get('LIMIT_ORDER_MIN_CONFIDENCE')
-        max_entry_atr_deviation = risk_settings.get('MAX_ENTRY_ATR_DEVIATION')
-        min_rr_ratio = risk_manager_config.get('MIN_RR_RATIO')
+        if planned_entry is None:
+            planned_entry = analysis_payload.get('entry_price')
 
-        if max_deviation_pips is None or limit_min_confidence is None or min_rr_ratio is None:
+        if planned_entry is None:
             return FinalizedOrderParams(
                 signal=signal,
                 order_type='NONE',
                 symbol=symbol,
-                entry_price=planned_entry,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
+                entry_price=0.0,
+                stop_loss=0.0,
+                take_profit=0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=0.0,
+                decision_notes=["Missing entry idea from analyzer."],
+                is_trade_allowed=False,
+                reject_reason="Missing entry idea."
+            )
+
+        risk_settings = config.get('risk_settings', {})
+        trading_settings = config.get('trading_settings', {})
+        risk_manager_config = config.get('risk_manager_config', {})
+
+        max_entry_atr_deviation = risk_settings.get('MAX_ENTRY_ATR_DEVIATION')
+        min_rr_ratio = risk_manager_config.get('MIN_RR_RATIO')
+
+        if min_rr_ratio is None:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=planned_entry or 0.0,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
                 lot_size=0.0,
                 risk_amount_usd=0.0,
                 rr_ratio=0.0,
@@ -763,109 +828,85 @@ class ScalpingRiskManager:
         )
         deviation_pips = float(deviation_metrics.get("dist_pips") or 0.0)
 
-        # ------------------------------------------------------------------
-        # ✅ افزودنی مرحله 4 (بدون حذف/تغییر منطق موجود):
-        # ثبت متریک‌های کلیدی Deviation در decision_notes برای تحلیل Rejectها
-        # ------------------------------------------------------------------
         decision_notes.append(
             f"PlannedEntry={planned_entry:.2f} MarketEntry={market_entry:.2f} deviation_pips={deviation_pips:.1f} conf={float(confidence):.1f}"
         )
-        # ------------------------------------------------------------------
 
-        order_type = 'MARKET'
-        entry_price = market_entry
+        order_type = "STOP" if str(entry_model).upper() == "STOP" else "MARKET"
+        entry_price = planned_entry if order_type == "STOP" else market_entry
 
-        if deviation_pips > max_deviation_pips:
-            if confidence >= limit_min_confidence:
-                order_type = 'LIMIT'
-                entry_price = planned_entry
-                decision_notes.append(
-                    f"Deviation {deviation_pips:.1f} pips > max {max_deviation_pips:.1f}: using LIMIT."
-                )
-            else:
-                decision_notes.append(
-                    f"Deviation {deviation_pips:.1f} pips > max {max_deviation_pips:.1f} with low confidence."
-                )
+        if order_type == "STOP":
+            if signal == "BUY" and planned_entry <= ask:
+                decision_notes.append("Stop already triggered; switching to MARKET.")
+                order_type = "MARKET"
+                entry_price = market_entry
+            elif signal == "SELL" and planned_entry >= bid:
+                decision_notes.append("Stop already triggered; switching to MARKET.")
+                order_type = "MARKET"
+                entry_price = market_entry
 
-                # ------------------------------------------------------------------
-                # ✅ افزودنی مرحله 4 (بدون حذف/تغییر منطق موجود):
-                # لاگ واضح هنگام Reject برای دیده‌شدن سریع در لاگ‌های runtime
-                # ------------------------------------------------------------------
-                try:
-                    self._logger.warning(
-                        "[RM][REJECT] signal=%s deviation_pips=%.1f > max=%.1f conf=%.1f < min_limit=%.1f planned=%.2f market=%.2f",
-                        signal,
-                        float(deviation_pips),
-                        float(max_deviation_pips),
-                        float(confidence),
-                        float(limit_min_confidence),
-                        float(planned_entry),
-                        float(market_entry),
-                    )
-                except Exception:
-                    # اگر logger یا cast مشکل داشت، مانع اجرای منطق نشود
-                    pass
-                # ------------------------------------------------------------------
-
-                return FinalizedOrderParams(
-                    signal=signal,
-                    order_type='NONE',
-                    symbol=symbol,
-                    entry_price=planned_entry,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    lot_size=0.0,
-                    risk_amount_usd=0.0,
-                    rr_ratio=0.0,
-                    deviation_pips=deviation_pips,
-                    decision_notes=decision_notes,
-                    is_trade_allowed=False,
-                    reject_reason="Deviation exceeded without sufficient confidence."
-                )
-        else:
-            decision_notes.append(
-                f"Deviation {deviation_pips:.1f} pips <= max {max_deviation_pips:.1f}: using MARKET."
-            )
-
-        analysis_context = analysis_payload.get('context', {}) or {}
-        market_metrics = analysis_payload.get('market_metrics') or analysis_context.get('market_metrics', {})
-        atr_value = market_metrics.get('atr_short') or market_metrics.get('atr')
-
-        if stop_loss is None or take_profit is None:
-            entry_context = (
-                analysis_payload.get("entry_context")
-                or analysis_context.get("entry_context", {})
-                or {}
-            )
-            recent_low = entry_context.get("recent_low")
-            recent_high = entry_context.get("recent_high")
-            sltp = self._compute_scalping_sl_tp(
-                signal=signal,
-                entry_price=planned_entry,
-                atr_value=atr_value,
-                recent_low=recent_low,
-                recent_high=recent_high,
-                config_payload=config,
-            )
-            stop_loss = sltp.get("stop_loss")
-            take_profit = sltp.get("take_profit")
-            decision_notes.append("SL/TP computed by risk manager scalping model.")
+        entry_context = (
+            analysis_payload.get("entry_context")
+            or analysis_context.get("entry_context", {})
+            or {}
+        )
+        recent_low = entry_context.get("recent_low")
+        recent_high = entry_context.get("recent_high")
+        sltp = self._compute_scalping_sl_tp(
+            signal=signal,
+            entry_price=entry_price,
+            atr_value=atr_value,
+            recent_low=recent_low,
+            recent_high=recent_high,
+            config_payload=config,
+        )
+        stop_loss = sltp.get("stop_loss")
+        take_profit = sltp.get("take_profit")
+        tp2_price = sltp.get("tp2_price")
+        decision_notes.append("SL/TP computed by risk manager scalping model.")
+        if tp2_price is not None:
+            self._logger.info("[NDS][TP2_PLAN] tp2=%.2f intent=runner optional=true", float(tp2_price))
 
         if stop_loss is None or take_profit is None:
             return FinalizedOrderParams(
                 signal=signal,
                 order_type='NONE',
                 symbol=symbol,
-                entry_price=planned_entry,
+                entry_price=entry_price,
                 stop_loss=stop_loss or 0.0,
                 take_profit=take_profit or 0.0,
                 lot_size=0.0,
                 risk_amount_usd=0.0,
                 rr_ratio=0.0,
                 deviation_pips=0.0,
-                decision_notes=["Missing SL/TP from analyzer and risk manager."],
+                decision_notes=["Missing SL/TP from risk manager."],
                 is_trade_allowed=False,
                 reject_reason="Missing SL/TP."
+            )
+
+        ok_dist, dist_reason = self._distance_sanity_check(
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            point_size=point_size,
+            atr_value=atr_value,
+        )
+        if not ok_dist:
+            self._logger.warning("[NDS][DIST_SANITY_FAIL] %s", dist_reason)
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type='NONE',
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=deviation_pips,
+                decision_notes=[f"Distance sanity failed: {dist_reason}"],
+                is_trade_allowed=False,
+                reject_reason="Distance sanity failed."
             )
 
         # ===============================
@@ -908,29 +949,24 @@ class ScalpingRiskManager:
                     reject_reason="Entry deviates beyond ATR threshold."
                 )
 
-        sl_distance = planned_entry - stop_loss if signal == 'BUY' else stop_loss - planned_entry
-        tp_distance = take_profit - planned_entry if signal == 'BUY' else planned_entry - take_profit
+        sl_distance = entry_price - stop_loss if signal == 'BUY' else stop_loss - entry_price
+        tp_distance = take_profit - entry_price if signal == 'BUY' else entry_price - take_profit
         if sl_distance <= 0 or tp_distance <= 0:
             return FinalizedOrderParams(
                 signal=signal,
                 order_type='NONE',
                 symbol=symbol,
-                entry_price=planned_entry,
+                entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 lot_size=0.0,
                 risk_amount_usd=0.0,
                 rr_ratio=0.0,
                 deviation_pips=deviation_pips,
-                decision_notes=["Invalid SL/TP distances from analyzer."],
+                decision_notes=["Invalid SL/TP distances from risk model."],
                 is_trade_allowed=False,
                 reject_reason="SL/TP distances invalid for signal."
             )
-
-        if entry_price != planned_entry:
-            stop_loss = entry_price - sl_distance if signal == 'BUY' else entry_price + sl_distance
-            take_profit = entry_price + tp_distance if signal == 'BUY' else entry_price - tp_distance
-            decision_notes.append("Adjusted SL/TP to preserve distances after entry update.")
 
         rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
 
@@ -1030,6 +1066,15 @@ class ScalpingRiskManager:
             if max_lot is not None and lot_size > max_lot:
                 decision_notes.append(f"Lot clamped to max {max_lot}.")
                 lot_size = max_lot
+
+        self._logger.info(
+            "[NDS][EXECUTION_READY] entry=%.2f sl=%.2f tp1=%.2f tp2=%s risk_usd=%.2f",
+            float(entry_price),
+            float(stop_loss),
+            float(take_profit),
+            f"{float(tp2_price):.2f}" if tp2_price is not None else "NONE",
+            float(risk_params.risk_amount),
+        )
 
         decision_notes.append(
             f"Final entry {entry_price:.2f} SL {stop_loss:.2f} TP {take_profit:.2f} lot {lot_size:.3f}."

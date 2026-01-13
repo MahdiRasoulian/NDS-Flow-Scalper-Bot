@@ -1141,6 +1141,38 @@ class NDSBot:
                         take_profit=finalized.take_profit,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
+            elif str(order_type).lower() == "stop":
+                stop_order_type = f"{signal_data['signal']}_STOP"
+                if hasattr(self.mt5_client, "send_stop_order"):
+                    order_result = self.mt5_client.send_stop_order(
+                        symbol=SYMBOL,
+                        order_type=stop_order_type,
+                        volume=lot_size,
+                        stop_price=finalized.entry_price,
+                        stop_loss=finalized.stop_loss,
+                        take_profit=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                    )
+                elif hasattr(self.mt5_client, "send_pending_order"):
+                    order_result = self.mt5_client.send_pending_order(
+                        symbol=SYMBOL,
+                        order_type=stop_order_type,
+                        volume=lot_size,
+                        pending_price=finalized.entry_price,
+                        stop_loss=finalized.stop_loss,
+                        take_profit=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                    )
+                else:
+                    order_result = self.mt5_client.send_order_with_type(
+                        symbol=SYMBOL,
+                        order_type=stop_order_type,
+                        volume=lot_size,
+                        price=finalized.entry_price,
+                        stop_loss=finalized.stop_loss,
+                        take_profit=finalized.take_profit,
+                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                    )
             else:
                 # Limit/Pending
                 limit_order_type = f"{signal_data['signal']}_LIMIT"  # BUY_LIMIT / SELL_LIMIT
