@@ -13,6 +13,10 @@ from typing import Dict, List
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../NDS-Flow-Scalper-Bot
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.trading_bot.nds.analyzer import GoldNDSAnalyzer
 from src.trading_bot.nds.distance_utils import price_to_points, points_to_pips
 from src.trading_bot.risk_manager import ScalpingRiskManager
