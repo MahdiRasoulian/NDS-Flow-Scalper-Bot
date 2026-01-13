@@ -686,12 +686,67 @@ class SMCAnalyzer:
         self.df['mid_price'] = (self.df['high'] + self.df['low']) / 2
 
     def _get_swing_period(self, timeframe: str) -> int:
-        """تعیین دوره سوینگ بر اساس تایم‌فریم"""
-        swing_period_map = self.settings.get('SWING_PERIOD_MAP', {})
-        if timeframe.upper() in swing_period_map:
-            return swing_period_map[timeframe.upper()]
+        """تعیین دوره سوینگ بر اساس تایم‌فریم (با نرمال‌سازی و مقدار پیش‌فرض امن)"""
+        tf_raw = str(timeframe or "")
+        tf = tf_raw.strip().upper()
+
+        # Alias mapping برای تحمل فرمت‌های مختلف تایم‌فریم
+        alias_map = {
+            "15": "M15",
+            "15M": "M15",
+            "M_15": "M15",
+            "MIN15": "M15",
+            "M15 ": "M15",
+
+            "5": "M5",
+            "5M": "M5",
+            "M_5": "M5",
+            "MIN5": "M5",
+
+            "1": "M1",
+            "1M": "M1",
+            "M_1": "M1",
+            "MIN1": "M1",
+
+            "30": "M30",
+            "30M": "M30",
+            "M_30": "M30",
+            "MIN30": "M30",
+
+            "60": "H1",
+            "1H": "H1",
+            "H_1": "H1",
+
+            "240": "H4",
+            "4H": "H4",
+            "H_4": "H4",
+        }
+        tf = alias_map.get(tf, tf)
+
+        # تنظیمات کاربر (اگر وجود دارد)
+        swing_period_map = self.settings.get("SWING_PERIOD_MAP", {}) or {}
+
+        # کلیدها را نرمال کنیم تا اگر کاربر lower/space گذاشته بود هم کار کند
+        norm_map = {str(k).strip().upper(): v for k, v in swing_period_map.items()}
+
+        # اگر در تنظیمات موجود بود، همان اولویت دارد
+        if tf in norm_map:
+            return int(norm_map[tf])
+
+        # مقدار پیش‌فرض امن (برای اینکه smoke test و اجرا fail نشود)
+        default_map = {
+            "M1": 5,
+            "M5": 7,
+            "M15": 9,   # حساسیت مناسب برای M15
+            "M30": 11,
+            "H1": 13,
+            "H4": 17,
+        }
+        if tf in default_map:
+            return int(default_map[tf])
 
         raise KeyError(f"Missing SWING_PERIOD_MAP for timeframe: {timeframe}")
+
 
     def detect_swings(self, timeframe: str = 'M15') -> List[SwingPoint]:
         """
