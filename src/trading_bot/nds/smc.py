@@ -216,6 +216,7 @@ class SMCAnalyzer:
         touch_indices: List[int] = []
         confirmed_hits: List[Tuple[int, str]] = []
         first_touch_idx = None
+        max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
 
         for j in range(start_idx, len(df)):
             high = float(df["high"].iloc[j])
@@ -259,6 +260,12 @@ class SMCAnalyzer:
             else:
                 retest_idx = touch_indices[-1]
                 retest_reason = "NO_CONFIRMED_TOUCH"
+
+        if touch_count > max_touches:
+            eligible = False
+            retest_reason = "TOO_MANY_TOUCHES"
+            if retest_idx is None:
+                retest_idx = touch_indices[-1]
 
         return first_touch_idx, retest_idx, touch_count, eligible, retest_reason
 
@@ -397,39 +404,12 @@ class SMCAnalyzer:
                 retest_policy=retest_policy,
             )
 
-            if touch_count == 0 or retest_idx is None:
-                self._log_info(
-                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
-                    zone_type,
-                    retest_idx,
-                    retest_reason,
-                )
-                continue
-
-            if not eligible:
-                self._log_info(
-                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
-                    zone_type,
-                    retest_idx,
-                    retest_reason,
-                )
-                continue
-
             max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
             touch_penalty = float(self.settings.get("FLOW_TOUCH_PENALTY", 0.55))
 
-            if touch_count > max_touches:
-                self._log_info(
-                    "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
-                    zone_type,
-                    retest_idx,
-                    touch_count,
-                    max_touches,
-                )
-                continue
-
             fresh = touch_count == 1
-            age_bars = max(0, last_idx - retest_idx)
+            age_anchor = retest_idx if retest_idx is not None else break_idx
+            age_bars = max(0, last_idx - age_anchor)
             confidence = float(disp_meta.get("score", 0.0))
             confidence *= max(0.3, 1.0 - (age_bars / 200.0))
             if not fresh:
@@ -450,17 +430,34 @@ class SMCAnalyzer:
                     "retest_index": retest_idx,
                     "touch_count": touch_count,
                     "fresh": fresh,
-                    "eligible": True,
-                    "notes": f"break_idx={break_idx} retest_idx={retest_idx}",
+                    "eligible": eligible,
+                    "retest_reason": retest_reason,
+                    "notes": f"break_idx={break_idx} retest_idx={retest_idx} policy={retest_policy}",
                 }
             )
-            self._log_info(
-                "[NDS][FLOW][RETEST_OK] type=BREAKER reason=%s idx=%s touches=%s fresh=%s",
-                retest_reason,
-                retest_idx,
-                touch_count,
-                fresh,
-            )
+            if eligible:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_OK] type=BREAKER reason=%s idx=%s touches=%s fresh=%s",
+                    retest_reason,
+                    retest_idx,
+                    touch_count,
+                    fresh,
+                )
+            elif retest_reason == "TOO_MANY_TOUCHES":
+                self._log_info(
+                    "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
+                    zone_type,
+                    retest_idx,
+                    touch_count,
+                    max_touches,
+                )
+            else:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
+                    zone_type,
+                    retest_idx,
+                    retest_reason,
+                )
 
         self._log_info("[NDS][SMC][BREAKER] detected=%s", len(breakers))
         if self.debug_smc and breakers:
@@ -544,38 +541,12 @@ class SMCAnalyzer:
                 retest_policy=retest_policy,
             )
 
-            if touch_count == 0 or retest_idx is None:
-                self._log_info(
-                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
-                    zone_type,
-                    retest_idx,
-                    retest_reason,
-                )
-                continue
-
-            if not eligible:
-                self._log_info(
-                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
-                    zone_type,
-                    retest_idx,
-                    retest_reason,
-                )
-                continue
-
             max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
             touch_penalty = float(self.settings.get("FLOW_TOUCH_PENALTY", 0.55))
-            if touch_count > max_touches:
-                self._log_info(
-                    "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
-                    zone_type,
-                    retest_idx,
-                    touch_count,
-                    max_touches,
-                )
-                continue
 
             fresh = touch_count == 1
-            age_bars = max(0, last_idx - retest_idx)
+            age_anchor = retest_idx if retest_idx is not None else break_idx
+            age_bars = max(0, last_idx - age_anchor)
             confidence = float(disp_meta.get("score", 0.0))
             confidence *= max(0.3, 1.0 - (age_bars / 200.0))
             if not fresh:
@@ -594,17 +565,34 @@ class SMCAnalyzer:
                     "retest_index": retest_idx,
                     "touch_count": touch_count,
                     "fresh": fresh,
-                    "eligible": True,
-                    "notes": f"break_idx={break_idx} retest_idx={retest_idx}",
+                    "eligible": eligible,
+                    "retest_reason": retest_reason,
+                    "notes": f"break_idx={break_idx} retest_idx={retest_idx} policy={retest_policy}",
                 }
             )
-            self._log_info(
-                "[NDS][FLOW][RETEST_OK] type=IFVG reason=%s idx=%s touches=%s fresh=%s",
-                retest_reason,
-                retest_idx,
-                touch_count,
-                fresh,
-            )
+            if eligible:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_OK] type=IFVG reason=%s idx=%s touches=%s fresh=%s",
+                    retest_reason,
+                    retest_idx,
+                    touch_count,
+                    fresh,
+                )
+            elif retest_reason == "TOO_MANY_TOUCHES":
+                self._log_info(
+                    "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
+                    zone_type,
+                    retest_idx,
+                    touch_count,
+                    max_touches,
+                )
+            else:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_FAIL] type=%s idx=%s reason=%s",
+                    zone_type,
+                    retest_idx,
+                    retest_reason,
+                )
 
         self._log_info("[NDS][SMC][IFVG] detected=%s", len(ifvgs))
         if self.debug_smc and ifvgs:

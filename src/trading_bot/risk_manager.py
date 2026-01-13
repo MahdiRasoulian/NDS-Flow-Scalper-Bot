@@ -1087,6 +1087,7 @@ class ScalpingRiskManager:
             entry_price=entry_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            take_profit2=tp2_price,
             lot_size=lot_size,
             risk_amount_usd=risk_params.risk_amount,
             rr_ratio=rr_ratio,

@@ -48,6 +48,11 @@ except ImportError as e:
 from src.trading_bot.state import BotState
 from src.trading_bot.execution_reporting import generate_execution_report
 from src.trading_bot.contracts import ExecutionEvent, PositionContract, compute_pips
+from src.trading_bot.nds.distance_utils import (
+    calculate_distance_metrics,
+    price_to_points,
+    points_to_pips,
+)
 from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.trade_tracker import TradeTracker
@@ -1231,6 +1236,48 @@ class NDSBot:
             if success and order_id:
                 signal_data["order_ticket"] = order_id
                 signal_data["position_ticket"] = position_ticket
+                entry_idea = signal_data.get("entry_idea") or (signal_data.get("context") or {}).get("entry_idea", {})
+                entry_context = (
+                    signal_data.get("entry_context")
+                    or (signal_data.get("context") or {}).get("entry_context", {})
+                    or {}
+                )
+                entry_source = entry_idea.get("zone") or signal_data.get("entry_source")
+                entry_type = entry_idea.get("entry_type") or signal_data.get("entry_type")
+                entry_tier = entry_idea.get("tier") or signal_data.get("tier")
+                retest_reason = None
+                touch_count = None
+                if isinstance(entry_source, dict):
+                    retest_reason = entry_source.get("retest_reason")
+                    touch_count = entry_source.get("touch_count")
+
+                point_size = self.risk_manager._get_point_size(config_payload)
+                spread_price = float(current_price_data.get("spread", 0.0) or 0.0)
+                spread_pips = points_to_pips(price_to_points(spread_price, point_size))
+                sl_metrics = calculate_distance_metrics(
+                    entry_price=actual_entry_price,
+                    current_price=actual_sl,
+                    point_size=point_size,
+                )
+                tp1_metrics = calculate_distance_metrics(
+                    entry_price=actual_entry_price,
+                    current_price=actual_tp,
+                    point_size=point_size,
+                )
+                tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
+                tp2_metrics = (
+                    calculate_distance_metrics(
+                        entry_price=actual_entry_price,
+                        current_price=tp2_price,
+                        point_size=point_size,
+                    )
+                    if tp2_price
+                    else {}
+                )
+                sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
+                tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
+                tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+
                 logger.info(
                     "✅ [TRADE][OPEN] ticket=%s position=%s symbol=%s side=%s entry=%.2f sl=%.2f tp=%.2f vol=%.3f order_type=%s",
                     order_id,
@@ -1274,6 +1321,16 @@ class NDSBot:
                         "decision_notes": finalized.decision_notes,
                         "analysis_snapshot": signal_data,
                         "rr_ratio": getattr(finalized, "rr_ratio", None),
+                        "entry_type": entry_type,
+                        "tier": entry_tier,
+                        "retest_reason": retest_reason,
+                        "touch_count": touch_count,
+                        "dist_pips": entry_context.get("dist_pips"),
+                        "sl_pips": sl_pips,
+                        "tp1_pips": tp1_pips,
+                        "tp2_pips": tp2_pips,
+                        "spread_pips": spread_pips,
+                        "tp2_price": tp2_price,
                     },
                 }
                 self.trade_tracker.add_trade_open(open_event)

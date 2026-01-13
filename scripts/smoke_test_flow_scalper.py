@@ -38,6 +38,15 @@ def run(csv_path: str, limit: int | None) -> int:
     tp_pips_list: List[float] = []
     rejection_reasons: Dict[str, int] = {}
     zone_rejections: Dict[str, int] = {"too_far": 0, "too_old": 0, "too_many_touches": 0, "stale": 0}
+    retest_rejections: Dict[str, int] = {
+        "TOO_MANY_TOUCHES": 0,
+        "FIRST_TOUCH_UNCONFIRMED": 0,
+        "NO_CONFIRMED_TOUCH": 0,
+    }
+    momentum_rejections: Dict[str, int] = {"time_outside_window": 0}
+    spread_rejections: Dict[str, int] = {"spread_too_high": 0}
+    sl_pips_by_tier: Dict[str, List[float]] = {}
+    tp_pips_by_tier: Dict[str, List[float]] = {}
     non_fresh_zones = 0
     strong_trend_cycles = 0
     ifvg_zone_count = 0
@@ -71,6 +80,9 @@ def run(csv_path: str, limit: int | None) -> int:
             rejections = entry_context.get("zone_rejections", {}) or {}
             for key in zone_rejections.keys():
                 zone_rejections[key] += int(rejections.get(key, 0) or 0)
+            momentum_block = entry_context.get("momentum_block_reason")
+            if momentum_block in momentum_rejections:
+                momentum_rejections[momentum_block] += 1
 
         if signal_context.get("strong_trend"):
             strong_trend_cycles += 1
@@ -88,6 +100,10 @@ def run(csv_path: str, limit: int | None) -> int:
         for zone in breakers + inversion_fvgs:
             if zone and not zone.get("fresh", True):
                 non_fresh_zones += 1
+            if zone and not zone.get("eligible", True):
+                retest_reason = str(zone.get("retest_reason") or "").upper()
+                if retest_reason in retest_rejections:
+                    retest_rejections[retest_reason] += 1
 
         if result.signal in {"BUY", "SELL"} and entry_level:
             atr_value = None
@@ -106,9 +122,18 @@ def run(csv_path: str, limit: int | None) -> int:
             tp_pips = _distance_pips(abs(float(sltp["take_profit"]) - float(entry_level)), 0.001)
             sl_pips_list.append(sl_pips)
             tp_pips_list.append(tp_pips)
+            sl_pips_by_tier.setdefault(entry_tier, []).append(sl_pips)
+            tp_pips_by_tier.setdefault(entry_tier, []).append(tp_pips)
         elif result.signal == "NONE" and result.reasons:
             reason_key = result.reasons[-1]
             rejection_reasons[reason_key] = rejection_reasons.get(reason_key, 0) + 1
+
+        if "spread" in df.columns:
+            spread_value = float(window["spread"].iloc[-1] or 0.0)
+            spread_pips = _distance_pips(spread_value, 0.001)
+            spread_max = float(risk_manager.settings.get("SPREAD_MAX_PIPS", 2.5))
+            if spread_pips > spread_max:
+                spread_rejections["spread_too_high"] += 1
 
     sl_avg = sum(sl_pips_list) / len(sl_pips_list) if sl_pips_list else 0.0
     tp_avg = sum(tp_pips_list) / len(tp_pips_list) if tp_pips_list else 0.0
@@ -125,10 +150,25 @@ def run(csv_path: str, limit: int | None) -> int:
     print("Zone rejections:")
     for key in ["too_many_touches", "stale", "too_far", "too_old"]:
         print(f"  {key}: {zone_rejections.get(key, 0)}")
+    print("Retest rejections:")
+    for key in ["TOO_MANY_TOUCHES", "FIRST_TOUCH_UNCONFIRMED", "NO_CONFIRMED_TOUCH"]:
+        print(f"  {key}: {retest_rejections.get(key, 0)}")
+    print("Momentum rejections:")
+    for key in ["time_outside_window"]:
+        print(f"  {key}: {momentum_rejections.get(key, 0)}")
+    print("Spread rejections:")
+    print(f"  spread_too_high: {spread_rejections.get('spread_too_high', 0)}")
     print(f"Detected IFVG zones: {ifvg_zone_count}")
     print(f"Non-fresh zones observed: {non_fresh_zones}")
     print(f"Average SL pips: {sl_avg:.2f}")
     print(f"Average TP pips: {tp_avg:.2f}")
+    print("Average SL/TP by tier:")
+    for tier_key in ["A", "B", "C", "D", "NONE"]:
+        tier_sl = sl_pips_by_tier.get(tier_key, [])
+        tier_tp = tp_pips_by_tier.get(tier_key, [])
+        tier_sl_avg = sum(tier_sl) / len(tier_sl) if tier_sl else 0.0
+        tier_tp_avg = sum(tier_tp) / len(tier_tp) if tier_tp else 0.0
+        print(f"  {tier_key}: sl_avg={tier_sl_avg:.2f} tp_avg={tier_tp_avg:.2f}")
     if rejection_reasons:
         print("Rejected trades by reason:")
         for reason, count in sorted(rejection_reasons.items(), key=lambda x: x[1], reverse=True):
