@@ -65,6 +65,19 @@ def _build_trade_report(event: ExecutionEvent, df=None) -> Optional[Dict[str, An
     market_metrics = metadata.get("market_metrics", {})
     if not analysis_snapshot:
         return None
+    entry_idea = analysis_snapshot.get("entry_idea", {}) if isinstance(analysis_snapshot, dict) else {}
+    entry_source = (
+        entry_idea.get("zone")
+        or analysis_snapshot.get("entry_source")
+        if isinstance(analysis_snapshot, dict)
+        else None
+    )
+    retest_reason = metadata.get("retest_reason")
+    touch_count = metadata.get("touch_count")
+    if isinstance(entry_source, dict):
+        retest_reason = retest_reason or entry_source.get("retest_reason")
+        touch_count = touch_count or entry_source.get("touch_count")
+    entry_context = analysis_snapshot.get("entry_context", {}) if isinstance(analysis_snapshot, dict) else {}
 
     return {
         'order_id': event.get("order_ticket"),
@@ -100,7 +113,16 @@ def _build_trade_report(event: ExecutionEvent, df=None) -> Optional[Dict[str, An
             'ask_at_analysis': analysis_snapshot.get('execution_ask'),
             'price_deviation_pips': metadata.get("price_deviation_pips"),
             'execution_source': analysis_snapshot.get('source', 'unknown')
-        }
+        },
+        'entry_type': metadata.get("entry_type") or entry_idea.get("entry_type"),
+        'tier': metadata.get("tier") or entry_idea.get("tier"),
+        'retest_reason': retest_reason,
+        'touch_count': touch_count,
+        'dist_pips': metadata.get("dist_pips") or entry_context.get("dist_pips"),
+        'sl_pips': metadata.get("sl_pips"),
+        'tp1_pips': metadata.get("tp1_pips"),
+        'tp2_pips': metadata.get("tp2_pips"),
+        'spread_pips': metadata.get("spread_pips"),
     }
 
 
@@ -166,6 +188,15 @@ def generate_execution_report(
                             "session": event.get("metadata", {}).get("session"),
                             "price_deviation_pips": event.get("metadata", {}).get("price_deviation_pips"),
                             "order_type": event.get("metadata", {}).get("order_type"),
+                            "entry_type": legacy_report.get("entry_type"),
+                            "tier": legacy_report.get("tier"),
+                            "retest_reason": legacy_report.get("retest_reason"),
+                            "touch_count": legacy_report.get("touch_count"),
+                            "dist_pips": legacy_report.get("dist_pips"),
+                            "sl_pips": legacy_report.get("sl_pips"),
+                            "tp1_pips": legacy_report.get("tp1_pips"),
+                            "tp2_pips": legacy_report.get("tp2_pips"),
+                            "spread_pips": legacy_report.get("spread_pips"),
                         },
                     )
 

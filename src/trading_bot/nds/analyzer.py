@@ -139,6 +139,7 @@ class GoldNDSAnalyzer:
             'FLOW_TOUCH_PENETRATION_ATR': float,
             'FLOW_MAX_TOUCHES': int,
             'FLOW_TOUCH_PENALTY': float,
+            'MOMO_SESSION_ALLOWLIST': list,
         }
 
         validated_config: Dict[str, Any] = {}
@@ -161,6 +162,11 @@ class GoldNDSAnalyzer:
                     parsed_value = value
                 elif isinstance(value, str):
                     parsed_value = value.strip().lower() in {'1', 'true', 'yes', 'y'}
+            elif target_type is list:
+                if isinstance(value, (list, tuple, set)):
+                    parsed_value = [str(v).strip() for v in value if str(v).strip()]
+                elif isinstance(value, str):
+                    parsed_value = [v.strip() for v in value.split(",") if v.strip()]
             else:
                 try:
                     parsed_value = target_type(value)
@@ -738,11 +744,27 @@ class GoldNDSAnalyzer:
             entry_model = entry_idea.get("entry_model", "NONE")
             entry_source = entry_idea.get("zone")
             entry_context = entry_idea.get("metrics", {}) or {}
-            if entry_idea.get("reason"):
-                reasons.append(entry_idea["reason"])
+            entry_reason = entry_idea.get("reason")
+            if entry_reason:
+                reasons.append(entry_reason)
 
             signal = entry_idea.get("signal", "NONE") or "NONE"
             result_payload["signal"] = signal
+            result_payload["entry_reason"] = entry_reason
+
+            entry_signal_context = {
+                "signal": signal,
+                "entry_price": entry_price,
+                "stop_loss": None,
+                "take_profit": None,
+                "take_profit2": None,
+                "entry_type": entry_type,
+                "entry_source": entry_source,
+                "entry_reason": entry_reason,
+                "entry_model": entry_model,
+                "tier": entry_idea.get("tier", "NONE"),
+                "metrics": entry_context,
+            }
 
             try:
                 if "context" not in result_payload or result_payload.get("context") is None:
@@ -757,8 +779,8 @@ class GoldNDSAnalyzer:
                 result_payload["context"]["entry_idea"] = entry_idea
                 result_payload["context"]["entry_source"] = entry_source
                 result_payload["context"]["entry_context"] = entry_context
-                result_payload["signal_context"] = entry_idea
-                result_payload["context"]["signal_context"] = entry_idea
+                result_payload["signal_context"] = entry_signal_context
+                result_payload["context"]["signal_context"] = entry_signal_context
             except Exception as _ctx_e:
                 self._log_debug("[NDS][SIGNAL][CONTEXT] failed to attach flow entry context: %s", _ctx_e)
 
@@ -1142,6 +1164,13 @@ class GoldNDSAnalyzer:
             for zone in zones:
                 if not bool(zone.get("eligible", True)):
                     rejection_counts["ineligible"] += 1
+                    self._log_info(
+                        "[NDS][FLOW][ZONE_REJECT] tier=FLOW type=%s reason=INELIGIBLE retest_reason=%s idx=%s touches=%s",
+                        zone.get("type"),
+                        zone.get("retest_reason"),
+                        zone.get("retest_index") or zone.get("index"),
+                        zone.get("touch_count"),
+                    )
                     continue
                 z_type = str(zone.get("type", ""))
                 if side == "BUY" and "BULLISH" not in z_type:
@@ -1158,13 +1187,34 @@ class GoldNDSAnalyzer:
                 age = int(zone.get("age_bars", 9999))
                 if dist_atr > max_dist_atr:
                     rejection_counts["too_far"] += 1
+                    self._log_info(
+                        "[NDS][FLOW][ZONE_REJECT] tier=FLOW type=%s reason=TOO_FAR dist_atr=%.2f max=%.2f idx=%s",
+                        zone.get("type"),
+                        dist_atr,
+                        max_dist_atr,
+                        zone.get("retest_index") or zone.get("index"),
+                    )
                     continue
                 if age > max_age:
                     rejection_counts["too_old"] += 1
+                    self._log_info(
+                        "[NDS][FLOW][ZONE_REJECT] tier=FLOW type=%s reason=TOO_OLD age=%s max=%s idx=%s",
+                        zone.get("type"),
+                        age,
+                        max_age,
+                        zone.get("retest_index") or zone.get("index"),
+                    )
                     continue
                 touch_count = int(zone.get("touch_count", 1))
                 if touch_count > max_touches:
                     rejection_counts["too_many_touches"] += 1
+                    self._log_info(
+                        "[NDS][FLOW][ZONE_REJECT] tier=FLOW type=%s reason=TOO_MANY_TOUCHES touches=%s max=%s idx=%s",
+                        zone.get("type"),
+                        touch_count,
+                        max_touches,
+                        zone.get("retest_index") or zone.get("index"),
+                    )
                     continue
                 confidence = float(zone.get("confidence", 0.0))
                 freshness_penalty = float(settings.get("FLOW_TOUCH_PENALTY", 0.55))
@@ -1208,9 +1258,9 @@ class GoldNDSAnalyzer:
         self._log_info(
             "[NDS][FLOW_ZONES] breakers=%d eligible=%d ifvg=%d eligible=%d",
             len(breakers),
-            len(brk_candidates),
+            sum(1 for z in breakers if bool(z.get("eligible", True))),
             len(ifvgs),
-            len(ifvg_candidates),
+            sum(1 for z in ifvgs if bool(z.get("eligible", True))),
         )
 
         entry_type = "NONE"
@@ -1242,6 +1292,7 @@ class GoldNDSAnalyzer:
             reject_reason = None
 
         momentum_reason = None
+        momentum_block_reason = None
         if entry_level is None:
             momo_adx_min = float(settings.get("MOMO_ADX_MIN", 35.0))
             time_start = settings.get("MOMO_TIME_START", "10:00")
@@ -1251,29 +1302,48 @@ class GoldNDSAnalyzer:
             now_ts = self.df["time"].iloc[-1]
             in_window, time_error = self._is_time_in_window(now_ts, time_start, time_end)
             if time_error:
-                momentum_reason = f"time_block:{time_error}"
-                self._log_info("[NDS][FLOW_TIER] tier=C momentum blocked (%s)", momentum_reason)
+                momentum_block_reason = "time_parse_failed"
+                momentum_reason = f"time_parse_failed:{time_error}"
+                self._log_info(
+                    "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
+                    momentum_block_reason,
+                )
                 in_window = False
+            elif not in_window:
+                momentum_block_reason = "time_outside_window"
+                momentum_reason = "time_outside_window"
+                self._log_info(
+                    "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
+                    momentum_block_reason,
+                )
 
             session_name = self._normalize_session_name(
                 getattr(session_analysis, "current_session", "OTHER")
             )
             session_ok = True
             if session_only:
-                session_ok = session_name in {"LONDON", "NEW_YORK", "OVERLAP"}
+                allowlist = settings.get("MOMO_SESSION_ALLOWLIST")
+                if isinstance(allowlist, str):
+                    allowlist = [s.strip().upper() for s in allowlist.split(",") if s.strip()]
+                elif isinstance(allowlist, (list, tuple, set)):
+                    allowlist = [str(s).strip().upper() for s in allowlist if str(s).strip()]
+                else:
+                    allowlist = ["LONDON", "NEW_YORK", "OVERLAP"]
+                session_ok = session_name in set(allowlist)
 
             liquidity_ok = bool(getattr(session_analysis, "is_active_session", True))
             market_status = str(volume_analysis.get("market_status", "") or "").upper()
             if market_status in {"CLOSED", "HALTED"}:
                 liquidity_ok = False
 
-            strong_trend = bool(signal_context.get("strong_trend"))
-            time_ok = in_window or (strong_trend and time_error is None)
-
             bias = str(signal_context.get("bias", "") or "")
             bias_ok = (bias == "BULLISH" and signal == "BUY") or (bias == "BEARISH" and signal == "SELL") or not bias
 
-            if adx_value >= momo_adx_min and time_ok and (session_ok or strong_trend) and liquidity_ok and bias_ok:
+            adx_ok = adx_value >= momo_adx_min
+            time_ok = in_window
+            session_ok = session_ok
+
+            if adx_ok and time_ok and session_ok and liquidity_ok and bias_ok:
                 buffer_atr = float(settings.get("MOMO_BUFFER_ATR_MULT", 0.1))
                 buffer_min_pips = float(settings.get("MOMO_BUFFER_MIN_PIPS", 1.0))
                 buffer_price = pips_to_price(buffer_min_pips, point_size)
@@ -1311,11 +1381,22 @@ class GoldNDSAnalyzer:
                 entry_confidence = min(1.0, max(0.35, float(adx_value) / max(momo_adx_min, 1.0)))
                 reject_reason = None
             else:
-                momentum_reason = (
-                    f"adx={adx_value:.1f}/{momo_adx_min:.1f} "
-                    f"window={in_window} session_ok={session_ok} liquidity_ok={liquidity_ok} bias_ok={bias_ok}"
+                if momentum_block_reason is None:
+                    if not adx_ok:
+                        momentum_block_reason = "adx_below_min"
+                    elif not session_ok:
+                        momentum_block_reason = "session_blocked"
+                    elif not liquidity_ok:
+                        momentum_block_reason = "untradable_market" if market_status in {"CLOSED", "HALTED"} else "liquidity_blocked"
+                    elif not bias_ok:
+                        momentum_block_reason = "bias_mismatch"
+                    else:
+                        momentum_block_reason = "time_outside_window"
+                momentum_reason = momentum_block_reason
+                self._log_info(
+                    "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
+                    momentum_block_reason,
                 )
-                self._log_debug("[NDS][FLOW_TIER] tier=C momentum skipped (%s)", momentum_reason)
 
         if entry_level is None:
             entry_reason = entry_reason if momentum_reason is None else f"{entry_reason}; momo_block={momentum_reason}"
@@ -1331,11 +1412,23 @@ class GoldNDSAnalyzer:
                     atr_value=atr_value,
                 )
             )
+            self._log_info(
+                "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f dist_price=%.3f dist_points=%.2f dist_pips=%.2f dist_usd=%.3f dist_atr=%.2f",
+                entry_type,
+                float(entry_level),
+                float(current_price),
+                float(entry_context.get("dist_price") or 0.0),
+                float(entry_context.get("dist_points") or 0.0),
+                float(entry_context.get("dist_pips") or 0.0),
+                float(entry_context.get("dist_usd") or 0.0),
+                float(entry_context.get("dist_atr") or 0.0),
+            )
 
         entry_context.update(
             {
                 "point_size": point_size,
                 "momentum_reason": momentum_reason,
+                "momentum_block_reason": momentum_block_reason,
                 "buffer_price": buffer_price,
                 "recent_low": recent_low,
                 "recent_high": recent_high,

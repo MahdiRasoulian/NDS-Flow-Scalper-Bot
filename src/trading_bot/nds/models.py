@@ -202,6 +202,7 @@ class FinalizedOrderParams:
     entry_price: float
     stop_loss: float
     take_profit: float
+    take_profit2: Optional[float] = None
     lot_size: float
     risk_amount_usd: float
     rr_ratio: float
