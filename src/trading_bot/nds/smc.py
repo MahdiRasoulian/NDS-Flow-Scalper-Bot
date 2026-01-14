@@ -1,6 +1,7 @@
 """
 تحلیل ساختار بازار و الگوهای SMC
 """
+import inspect
 import logging
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -41,6 +42,9 @@ class SMCAnalyzer:
 
     def _log_info(self, message: str, *args: Any) -> None:
         logger.info(message, *args)
+
+    def _log_warning(self, message: str, *args: Any) -> None:
+        logger.warning(message, *args)
 
     def _log_verbose(self, message: str, *args: Any) -> None:
         """لاگ مرحله‌ای با سطح INFO (فقط وقتی DEBUG_SMC فعال باشد).
@@ -169,6 +173,52 @@ class SMCAnalyzer:
             penetration_atr = 0.05
         return float(atr_value) * penetration_atr if atr_value else 0.0
 
+    def _format_time_key(self, value: Any) -> Optional[str]:
+        if value is None or (hasattr(pd, "isna") and pd.isna(value)):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        return str(value)
+
+    def _resolve_touch_mode(self, source: str) -> str:
+        mode = str(self.settings.get("FLOW_TOUCH_MODE", "EVENT_BASED") or "EVENT_BASED").upper()
+        if mode in {"CANDLE_BASED", "CANDLE", "BAR", "BAR_BASED"}:
+            stack = inspect.stack()
+            stack_hint = "->".join(frame.function for frame in stack[1:4])
+            self._log_warning(
+                "[NDS][FLOW][TOUCH_MODE_WARNING] touch_mode=%s source=%s stack_hint=%s",
+                mode,
+                source,
+                stack_hint,
+            )
+            mode = "EVENT_BASED"
+        return "event_based" if mode == "EVENT_BASED" else "candle_based"
+
+    def _iteration_signature(self, df: pd.DataFrame) -> Dict[str, Any]:
+        if df is None or df.empty:
+            return {
+                "start_idx": None,
+                "end_idx": None,
+                "start_time": None,
+                "end_time": None,
+            }
+        try:
+            start_idx = int(df.index[0])
+        except Exception:
+            start_idx = df.index[0]
+        try:
+            end_idx = int(df.index[-1])
+        except Exception:
+            end_idx = df.index[-1]
+        start_time = self._format_time_key(df["time"].iloc[0]) if "time" in df.columns else None
+        end_time = self._format_time_key(df["time"].iloc[-1]) if "time" in df.columns else None
+        return {
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+
     def _is_zone_touch(
         self,
         high: float,
@@ -191,11 +241,15 @@ class SMCAnalyzer:
         bottom: float,
         origin_idx: int,
         break_idx: int,
+        origin_time: Optional[Any] = None,
+        break_time: Optional[Any] = None,
     ) -> str:
         precision = int(self.settings.get("FLOW_ZONE_KEY_PRECISION", 5))
         top_key = round(float(top), precision)
         bottom_key = round(float(bottom), precision)
-        return f"{zone_type}|origin={origin_idx}|break={break_idx}|top={top_key}|bottom={bottom_key}"
+        origin_key = self._format_time_key(origin_time) or str(origin_idx)
+        break_key = self._format_time_key(break_time) or str(break_idx)
+        return f"{zone_type}|origin={origin_key}|break={break_key}|top={top_key}|bottom={bottom_key}"
 
     def _select_zone_candidate(
         self,
@@ -242,6 +296,7 @@ class SMCAnalyzer:
         retest_policy: str,
         zone_id: Optional[str] = None,
     ) -> Tuple[Optional[int], Optional[int], int, bool, str]:
+        _ = self._resolve_touch_mode("_scan_zone_touches")
         touch_indices: List[int] = []
         confirmed_hits: List[Tuple[int, str, int]] = []
         first_touch_idx = None
@@ -449,7 +504,9 @@ class SMCAnalyzer:
             retest_idx = None
             zone_type = "BULLISH_BREAKER" if ob["type"] == "BEARISH_OB" else "BEARISH_BREAKER"
             retest_policy = str(self.settings.get("FLOW_RETEST_POLICY", "FIRST_TOUCH"))
-            zone_id = self._make_zone_key(zone_type, ob_high, ob_low, ob_idx, break_idx)
+            origin_time = df["time"].iloc[ob_idx] if "time" in df.columns else None
+            break_time = df["time"].iloc[break_idx] if "time" in df.columns else None
+            zone_id = self._make_zone_key(zone_type, ob_high, ob_low, ob_idx, break_idx, origin_time, break_time)
             first_touch_idx, retest_idx, touch_count, eligible, retest_reason = self._scan_zone_touches(
                 df=df,
                 start_idx=break_idx + 1,
@@ -489,6 +546,8 @@ class SMCAnalyzer:
                     "eligible": eligible,
                     "retest_reason": retest_reason,
                     "zone_id": zone_id,
+                    "touch_mode": self._resolve_touch_mode("_scan_zone_touches"),
+                    "touch_source_fn": "_scan_zone_touches",
                     "notes": f"break_idx={break_idx} retest_idx={retest_idx} policy={retest_policy}",
             }
             self._log_debug(
@@ -524,12 +583,30 @@ class SMCAnalyzer:
                     fresh,
                 )
             elif retest_reason == "TOO_MANY_TOUCHES":
+                iter_sig = self._iteration_signature(df)
+                touch_mode = self._resolve_touch_mode("_scan_zone_touches")
                 self._log_info(
                     "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
                     zone_type,
                     retest_idx,
                     touch_count,
                     max_touches,
+                )
+                self._log_info(
+                    "[NDS][FLOW][RETEST_REJECT] reason=TOO_MANY_TOUCHES zone_id=%s zone_type=%s idx=%s "
+                    "touches=%s max_touches=%s touch_mode=%s touch_source_fn=%s iter_start_idx=%s "
+                    "iter_end_idx=%s iter_start_time=%s iter_end_time=%s",
+                    zone_id,
+                    zone_type,
+                    retest_idx,
+                    touch_count,
+                    max_touches,
+                    touch_mode,
+                    "_scan_zone_touches",
+                    iter_sig.get("start_idx"),
+                    iter_sig.get("end_idx"),
+                    iter_sig.get("start_time"),
+                    iter_sig.get("end_time"),
                 )
             else:
                 self._log_info(
@@ -611,7 +688,9 @@ class SMCAnalyzer:
                 continue
 
             retest_policy = str(self.settings.get("FLOW_RETEST_POLICY", "FIRST_TOUCH"))
-            zone_id = self._make_zone_key(zone_type, top, bottom, fvg_idx, break_idx)
+            origin_time = df["time"].iloc[fvg_idx] if "time" in df.columns else None
+            break_time = df["time"].iloc[break_idx] if "time" in df.columns else None
+            zone_id = self._make_zone_key(zone_type, top, bottom, fvg_idx, break_idx, origin_time, break_time)
             first_touch_idx, retest_idx, touch_count, eligible, retest_reason = self._scan_zone_touches(
                 df=df,
                 start_idx=break_idx + 1,
@@ -649,6 +728,8 @@ class SMCAnalyzer:
                     "eligible": eligible,
                     "retest_reason": retest_reason,
                     "zone_id": zone_id,
+                    "touch_mode": self._resolve_touch_mode("_scan_zone_touches"),
+                    "touch_source_fn": "_scan_zone_touches",
                     "notes": f"break_idx={break_idx} retest_idx={retest_idx} policy={retest_policy}",
             }
             self._log_debug(
@@ -684,12 +765,30 @@ class SMCAnalyzer:
                     fresh,
                 )
             elif retest_reason == "TOO_MANY_TOUCHES":
+                iter_sig = self._iteration_signature(df)
+                touch_mode = self._resolve_touch_mode("_scan_zone_touches")
                 self._log_info(
                     "[NDS][FLOW][ZONE_REJECT] reason=TOO_MANY_TOUCHES type=%s idx=%s touches=%s max=%s",
                     zone_type,
                     retest_idx,
                     touch_count,
                     max_touches,
+                )
+                self._log_info(
+                    "[NDS][FLOW][RETEST_REJECT] reason=TOO_MANY_TOUCHES zone_id=%s zone_type=%s idx=%s "
+                    "touches=%s max_touches=%s touch_mode=%s touch_source_fn=%s iter_start_idx=%s "
+                    "iter_end_idx=%s iter_start_time=%s iter_end_time=%s",
+                    zone_id,
+                    zone_type,
+                    retest_idx,
+                    touch_count,
+                    max_touches,
+                    touch_mode,
+                    "_scan_zone_touches",
+                    iter_sig.get("start_idx"),
+                    iter_sig.get("end_idx"),
+                    iter_sig.get("start_time"),
+                    iter_sig.get("end_time"),
                 )
             else:
                 self._log_info(
