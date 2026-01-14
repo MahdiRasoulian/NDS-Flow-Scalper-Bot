@@ -1252,7 +1252,7 @@ class NDSBot:
                     touch_count = entry_source.get("touch_count")
 
                 point_size = self.risk_manager._get_point_size(config_payload)
-                spread_price = float(current_price_data.get("spread", 0.0) or 0.0)
+                spread_price = float(current_price_data.get("spread", 0.19) or 0.19)
                 spread_pips = points_to_pips(price_to_points(spread_price, point_size))
                 sl_metrics = calculate_distance_metrics(
                     entry_price=actual_entry_price,
