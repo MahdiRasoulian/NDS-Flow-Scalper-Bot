@@ -22,12 +22,21 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.trading_bot.nds.analyzer import GoldNDSAnalyzer
-from src.trading_bot.nds.distance_utils import price_to_points, points_to_pips
+from src.trading_bot.nds.distance_utils import (
+    calculate_distance_metrics,
+    infer_point_size_from_prices,
+    resolve_point_size_from_config,
+)
 from src.trading_bot.risk_manager import ScalpingRiskManager
 
 
 def _distance_pips(price_distance: float, point_size: float) -> float:
-    return points_to_pips(price_to_points(price_distance, point_size))
+    metrics = calculate_distance_metrics(
+        entry_price=0.0,
+        current_price=price_distance,
+        point_size=point_size,
+    )
+    return float(metrics.get("dist_pips") or 0.0)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -115,6 +124,12 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
     ifvg_zone_count = 0
 
     risk_manager = ScalpingRiskManager()
+    inferred_point_size = infer_point_size_from_prices(df["close"].tail(window))
+    resolved_point_size = resolve_point_size_from_config(risk_manager.settings, default=None)
+    print(
+        f"[SMOKE] inferred_point_size={inferred_point_size:.4f} "
+        f"resolved_point_size={resolved_point_size:.4f}"
+    )
 
     # Use rolling fixed window to avoid O(n^2)
     start_idx = window - 1
@@ -188,28 +203,34 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
                 market_metrics = result.context.get("market_metrics", {}) or {}
                 atr_value = market_metrics.get("atr_short") or market_metrics.get("atr")
 
-            sltp = risk_manager._compute_scalping_sl_tp(
-                signal=result.signal,
-                entry_price=float(entry_level),
-                atr_value=atr_value,
-                recent_low=entry_context.get("recent_low"),
-                recent_high=entry_context.get("recent_high"),
-                config_payload=risk_manager.settings,
-            )
+            sl_price = result.stop_loss
+            tp_price = result.take_profit
+            if sl_price is None or tp_price is None:
+                sltp = risk_manager._compute_scalping_sl_tp(
+                    signal=result.signal,
+                    entry_price=float(entry_level),
+                    atr_value=atr_value,
+                    recent_low=entry_context.get("recent_low"),
+                    recent_high=entry_context.get("recent_high"),
+                    config_payload=risk_manager.settings,
+                )
+                sl_price = sltp.get("stop_loss")
+                tp_price = sltp.get("take_profit")
 
-            sl_pips = _distance_pips(abs(float(entry_level) - float(sltp["stop_loss"])), 0.001)
-            tp_pips = _distance_pips(abs(float(sltp["take_profit"]) - float(entry_level)), 0.001)
-            sl_pips_list.append(sl_pips)
-            tp_pips_list.append(tp_pips)
-            sl_pips_by_tier.setdefault(entry_tier, []).append(sl_pips)
-            tp_pips_by_tier.setdefault(entry_tier, []).append(tp_pips)
+            if sl_price is not None and tp_price is not None:
+                sl_pips = _distance_pips(abs(float(entry_level) - float(sl_price)), resolved_point_size)
+                tp_pips = _distance_pips(abs(float(tp_price) - float(entry_level)), resolved_point_size)
+                sl_pips_list.append(sl_pips)
+                tp_pips_list.append(tp_pips)
+                sl_pips_by_tier.setdefault(entry_tier, []).append(sl_pips)
+                tp_pips_by_tier.setdefault(entry_tier, []).append(tp_pips)
         elif result.signal == "NONE" and result.reasons:
             reason_key = result.reasons[-1]
             rejection_reasons[reason_key] = rejection_reasons.get(reason_key, 0) + 1
 
         if "spread" in df.columns and not df["spread"].isna().all():
             spread_value = float(df["spread"].iloc[i] or 0.0)
-            spread_pips = _distance_pips(spread_value, 0.001)
+            spread_pips = _distance_pips(spread_value, resolved_point_size)
             spread_max = float(risk_manager.settings.get("SPREAD_MAX_PIPS", 2.5))
             if spread_pips > spread_max:
                 spread_rejections["spread_too_high"] += 1

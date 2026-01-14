@@ -50,8 +50,7 @@ from src.trading_bot.execution_reporting import generate_execution_report
 from src.trading_bot.contracts import ExecutionEvent, PositionContract, compute_pips
 from src.trading_bot.nds.distance_utils import (
     calculate_distance_metrics,
-    price_to_points,
-    points_to_pips,
+    resolve_point_size_with_source,
 )
 from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
@@ -1251,9 +1250,22 @@ class NDSBot:
                     retest_reason = entry_source.get("retest_reason")
                     touch_count = entry_source.get("touch_count")
 
-                point_size = self.risk_manager._get_point_size(config_payload)
+                point_size, point_source = resolve_point_size_with_source(
+                    config_payload,
+                    default=self.risk_manager._get_gold_spec("point"),
+                )
+                logger.info(
+                    "[NDS][POINT_SIZE] point_size=%.4f source=%s",
+                    point_size,
+                    point_source,
+                )
                 spread_price = float(current_price_data.get("spread", 0.19) or 0.19)
-                spread_pips = points_to_pips(price_to_points(spread_price, point_size))
+                spread_metrics = calculate_distance_metrics(
+                    entry_price=0.0,
+                    current_price=spread_price,
+                    point_size=point_size,
+                )
+                spread_pips = float(spread_metrics.get("dist_pips") or 0.0)
                 sl_metrics = calculate_distance_metrics(
                     entry_price=actual_entry_price,
                     current_price=actual_sl,
@@ -1330,6 +1342,7 @@ class NDSBot:
                         "tp1_pips": tp1_pips,
                         "tp2_pips": tp2_pips,
                         "spread_pips": spread_pips,
+                        "point_size": point_size,
                         "tp2_price": tp2_price,
                     },
                 }
@@ -1414,7 +1427,16 @@ class NDSBot:
                 close_time = history.get("close_time")
                 reason = history.get("reason")
 
-                pips_val = compute_pips(symbol, entry_price or 0.0, exit_price or 0.0)
+                point_size, point_source = resolve_point_size_with_source(
+                    self.config,
+                    default=self.risk_manager._get_gold_spec("point"),
+                )
+                logger.info(
+                    "[NDS][POINT_SIZE] point_size=%.4f source=%s",
+                    point_size,
+                    point_source,
+                )
+                pips_val = compute_pips(symbol, entry_price or 0.0, exit_price or 0.0, config_payload=self.config)
 
                 close_event: ExecutionEvent = {
                     "event_type": "CLOSE",
