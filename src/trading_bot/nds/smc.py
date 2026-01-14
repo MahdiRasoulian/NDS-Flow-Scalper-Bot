@@ -182,9 +182,37 @@ class SMCAnalyzer:
         close_in_zone = bottom <= close <= top
         wick_from_above = high >= top and low <= top - penetration
         wick_from_below = low <= bottom and high >= bottom + penetration
-        mid = (top + bottom) / 2.0
-        mid_touched = abs(close - mid) <= penetration
-        return close_in_zone or wick_from_above or wick_from_below or mid_touched
+        return close_in_zone or wick_from_above or wick_from_below
+
+    def _make_zone_key(
+        self,
+        zone_type: str,
+        top: float,
+        bottom: float,
+        origin_idx: int,
+        break_idx: int,
+    ) -> str:
+        precision = int(self.settings.get("FLOW_ZONE_KEY_PRECISION", 5))
+        top_key = round(float(top), precision)
+        bottom_key = round(float(bottom), precision)
+        return f"{zone_type}|origin={origin_idx}|break={break_idx}|top={top_key}|bottom={bottom_key}"
+
+    def _select_zone_candidate(
+        self,
+        existing: Dict[str, Any],
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if existing is None:
+            return candidate
+        existing_conf = float(existing.get("confidence", 0.0))
+        candidate_conf = float(candidate.get("confidence", 0.0))
+        existing_touches = int(existing.get("touch_count", 0))
+        candidate_touches = int(candidate.get("touch_count", 0))
+        if candidate_touches < existing_touches:
+            return candidate
+        if candidate_touches == existing_touches and candidate_conf > existing_conf:
+            return candidate
+        return existing
 
     def _count_zone_touches(
         self,
@@ -212,20 +240,37 @@ class SMCAnalyzer:
         zone_type: str,
         atr_value: float,
         retest_policy: str,
+        zone_id: Optional[str] = None,
     ) -> Tuple[Optional[int], Optional[int], int, bool, str]:
         touch_indices: List[int] = []
-        confirmed_hits: List[Tuple[int, str]] = []
+        confirmed_hits: List[Tuple[int, str, int]] = []
         first_touch_idx = None
         max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
+        in_touch = False
+        current_touch_idx: Optional[int] = None
 
         for j in range(start_idx, len(df)):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
             close = float(df["close"].iloc[j])
-            if self._is_zone_touch(high, low, close, top, bottom, atr_value):
-                if first_touch_idx is None:
-                    first_touch_idx = j
-                touch_indices.append(j)
+            touched = self._is_zone_touch(high, low, close, top, bottom, atr_value)
+            if touched:
+                if not in_touch:
+                    in_touch = True
+                    current_touch_idx = j
+                    touch_indices.append(j)
+                    first_touch_idx = first_touch_idx or j
+                    if zone_id:
+                        candle_time = None
+                        if "time" in df.columns:
+                            candle_time = df["time"].iloc[j]
+                        self._log_debug(
+                            "[NDS][FLOW_DEBUG][TOUCH_INCREMENT] zone_id=%s idx=%s time=%s touches=%s",
+                            zone_id,
+                            j,
+                            candle_time,
+                            len(touch_indices),
+                        )
                 confirmed, reason = self._confirm_retest(
                     df=df,
                     retest_idx=j,
@@ -234,8 +279,11 @@ class SMCAnalyzer:
                     bottom=bottom,
                     atr_value=atr_value,
                 )
-                if confirmed:
-                    confirmed_hits.append((j, reason))
+                if confirmed and current_touch_idx is not None:
+                    confirmed_hits.append((j, reason, current_touch_idx))
+            else:
+                in_touch = False
+                current_touch_idx = None
 
         touch_count = len(touch_indices)
         retest_idx = None
@@ -248,14 +296,21 @@ class SMCAnalyzer:
         retest_policy = str(retest_policy or "").upper()
         if retest_policy == "FIRST_TOUCH":
             retest_idx = first_touch_idx
-            if confirmed_hits and confirmed_hits[0][0] == first_touch_idx:
+            confirmed_first = None
+            if first_touch_idx is not None:
+                for hit_idx, reason, visit_idx in confirmed_hits:
+                    if visit_idx == first_touch_idx:
+                        confirmed_first = (hit_idx, reason)
+                        break
+            if confirmed_first:
+                retest_idx, retest_reason = confirmed_first
                 eligible = True
-                retest_reason = confirmed_hits[0][1]
             else:
                 retest_reason = "FIRST_TOUCH_UNCONFIRMED"
         else:
             if confirmed_hits:
-                retest_idx, retest_reason = confirmed_hits[-1]
+                last_idx, last_reason, _ = confirmed_hits[-1]
+                retest_idx, retest_reason = last_idx, last_reason
                 eligible = True
             else:
                 retest_idx = touch_indices[-1]
@@ -394,6 +449,7 @@ class SMCAnalyzer:
             retest_idx = None
             zone_type = "BULLISH_BREAKER" if ob["type"] == "BEARISH_OB" else "BEARISH_BREAKER"
             retest_policy = str(self.settings.get("FLOW_RETEST_POLICY", "FIRST_TOUCH"))
+            zone_id = self._make_zone_key(zone_type, ob_high, ob_low, ob_idx, break_idx)
             first_touch_idx, retest_idx, touch_count, eligible, retest_reason = self._scan_zone_touches(
                 df=df,
                 start_idx=break_idx + 1,
@@ -402,6 +458,7 @@ class SMCAnalyzer:
                 zone_type=zone_type,
                 atr_value=atr_value,
                 retest_policy=retest_policy,
+                zone_id=zone_id,
             )
 
             max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
@@ -415,8 +472,7 @@ class SMCAnalyzer:
             if not fresh:
                 confidence *= touch_penalty
 
-            breakers.append(
-                {
+            zone_payload = {
                     "type": zone_type,
                     "top": ob_high,
                     "bottom": ob_low,
@@ -432,9 +488,33 @@ class SMCAnalyzer:
                     "fresh": fresh,
                     "eligible": eligible,
                     "retest_reason": retest_reason,
+                    "zone_id": zone_id,
                     "notes": f"break_idx={break_idx} retest_idx={retest_idx} policy={retest_policy}",
-                }
+            }
+            self._log_debug(
+                "[NDS][FLOW_DEBUG][ZONE_ID] zone_id=%s type=%s top=%.5f bottom=%.5f origin_idx=%s break_idx=%s retest_idx=%s touches=%s eligible=%s",
+                zone_id,
+                zone_type,
+                float(ob_high),
+                float(ob_low),
+                ob_idx,
+                break_idx,
+                retest_idx,
+                touch_count,
+                eligible,
             )
+            zone_key = zone_payload.get("zone_id")
+            if zone_key:
+                existing = next((z for z in breakers if z.get("zone_id") == zone_key), None)
+                if existing is None:
+                    breakers.append(zone_payload)
+                else:
+                    replacement = self._select_zone_candidate(existing, zone_payload)
+                    if replacement is not existing:
+                        breakers = [z for z in breakers if z.get("zone_id") != zone_key]
+                        breakers.append(replacement)
+            else:
+                breakers.append(zone_payload)
             if eligible:
                 self._log_info(
                     "[NDS][FLOW][RETEST_OK] type=BREAKER reason=%s idx=%s touches=%s fresh=%s",
@@ -531,6 +611,7 @@ class SMCAnalyzer:
                 continue
 
             retest_policy = str(self.settings.get("FLOW_RETEST_POLICY", "FIRST_TOUCH"))
+            zone_id = self._make_zone_key(zone_type, top, bottom, fvg_idx, break_idx)
             first_touch_idx, retest_idx, touch_count, eligible, retest_reason = self._scan_zone_touches(
                 df=df,
                 start_idx=break_idx + 1,
@@ -539,6 +620,7 @@ class SMCAnalyzer:
                 zone_type=zone_type,
                 atr_value=atr_value,
                 retest_policy=retest_policy,
+                zone_id=zone_id,
             )
 
             max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
@@ -551,8 +633,7 @@ class SMCAnalyzer:
             confidence *= max(0.3, 1.0 - (age_bars / 200.0))
             if not fresh:
                 confidence *= touch_penalty
-            ifvgs.append(
-                {
+            zone_payload = {
                     "type": zone_type,
                     "top": top,
                     "bottom": bottom,
@@ -567,9 +648,33 @@ class SMCAnalyzer:
                     "fresh": fresh,
                     "eligible": eligible,
                     "retest_reason": retest_reason,
+                    "zone_id": zone_id,
                     "notes": f"break_idx={break_idx} retest_idx={retest_idx} policy={retest_policy}",
-                }
+            }
+            self._log_debug(
+                "[NDS][FLOW_DEBUG][ZONE_ID] zone_id=%s type=%s top=%.5f bottom=%.5f origin_idx=%s break_idx=%s retest_idx=%s touches=%s eligible=%s",
+                zone_id,
+                zone_type,
+                float(top),
+                float(bottom),
+                fvg_idx,
+                break_idx,
+                retest_idx,
+                touch_count,
+                eligible,
             )
+            zone_key = zone_payload.get("zone_id")
+            if zone_key:
+                existing = next((z for z in ifvgs if z.get("zone_id") == zone_key), None)
+                if existing is None:
+                    ifvgs.append(zone_payload)
+                else:
+                    replacement = self._select_zone_candidate(existing, zone_payload)
+                    if replacement is not existing:
+                        ifvgs = [z for z in ifvgs if z.get("zone_id") != zone_key]
+                        ifvgs.append(replacement)
+            else:
+                ifvgs.append(zone_payload)
             if eligible:
                 self._log_info(
                     "[NDS][FLOW][RETEST_OK] type=IFVG reason=%s idx=%s touches=%s fresh=%s",

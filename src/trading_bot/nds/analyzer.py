@@ -178,6 +178,7 @@ class GoldNDSAnalyzer:
             'FLOW_TOUCH_PENETRATION_ATR': float,
             'FLOW_MAX_TOUCHES': int,
             'FLOW_TOUCH_PENALTY': float,
+            'FLOW_ZONE_KEY_PRECISION': int,
             'MOMO_SESSION_ALLOWLIST': list,
         }
 
@@ -1235,11 +1236,27 @@ class GoldNDSAnalyzer:
                 if zone.get("stale"):
                     rejection_counts["stale"] += 1
                     continue
-                mid = float(zone.get("mid", 0.0))
-                if mid <= 0:
+                top = float(zone.get("top", 0.0))
+                bottom = float(zone.get("bottom", 0.0))
+                if top <= 0 or bottom <= 0:
                     continue
-                dist_atr = abs(float(current_price) - mid) / float(atr_value) if atr_value > 0 else 999.0
+                if bottom <= current_price <= top:
+                    dist_price = 0.0
+                else:
+                    dist_price = min(abs(current_price - top), abs(current_price - bottom))
+                dist_atr = dist_price / float(atr_value) if atr_value > 0 else 999.0
                 age = int(zone.get("age_bars", 9999))
+                self._log_debug(
+                    "[NDS][FLOW_DEBUG][ZONE_DISTANCE] zone_id=%s type=%s top=%.5f bottom=%.5f price=%.5f dist=%.5f dist_atr=%.3f max=%.3f",
+                    zone.get("zone_id"),
+                    zone.get("type"),
+                    top,
+                    bottom,
+                    float(current_price),
+                    dist_price,
+                    dist_atr,
+                    max_dist_atr,
+                )
                 if dist_atr > max_dist_atr:
                     rejection_counts["too_far"] += 1
                     self._log_info(
@@ -1317,6 +1334,23 @@ class GoldNDSAnalyzer:
             len(ifvgs),
             sum(1 for z in ifvgs if bool(z.get("eligible", True))),
         )
+        all_zones = breakers + ifvgs
+        if all_zones:
+            touch_values = [int(z.get("touch_count", 0)) for z in all_zones]
+            avg_touches = sum(touch_values) / len(touch_values) if touch_values else 0.0
+            max_touches = max(touch_values) if touch_values else 0
+            eligible_count = sum(1 for z in all_zones if bool(z.get("eligible", True)))
+            last_time = self.df["time"].iloc[-1] if "time" in self.df.columns else None
+            self._log_debug(
+                "[NDS][FLOW_DEBUG][ZONE_SUMMARY] time=%s zones=%d eligible=%d avg_touches=%.2f max_touches=%d breakers=%d ifvg=%d",
+                last_time,
+                len(all_zones),
+                eligible_count,
+                avg_touches,
+                max_touches,
+                len(breakers),
+                len(ifvgs),
+            )
 
         entry_type = "NONE"
         entry_source = None
