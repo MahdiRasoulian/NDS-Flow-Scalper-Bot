@@ -41,8 +41,7 @@ from .smc import SMCAnalyzer
 from .distance_utils import (
     calculate_distance_metrics,
     pips_to_price,
-    price_to_points,
-    points_to_pips,
+    resolve_point_size_with_source,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +68,8 @@ class GoldNDSAnalyzer:
         self.swing_period_map = technical_settings.get('SWING_PERIOD_MAP', {})
 
         self.atr: Optional[float] = None
+        self._point_size: Optional[float] = None
+        self._point_size_source: Optional[str] = None
 
         self._apply_custom_config()
         self._validate_dataframe()
@@ -494,6 +495,12 @@ class GoldNDSAnalyzer:
         """
         mode = "Scalping" if scalping_mode else "Regular"
         self._log_info("[NDS][INIT] start analysis mode=%s analysis_only=true", mode)
+        point_size, source = self._resolve_point_size()
+        self._log_info(
+            "[NDS][POINT_SIZE] point_size=%.4f source=%s",
+            point_size,
+            source,
+        )
 
         try:
             atr_window = self.GOLD_SETTINGS.get('ATR_WINDOW', 14)
@@ -852,12 +859,24 @@ class GoldNDSAnalyzer:
             k = 0.35
         return max(0.01, float(atr_value) * k)
 
+    def _resolve_point_size(self) -> Tuple[float, str]:
+        default_point_size = self.GOLD_SETTINGS.get("POINT_SIZE")
+        point_size, source = resolve_point_size_with_source(self.config, default=default_point_size)
+        self._point_size = point_size
+        self._point_size_source = source
+        return point_size, source
+
     def _get_point_size(self) -> float:
         """Return configured point size with default."""
-        try:
-            return float(self.GOLD_SETTINGS.get("POINT_SIZE", 0.01))
-        except Exception:
-            return 0.001
+        if self._point_size is not None:
+            return self._point_size
+        point_size, source = self._resolve_point_size()
+        self._log_debug(
+            "[NDS][POINT_SIZE] point_size=%.4f source=%s",
+            point_size,
+            source,
+        )
+        return point_size
 
     def _normalize_session_name(self, session_name: str) -> str:
         if not session_name:
@@ -933,8 +952,13 @@ class GoldNDSAnalyzer:
         if sl_distance <= 0:
             sl_distance = pips_to_price(sl_min_pips, point_size)
 
-        sl_points = price_to_points(sl_distance, point_size)
-        sl_pips = points_to_pips(sl_points)
+        sl_metrics = calculate_distance_metrics(
+            entry_price=float(entry_price),
+            current_price=float(entry_price) + float(sl_distance),
+            point_size=point_size,
+        )
+        sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
+        raw_sl_pips = sl_pips
         clamp_reason = None
 
         if sl_pips < sl_min_pips:
@@ -948,11 +972,13 @@ class GoldNDSAnalyzer:
 
         if clamp_reason:
             self._log_info(
-                "[NDS][SL_CLAMP] reason=%s sl_pips=%.2f bounds=[%.2f,%.2f]",
+                "[NDS][SL_CLAMP] reason=%s raw=%.2f clamped=%.2f bounds=[%.2f,%.2f] point_size=%.4f",
                 clamp_reason,
+                raw_sl_pips,
                 sl_pips,
                 sl_min_pips,
                 sl_max_pips,
+                point_size,
             )
 
         if signal == "BUY":
@@ -1413,10 +1439,11 @@ class GoldNDSAnalyzer:
                 )
             )
             self._log_info(
-                "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f dist_price=%.3f dist_points=%.2f dist_pips=%.2f dist_usd=%.3f dist_atr=%.2f",
+                "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f point_size=%.4f dist_price=%.3f dist_points=%.2f dist_pips=%.2f dist_usd=%.3f dist_atr=%.2f",
                 entry_type,
                 float(entry_level),
                 float(current_price),
+                float(entry_context.get("point_size") or 0.0),
                 float(entry_context.get("dist_price") or 0.0),
                 float(entry_context.get("dist_points") or 0.0),
                 float(entry_context.get("dist_pips") or 0.0),
@@ -1480,7 +1507,7 @@ class GoldNDSAnalyzer:
         meta = symbol_meta if isinstance(symbol_meta, dict) else {}
         point_size = meta.get("point_size")
         if point_size is None:
-            point_size = self.GOLD_SETTINGS.get("POINT_SIZE", 0.01)
+            point_size = self._get_point_size()
         atr_source = atr_value
         if atr_source is None and meta:
             atr_source = meta.get("atr")
@@ -2959,7 +2986,7 @@ class GoldNDSAnalyzer:
             entry_metrics = self._calc_entry_distance_metrics(
                 entry_price=entry,
                 current_price=current_price,
-                symbol_meta={"point_size": self.GOLD_SETTINGS.get("POINT_SIZE", 0.01)},
+                symbol_meta={"point_size": self._get_point_size()},
                 atr_value=atr_value,
             )
             idea["entry_distance_pips"] = entry_metrics.get("dist_pips")
@@ -2971,7 +2998,7 @@ class GoldNDSAnalyzer:
             idea["metrics"]["dist_points"] = entry_metrics.get("dist_points")
 
             self._log_info(
-                "[NDS][ENTRY_METRICS] entry=%.3f cur=%.3f point=%.4f dist_usd=%.4f dist_points=%.2f dist_pips=%.2f dist_atr=%s",
+                "[NDS][ENTRY_METRICS] entry=%.3f cur=%.3f point_size=%.4f dist_usd=%.4f dist_points=%.2f dist_pips=%.2f dist_atr=%s",
                 entry,
                 float(current_price),
                 float(entry_metrics.get("point_size") or 0.0),

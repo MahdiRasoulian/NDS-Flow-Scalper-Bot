@@ -10,6 +10,13 @@ try:
 except Exception:  # pragma: no cover - optional import for offline tests
     mt5 = None
 
+from src.trading_bot.nds.distance_utils import (
+    calculate_distance_metrics,
+    DEFAULT_POINT_SIZE,
+    pips_to_price,
+    resolve_point_size_with_source,
+)
+
 
 class PositionContract(TypedDict):
     position_ticket: int
@@ -96,29 +103,47 @@ def normalize_position(raw: Dict[str, Any]) -> PositionContract:
     )
 
 
-def _infer_pip_size(symbol: str) -> float:
-    symbol_upper = symbol.upper()
-    if "XAU" in symbol_upper or "GOLD" in symbol_upper:
-        return 0.10
-
-    if mt5 is not None:
+def _infer_pip_size(symbol: str, config_payload: Optional[Dict[str, Any]] = None) -> float:
+    """Deprecated: use calculate_distance_metrics with resolved point_size instead."""
+    point_size, source = resolve_point_size_with_source(config_payload, default=None)
+    if source == "default" and mt5 is not None:
         try:
             info = mt5.symbol_info(symbol)
             if info and info.point:
-                if info.digits in (3, 5):
-                    return info.point * 10
-                return info.point
+                point_size = float(info.point)
         except Exception:
             pass
+    if not point_size or point_size <= 0:
+        point_size = DEFAULT_POINT_SIZE
+    return pips_to_price(1.0, point_size)
 
-    return 0.0001
 
-
-def compute_pips(symbol: str, entry: float, exit: float) -> float:
-    """Compute pips between entry and exit using symbol info when available."""
+def compute_pips(
+    symbol: str,
+    entry: float,
+    exit: float,
+    config_payload: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Compute pips between entry and exit using centralized distance utilities."""
     if not entry or not exit:
         return 0.0
-    pip_size = _infer_pip_size(symbol)
-    if pip_size <= 0:
-        return 0.0
-    return abs(exit - entry) / pip_size
+    point_size = None
+    if config_payload is not None:
+        point_size, source = resolve_point_size_with_source(config_payload, default=None)
+        if source == "default":
+            point_size = None
+    if point_size is None and mt5 is not None:
+        try:
+            info = mt5.symbol_info(symbol)
+            if info and info.point:
+                point_size = float(info.point)
+        except Exception:
+            point_size = None
+    if not point_size or point_size <= 0:
+        point_size = DEFAULT_POINT_SIZE
+    metrics = calculate_distance_metrics(
+        entry_price=entry,
+        current_price=exit,
+        point_size=point_size,
+    )
+    return float(metrics.get("dist_pips") or 0.0)

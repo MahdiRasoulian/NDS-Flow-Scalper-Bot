@@ -15,9 +15,11 @@ from config.settings import config
 
 from src.trading_bot.nds.distance_utils import (
     calculate_distance_metrics,
+    DEFAULT_POINT_SIZE,
     pips_to_price,
     price_to_points,
-    points_to_pips,
+    resolve_point_size_from_config,
+    resolve_point_size_with_source,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,7 +121,7 @@ class ScalpingRiskManager:
             self.GOLD_SPECS = {}
 
         # Conservative defaults (should be overridden by broker-specific config)
-        self.GOLD_SPECS.setdefault("point", 0.01)
+        self.GOLD_SPECS.setdefault("point", DEFAULT_POINT_SIZE)
         self.GOLD_SPECS.setdefault("digits", 2)
         self.GOLD_SPECS.setdefault("contract_size", 100.0)
         self.GOLD_SPECS.setdefault("tick_value_per_lot", 1.0)
@@ -526,19 +528,8 @@ class ScalpingRiskManager:
 
     def _get_point_size(self, config_payload: Dict[str, Any]) -> float:
         """Resolve point size with default for XAUUSD mapping."""
-        trading_settings = config_payload.get("trading_settings", {}) if isinstance(config_payload, dict) else {}
-        gold_specs = self._normalize_gold_specs(trading_settings.get("GOLD_SPECIFICATIONS", {}))
-        point_size = (
-            gold_specs.get("point")
-            or gold_specs.get("POINT")
-            or self._get_gold_spec("point", 0.01)
-        )
-        try:
-            point_size = float(point_size)
-        except Exception:
-            point_size = 0.01
-        if point_size <= 0:
-            point_size = 0.01
+        default_point_size = self._get_gold_spec("point", DEFAULT_POINT_SIZE)
+        point_size, _ = resolve_point_size_with_source(config_payload, default=default_point_size)
         return point_size
 
     def _compute_scalping_sl_tp(
@@ -549,10 +540,12 @@ class ScalpingRiskManager:
         recent_low: Optional[float],
         recent_high: Optional[float],
         config_payload: Dict[str, Any],
+        point_size: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Compute scalping SL/TP with ATR and recent candle extrema reference."""
         settings = self.settings
-        point_size = self._get_point_size(config_payload)
+        if point_size is None:
+            point_size = self._get_point_size(config_payload)
 
         atr_mult = float(settings.get("SCALP_ATR_SL_MULT", 1.5))
         sl_min_pips = float(settings.get("SL_MIN_PIPS", 10.0))
@@ -579,8 +572,12 @@ class ScalpingRiskManager:
         if sl_distance <= 0:
             sl_distance = pips_to_price(sl_min_pips, point_size)
 
-        sl_points = price_to_points(sl_distance, point_size)
-        sl_pips = points_to_pips(sl_points)
+        sl_metrics = calculate_distance_metrics(
+            entry_price=float(entry_price),
+            current_price=float(entry_price) + float(sl_distance),
+            point_size=point_size,
+        )
+        sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
         raw_sl_pips = sl_pips
         if sl_pips < sl_min_pips:
             sl_pips = sl_min_pips
@@ -591,11 +588,12 @@ class ScalpingRiskManager:
 
         if raw_sl_pips != sl_pips:
             self._logger.info(
-                "[NDS][SL_CLAMP] raw=%.2f clamped=%.2f bounds=[%.2f,%.2f]",
+                "[NDS][SL_CLAMP] raw=%.2f clamped=%.2f bounds=[%.2f,%.2f] point_size=%.4f",
                 raw_sl_pips,
                 sl_pips,
                 sl_min_pips,
                 sl_max_pips,
+                point_size,
             )
 
         if signal == "BUY":
@@ -684,6 +682,15 @@ class ScalpingRiskManager:
         """
         analysis_payload = self._normalize_analysis_payload(analysis)
         live_payload = live if isinstance(live, dict) else asdict(live)
+        point_size, point_source = resolve_point_size_with_source(
+            config,
+            default=self._get_gold_spec("point", DEFAULT_POINT_SIZE),
+        )
+        self._logger.info(
+            "[NDS][POINT_SIZE] point_size=%.4f source=%s",
+            point_size,
+            point_source,
+        )
 
         decision_notes: List[str] = []
         analysis_reasons = analysis_payload.get('reasons') or []
@@ -734,15 +741,19 @@ class ScalpingRiskManager:
             )
 
         spread = float(ask) - float(bid)
-        point_size = self._get_point_size(config)
-        spread_points = price_to_points(spread, point_size)
-        spread_pips = points_to_pips(spread_points)
+        spread_metrics = calculate_distance_metrics(
+            entry_price=0.0,
+            current_price=spread,
+            point_size=point_size,
+        )
+        spread_pips = float(spread_metrics.get("dist_pips") or 0.0)
         spread_max_pips = float(self.settings.get("SPREAD_MAX_PIPS", 2.5))
         if spread_pips > spread_max_pips:
             self._logger.info(
-                "[NDS][RISK_GATE] allow=false reason=SPREAD_TOO_HIGH spread_pips=%.2f max=%.2f",
+                "[NDS][RISK_GATE] allow=false reason=SPREAD_TOO_HIGH spread_pips=%.2f max=%.2f point_size=%.4f",
                 spread_pips,
                 spread_max_pips,
+                point_size,
             )
             return FinalizedOrderParams(
                 signal=signal,
@@ -818,8 +829,6 @@ class ScalpingRiskManager:
         market_entry = ask if signal == 'BUY' else bid
         deviation = abs(planned_entry - market_entry)
 
-        gold_specs = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
-        point_size = gold_specs.get('point') or self._get_gold_spec('point', 0.01)
         deviation_metrics = calculate_distance_metrics(
             entry_price=planned_entry,
             current_price=market_entry,
@@ -859,6 +868,7 @@ class ScalpingRiskManager:
             recent_low=recent_low,
             recent_high=recent_high,
             config_payload=config,
+            point_size=point_size,
         )
         stop_loss = sltp.get("stop_loss")
         take_profit = sltp.get("take_profit")
@@ -1124,9 +1134,13 @@ class ScalpingRiskManager:
             errors.append(f"Signal confidence ({confidence}%) below minimum ({min_confidence}%)")
 
         # بررسی فاصله استاپ برای اسکلپینگ (bounds in pips)
-        point_size = self._get_gold_spec('point', 0.01)
-        sl_points = price_to_points(sl_distance, point_size)
-        sl_pips = points_to_pips(sl_points)
+        point_size = resolve_point_size_from_config(self.settings, default=self._get_gold_spec("point", DEFAULT_POINT_SIZE))
+        sl_metrics = calculate_distance_metrics(
+            entry_price=entry,
+            current_price=sl,
+            point_size=point_size,
+        )
+        sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
         min_sl_pips = float(s.get('SL_MIN_PIPS', 10.0))
         max_sl_pips = float(s.get('SL_MAX_PIPS', 40.0))
 

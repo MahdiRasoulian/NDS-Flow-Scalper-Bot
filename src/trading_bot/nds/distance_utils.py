@@ -13,7 +13,7 @@ Notes:
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Iterable, Any
+from typing import Dict, Optional, Iterable, Any, Tuple
 
 DEFAULT_POINT_SIZE = 0.01
 
@@ -153,6 +153,58 @@ def resolve_point_size_from_config(
             continue
 
     return fallback
+
+
+def resolve_point_size_with_source(
+    config_payload: Optional[Dict[str, Any]],
+    default: Optional[float] = None,
+) -> Tuple[float, str]:
+    """
+    Resolve point size and return the source label for logging.
+
+    Source labels:
+      - config  (value resolved from config payload keys)
+      - default (fallback to default or DEFAULT_POINT_SIZE)
+    """
+    fallback = _safe_point_size(default)
+
+    if not isinstance(config_payload, dict):
+        return fallback, "default"
+
+    trading_settings = config_payload.get("trading_settings", {})
+    if not isinstance(trading_settings, dict):
+        trading_settings = {}
+
+    gold_specs = trading_settings.get("GOLD_SPECIFICATIONS", {})
+    if not isinstance(gold_specs, dict):
+        gold_specs = {}
+
+    candidates = [
+        gold_specs.get("POINT_SIZE"),
+        gold_specs.get("point_size"),
+        gold_specs.get("point"),
+        gold_specs.get("POINT"),
+        trading_settings.get("POINT_SIZE"),
+        trading_settings.get("point_size"),
+        trading_settings.get("POINT"),
+        trading_settings.get("point"),
+        config_payload.get("POINT_SIZE"),
+        config_payload.get("point_size"),
+        config_payload.get("POINT"),
+        config_payload.get("point"),
+    ]
+
+    for v in candidates:
+        try:
+            if v is None:
+                continue
+            vv = float(v)
+            if vv > 0:
+                return vv, "config"
+        except (TypeError, ValueError):
+            continue
+
+    return fallback, "default"
 
 
 def infer_point_size_from_prices(prices: Iterable[float], default: Optional[float] = None) -> float:
