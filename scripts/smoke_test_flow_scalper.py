@@ -27,6 +27,7 @@ from src.trading_bot.nds.distance_utils import (
     calculate_distance_metrics,
     infer_point_size_from_prices,
     resolve_point_size_from_config,
+    resolve_point_size_with_source,
 )
 from src.trading_bot.risk_manager import ScalpingRiskManager
 from src.trading_bot.config_utils import log_active_settings
@@ -130,11 +131,18 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
 
     risk_manager = ScalpingRiskManager()
     config_payload = config.get_full_config()
-    inferred_point_size = infer_point_size_from_prices(df["close"].tail(window))
-    resolved_point_size = resolve_point_size_from_config(risk_manager.settings, default=None)
+    resolved_point_size, point_source = resolve_point_size_with_source(config_payload, default=None)
+    if point_source == "config":
+        inferred_point_size = resolved_point_size
+        inference_note = "skipped"
+    else:
+        inferred_point_size = infer_point_size_from_prices(df["close"].tail(window))
+        inference_note = "inferred"
+    if resolved_point_size is None:
+        resolved_point_size = resolve_point_size_from_config(risk_manager.settings, default=None)
     print(
-        f"[SMOKE] inferred_point_size={inferred_point_size:.4f} "
-        f"resolved_point_size={resolved_point_size:.4f}"
+        f"[SMOKE] inferred_point_size={inferred_point_size:.4f} ({inference_note}) "
+        f"resolved_point_size={resolved_point_size:.4f} source={point_source}"
     )
 
     # Use rolling fixed window to avoid O(n^2)

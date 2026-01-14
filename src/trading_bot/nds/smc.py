@@ -15,6 +15,7 @@ from .models import (
     SwingPoint, SwingType, FVG, FVGType,
     OrderBlock, LiquiditySweep, MarketStructure, MarketTrend
 )
+from .distance_utils import pips_to_price, resolve_point_size_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -277,13 +278,36 @@ class SMCAnalyzer:
         atr_value: float,
     ) -> int:
         touches = 0
+        status = "OUTSIDE"
+        exit_threshold = self._touch_exit_threshold_price(atr_value)
         for j in range(start_idx, len(df)):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
             close = float(df["close"].iloc[j])
-            if self._is_zone_touch(high, low, close, top, bottom, atr_value):
+            touched = self._is_zone_touch(high, low, close, top, bottom, atr_value)
+            if status == "OUTSIDE" and touched:
                 touches += 1
+                status = "INSIDE"
+            elif status == "INSIDE":
+                if self._distance_from_zone(close, top, bottom) > exit_threshold:
+                    status = "OUTSIDE"
         return touches
+
+    def _touch_exit_threshold_price(self, atr_value: float) -> float:
+        exit_atr = float(self.settings.get("FLOW_TOUCH_EXIT_ATR", 0.2))
+        exit_pips = float(self.settings.get("FLOW_TOUCH_EXIT_PIPS", 5.0))
+        point_size = resolve_point_size_from_config(self.settings, default=None)
+        atr_component = float(atr_value) * exit_atr if atr_value else 0.0
+        pips_component = pips_to_price(exit_pips, point_size) if exit_pips > 0 else 0.0
+        return max(atr_component, pips_component)
+
+    @staticmethod
+    def _distance_from_zone(price: float, top: float, bottom: float) -> float:
+        if price > top:
+            return price - top
+        if price < bottom:
+            return bottom - price
+        return 0.0
 
     def _scan_zone_touches(
         self,
@@ -301,31 +325,34 @@ class SMCAnalyzer:
         confirmed_hits: List[Tuple[int, str, int]] = []
         first_touch_idx = None
         max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
-        in_touch = False
+        status = "OUTSIDE"
         current_touch_idx: Optional[int] = None
+        exit_threshold = self._touch_exit_threshold_price(atr_value)
 
         for j in range(start_idx, len(df)):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
             close = float(df["close"].iloc[j])
             touched = self._is_zone_touch(high, low, close, top, bottom, atr_value)
-            if touched:
-                if not in_touch:
-                    in_touch = True
+            if status == "OUTSIDE" and touched:
+                status = "INSIDE"
+                current_touch_idx = j
+                touch_indices.append(j)
+                first_touch_idx = first_touch_idx or j
+                if zone_id:
+                    candle_time = None
+                    if "time" in df.columns:
+                        candle_time = df["time"].iloc[j]
+                    self._log_debug(
+                        "[NDS][FLOW_DEBUG][TOUCH_INCREMENT] zone_id=%s idx=%s time=%s touches=%s",
+                        zone_id,
+                        j,
+                        candle_time,
+                        len(touch_indices),
+                    )
+            if touched and status == "INSIDE":
+                if current_touch_idx is None:
                     current_touch_idx = j
-                    touch_indices.append(j)
-                    first_touch_idx = first_touch_idx or j
-                    if zone_id:
-                        candle_time = None
-                        if "time" in df.columns:
-                            candle_time = df["time"].iloc[j]
-                        self._log_debug(
-                            "[NDS][FLOW_DEBUG][TOUCH_INCREMENT] zone_id=%s idx=%s time=%s touches=%s",
-                            zone_id,
-                            j,
-                            candle_time,
-                            len(touch_indices),
-                        )
                 confirmed, reason = self._confirm_retest(
                     df=df,
                     retest_idx=j,
@@ -336,8 +363,8 @@ class SMCAnalyzer:
                 )
                 if confirmed and current_touch_idx is not None:
                     confirmed_hits.append((j, reason, current_touch_idx))
-            else:
-                in_touch = False
+            if status == "INSIDE" and self._distance_from_zone(close, top, bottom) > exit_threshold:
+                status = "OUTSIDE"
                 current_touch_idx = None
 
         touch_count = len(touch_indices)

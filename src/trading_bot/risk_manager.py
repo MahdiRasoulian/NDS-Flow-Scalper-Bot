@@ -538,6 +538,8 @@ class ScalpingRiskManager:
 
         atr_mult = float(settings.get("SCALP_ATR_SL_MULT", 1.5))
         sl_min_pips = float(settings.get("SL_MIN_PIPS", 10.0))
+        min_sl_pips = float(settings.get("MIN_SL_PIPS", sl_min_pips))
+        sl_min_pips = max(sl_min_pips, min_sl_pips)
         sl_max_pips = float(settings.get("SL_MAX_PIPS", 40.0))
         tp1_pips = float(settings.get("TP1_PIPS", 35.0))
         tp2_enabled = bool(settings.get("TP2_ENABLED", True))
