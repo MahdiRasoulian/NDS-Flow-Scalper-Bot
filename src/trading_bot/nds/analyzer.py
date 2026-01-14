@@ -1213,17 +1213,28 @@ class GoldNDSAnalyzer:
             "stale": 0,
             "ineligible": 0,
         }
+        retest_rejection_counts = {
+            "TOO_MANY_TOUCHES": 0,
+            "FIRST_TOUCH_UNCONFIRMED": 0,
+            "NO_CONFIRMED_TOUCH": 0,
+        }
 
         def _tier_candidates(zones: List[Dict[str, Any]], side: str, max_dist_atr: float, max_age: int) -> List[Dict[str, Any]]:
             candidates = []
             max_touches = int(settings.get("FLOW_MAX_TOUCHES", 2))
             for zone in zones:
+                retest_reason = str(zone.get("retest_reason") or "").upper()
                 if not bool(zone.get("eligible", True)):
-                    rejection_counts["ineligible"] += 1
+                    if retest_reason in retest_rejection_counts:
+                        retest_rejection_counts[retest_reason] += 1
+                    if retest_reason == "TOO_MANY_TOUCHES":
+                        rejection_counts["too_many_touches"] += 1
+                    else:
+                        rejection_counts["ineligible"] += 1
                     self._log_info(
                         "[NDS][FLOW][ZONE_REJECT] tier=FLOW type=%s reason=INELIGIBLE retest_reason=%s idx=%s touches=%s",
                         zone.get("type"),
-                        zone.get("retest_reason"),
+                        retest_reason,
                         zone.get("retest_index") or zone.get("index"),
                         zone.get("touch_count"),
                     )
@@ -1242,12 +1253,17 @@ class GoldNDSAnalyzer:
                     continue
                 if bottom <= current_price <= top:
                     dist_price = 0.0
+                    boundary = "inside"
+                elif current_price > top:
+                    dist_price = abs(current_price - top)
+                    boundary = "upper"
                 else:
-                    dist_price = min(abs(current_price - top), abs(current_price - bottom))
+                    dist_price = abs(current_price - bottom)
+                    boundary = "lower"
                 dist_atr = dist_price / float(atr_value) if atr_value > 0 else 999.0
                 age = int(zone.get("age_bars", 9999))
                 self._log_debug(
-                    "[NDS][FLOW_DEBUG][ZONE_DISTANCE] zone_id=%s type=%s top=%.5f bottom=%.5f price=%.5f dist=%.5f dist_atr=%.3f max=%.3f",
+                    "[NDS][FLOW_DEBUG][ZONE_DISTANCE] zone_id=%s type=%s top=%.5f bottom=%.5f price=%.5f dist=%.5f dist_atr=%.3f max=%.3f boundary=%s",
                     zone.get("zone_id"),
                     zone.get("type"),
                     top,
@@ -1256,15 +1272,31 @@ class GoldNDSAnalyzer:
                     dist_price,
                     dist_atr,
                     max_dist_atr,
+                    boundary,
                 )
                 if dist_atr > max_dist_atr:
                     rejection_counts["too_far"] += 1
+                    ref_time = None
+                    ref_idx = None
+                    if "time" in self.df.columns:
+                        ref_time = self.df["time"].iloc[-1]
+                    if self.df.index is not None and len(self.df.index) > 0:
+                        ref_idx = self.df.index[-1]
+                    if hasattr(ref_time, "isoformat"):
+                        ref_time = ref_time.isoformat()
                     self._log_info(
-                        "[NDS][FLOW][ZONE_REJECT] tier=FLOW type=%s reason=TOO_FAR dist_atr=%.2f max=%.2f idx=%s",
+                        "[NDS][FLOW][ZONE_REJECT] tier=FLOW reason=TOO_FAR zone_id=%s zone_type=%s idx=%s "
+                        "dist_price=%.5f dist_atr=%.2f max_dist_atr=%.2f boundary=%s ref_price=%.5f ref_time=%s ref_idx=%s",
+                        zone.get("zone_id"),
                         zone.get("type"),
+                        zone.get("retest_index") or zone.get("index"),
+                        dist_price,
                         dist_atr,
                         max_dist_atr,
-                        zone.get("retest_index") or zone.get("index"),
+                        boundary,
+                        float(current_price),
+                        ref_time,
+                        ref_idx,
                     )
                     continue
                 if age > max_age:
@@ -1552,6 +1584,7 @@ class GoldNDSAnalyzer:
                 "recent_low": recent_low,
                 "recent_high": recent_high,
                 "zone_rejections": dict(rejection_counts),
+                "retest_rejections": dict(retest_rejection_counts),
             }
         )
 

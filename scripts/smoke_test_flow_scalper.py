@@ -178,6 +178,9 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
             rejections = entry_context.get("zone_rejections", {}) or {}
             for key in zone_rejections.keys():
                 zone_rejections[key] += int(rejections.get(key, 0) or 0)
+            retest_summary = entry_context.get("retest_rejections", {}) or {}
+            for key in retest_rejections.keys():
+                retest_rejections[key] += int(retest_summary.get(key, 0) or 0)
             momentum_block = entry_context.get("momentum_block_reason")
             if momentum_block in momentum_rejections:
                 momentum_rejections[momentum_block] += 1
@@ -198,10 +201,6 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
         for zone in breakers + inversion_fvgs:
             if zone and not zone.get("fresh", True):
                 non_fresh_zones += 1
-            if zone and not zone.get("eligible", True):
-                retest_reason = str(zone.get("retest_reason") or "").upper()
-                if retest_reason in retest_rejections:
-                    retest_rejections[retest_reason] += 1
 
         if result.signal in {"BUY", "SELL"} and entry_level:
             atr_value = None
