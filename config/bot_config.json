@@ -41,6 +41,7 @@
     "GOLD_SPECIFICATIONS": {
       "CONTRACT_SIZE": 100,
       "TICK_VALUE_PER_LOT": 100,
+      "POINT_SIZE": 0.1,
       "POINT": 0.1,
       "MIN_LOT": 0.01,
       "MAX_LOT": 2.0,
