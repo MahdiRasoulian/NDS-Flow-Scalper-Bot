@@ -178,8 +178,12 @@ class GoldNDSAnalyzer:
             'FLOW_TOUCH_PENETRATION_ATR': float,
             'FLOW_MAX_TOUCHES': int,
             'FLOW_TOUCH_PENALTY': float,
+            'FLOW_TOUCH_EXIT_ATR': float,
+            'FLOW_TOUCH_EXIT_PIPS': float,
             'FLOW_ZONE_KEY_PRECISION': int,
+            'FLOW_NEAREST_ZONES': int,
             'MOMO_SESSION_ALLOWLIST': list,
+            'MIN_SL_PIPS': float,
         }
 
         validated_config: Dict[str, Any] = {}
@@ -948,6 +952,8 @@ class GoldNDSAnalyzer:
 
         atr_mult = float(settings.get("SCALP_ATR_SL_MULT", 1.5))
         sl_min_pips = float(settings.get("SL_MIN_PIPS", 10.0))
+        min_sl_pips = float(settings.get("MIN_SL_PIPS", sl_min_pips))
+        sl_min_pips = max(sl_min_pips, min_sl_pips)
         sl_max_pips = float(settings.get("SL_MAX_PIPS", 40.0))
         tp1_pips = float(settings.get("TP1_PIPS", 35.0))
         tp2_enabled = bool(settings.get("TP2_ENABLED", True))
@@ -1222,6 +1228,8 @@ class GoldNDSAnalyzer:
         def _tier_candidates(zones: List[Dict[str, Any]], side: str, max_dist_atr: float, max_age: int) -> List[Dict[str, Any]]:
             candidates = []
             max_touches = int(settings.get("FLOW_MAX_TOUCHES", 2))
+            nearest_limit = int(settings.get("FLOW_NEAREST_ZONES", 5))
+            pre_candidates: List[Dict[str, Any]] = []
             for zone in zones:
                 retest_reason = str(zone.get("retest_reason") or "").upper()
                 if not bool(zone.get("eligible", True)):
@@ -1262,6 +1270,29 @@ class GoldNDSAnalyzer:
                     boundary = "lower"
                 dist_atr = dist_price / float(atr_value) if atr_value > 0 else 999.0
                 age = int(zone.get("age_bars", 9999))
+                pre_candidates.append(
+                    {
+                        "zone": zone,
+                        "dist_price": dist_price,
+                        "dist_atr": dist_atr,
+                        "age": age,
+                        "boundary": boundary,
+                        "top": top,
+                        "bottom": bottom,
+                    }
+                )
+            if not pre_candidates:
+                return candidates
+            pre_candidates.sort(key=lambda item: item["dist_atr"])
+            scoped_candidates = pre_candidates[:max(1, nearest_limit)]
+            for payload in scoped_candidates:
+                zone = payload["zone"]
+                dist_price = payload["dist_price"]
+                dist_atr = payload["dist_atr"]
+                age = payload["age"]
+                boundary = payload["boundary"]
+                top = payload["top"]
+                bottom = payload["bottom"]
                 self._log_debug(
                     "[NDS][FLOW_DEBUG][ZONE_DISTANCE] zone_id=%s type=%s top=%.5f bottom=%.5f price=%.5f dist=%.5f dist_atr=%.3f max=%.3f boundary=%s",
                     zone.get("zone_id"),
@@ -1348,7 +1379,7 @@ class GoldNDSAnalyzer:
                 brk_max_age,
             )
 
-        ifvg_max_dist = float(settings.get("IFVG_MAX_DIST_ATR", 0.5))
+        ifvg_max_dist = float(settings.get("IFVG_MAX_DIST_ATR", 3.0))
         ifvg_max_age = int(settings.get("IFVG_MAX_AGE_BARS", 60))
         ifvg_candidates = _tier_candidates(ifvgs, signal, ifvg_max_dist, ifvg_max_age)
         if not ifvg_candidates:

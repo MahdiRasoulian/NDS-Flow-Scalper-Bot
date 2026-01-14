@@ -23,12 +23,15 @@ DEFAULT_ACTIVE_SETTINGS: Dict[str, Dict[str, Any]] = {
     "flow_settings": {
         "BRK_MAX_DIST_ATR": 1.2,
         "BRK_MAX_AGE_BARS": 45,
-        "IFVG_MAX_DIST_ATR": 1.4,
+        "IFVG_MAX_DIST_ATR": 3.0,
         "IFVG_MAX_AGE_BARS": 45,
         "FLOW_MAX_TOUCHES": 2,
+        "FLOW_TOUCH_EXIT_ATR": 0.2,
+        "FLOW_TOUCH_EXIT_PIPS": 5.0,
         "FLOW_TOUCH_PENETRATION_ATR": 0.05,
         "FLOW_TOUCH_PENALTY": 0.55,
         "FLOW_RETEST_POLICY": "FIRST_TOUCH",
+        "FLOW_NEAREST_ZONES": 5,
     },
     "momentum_settings": {
         "MOMO_ADX_MIN": 35.0,
@@ -42,6 +45,7 @@ DEFAULT_ACTIVE_SETTINGS: Dict[str, Dict[str, Any]] = {
     "risk_settings": {
         "SCALP_ATR_SL_MULT": 1.5,
         "SL_MIN_PIPS": 10.0,
+        "MIN_SL_PIPS": 20.0,
         "SL_MAX_PIPS": 40.0,
         "TP1_PIPS": 35.0,
         "TP2_ENABLED": True,
