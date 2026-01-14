@@ -8,7 +8,7 @@ import logging
 import numpy as np
 from typing import Dict, Optional, Any, Tuple, List, TYPE_CHECKING, Union
 from dataclasses import dataclass, asdict
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta
 import math
 
 from config.settings import config
@@ -20,6 +20,14 @@ from src.trading_bot.nds.distance_utils import (
     price_to_points,
     resolve_point_size_from_config,
     resolve_point_size_with_source,
+)
+from src.trading_bot.config_utils import get_setting
+from src.trading_bot.time_utils import (
+    classify_session,
+    get_broker_now,
+    normalize_session_definitions,
+    parse_timestamp,
+    to_broker_time,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,7 +239,14 @@ class ScalpingRiskManager:
                 'MIN_CONFIDENCE': 'MIN_CONFIDENCE',
                 'MAX_PRICE_DEVIATION_PIPS': 'MAX_PRICE_DEVIATION_PIPS',
                 'MAX_ENTRY_ATR_DEVIATION': 'MAX_ENTRY_ATR_DEVIATION',
-                'LIMIT_ORDER_MIN_CONFIDENCE': 'LIMIT_ORDER_MIN_CONFIDENCE'
+                'LIMIT_ORDER_MIN_CONFIDENCE': 'LIMIT_ORDER_MIN_CONFIDENCE',
+                'SCALP_ATR_SL_MULT': 'SCALP_ATR_SL_MULT',
+                'SL_MIN_PIPS': 'SL_MIN_PIPS',
+                'SL_MAX_PIPS': 'SL_MAX_PIPS',
+                'TP1_PIPS': 'TP1_PIPS',
+                'TP2_ENABLED': 'TP2_ENABLED',
+                'TP2_PIPS': 'TP2_PIPS',
+                'SPREAD_MAX_PIPS': 'SPREAD_MAX_PIPS',
             },
             'technical_settings': {
                 'ATR_WINDOW': 'ATR_WINDOW',
@@ -298,47 +313,21 @@ class ScalpingRiskManager:
     @staticmethod
     def get_current_scalping_session(dt: datetime = None) -> str:
         """
-        Detect current scalping session based on LOCAL trading time (UTC+3).
-        This avoids false DEAD_ZONE detection caused by UTC mismatch.
+        Detect current scalping session based on broker trading time.
         """
-
-        # ===============================
-        # 1. Define trading timezone offset
-        # ===============================
-        TRADING_UTC_OFFSET = 3  # Iraq / Middle East
-
+        time_mode = str(get_setting(config, "trading_settings.TIME_MODE", "BROKER") or "BROKER").upper()
+        offset = float(get_setting(config, "trading_settings.BROKER_UTC_OFFSET_HOURS", 2) or 2)
         if dt is None:
-            dt = datetime.utcnow() + timedelta(hours=TRADING_UTC_OFFSET)
+            dt = get_broker_now(offset)
+        else:
+            parsed = parse_timestamp(dt) or dt
+            dt = to_broker_time(parsed, offset, time_mode)
 
-        current_time = dt.time()
-
-        sessions = config.get('sessions_config.SCALPING_SESSIONS', {})
-
-        for session_name, session_data in sessions.items():
-            start_hour = session_data.get('start', 0)
-            end_hour = session_data.get('end', 0)
-
-            start_time = time(start_hour, 0)
-            end_time = time(end_hour, 0)
-
-            # ===============================
-            # Normal session (same day)
-            # ===============================
-            if start_time <= end_time:
-                if start_time <= current_time < end_time:
-                    return session_name
-
-            # ===============================
-            # Overnight session (e.g. 22 → 01)
-            # ===============================
-            else:
-                if current_time >= start_time or current_time < end_time:
-                    return session_name
-
-        # ===============================
-        # Fallback (safety)
-        # ===============================
-        return 'DEAD_ZONE'
+        sessions = get_setting(config, "sessions_config.SCALPING_SESSIONS", {})
+        definitions = normalize_session_definitions(sessions)
+        session_info = classify_session(dt, definitions)
+        session = session_info.get("session", "UNKNOWN")
+        return "DEAD_ZONE" if session == "UNKNOWN" else session
 
     @staticmethod
     def is_scalping_friendly_session(session: str) -> bool:
@@ -551,6 +540,7 @@ class ScalpingRiskManager:
         sl_min_pips = float(settings.get("SL_MIN_PIPS", 10.0))
         sl_max_pips = float(settings.get("SL_MAX_PIPS", 40.0))
         tp1_pips = float(settings.get("TP1_PIPS", 35.0))
+        tp2_enabled = bool(settings.get("TP2_ENABLED", True))
         tp2_pips = float(settings.get("TP2_PIPS", tp1_pips * 2.0))
 
         atr_value = float(atr_value) if atr_value is not None else 0.0
@@ -599,11 +589,19 @@ class ScalpingRiskManager:
         if signal == "BUY":
             stop_loss = float(entry_price) - sl_distance
             take_profit = float(entry_price) + pips_to_price(tp1_pips, point_size)
-            tp2_price = float(entry_price) + pips_to_price(tp2_pips, point_size)
+            tp2_price = (
+                float(entry_price) + pips_to_price(tp2_pips, point_size)
+                if tp2_enabled
+                else None
+            )
         else:
             stop_loss = float(entry_price) + sl_distance
             take_profit = float(entry_price) - pips_to_price(tp1_pips, point_size)
-            tp2_price = float(entry_price) - pips_to_price(tp2_pips, point_size)
+            tp2_price = (
+                float(entry_price) - pips_to_price(tp2_pips, point_size)
+                if tp2_enabled
+                else None
+            )
 
         return {
             "stop_loss": stop_loss,

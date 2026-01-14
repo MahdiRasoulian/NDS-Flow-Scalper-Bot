@@ -17,7 +17,7 @@ Config keys (whitelisted via ANALYSIS_CONFIG_KEYS):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from collections import deque
@@ -43,6 +43,17 @@ from .distance_utils import (
     pips_to_price,
     resolve_point_size_with_source,
 )
+from src.trading_bot.config_utils import get_setting, resolve_active_settings
+from src.trading_bot.time_utils import (
+    classify_session,
+    in_time_window,
+    parse_timestamp,
+    to_broker_time,
+    DEFAULT_BROKER_OFFSET_HOURS,
+    DEFAULT_TIME_MODE,
+    DEFAULT_SESSION_DEFINITIONS,
+    normalize_session_definitions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +70,8 @@ class GoldNDSAnalyzer:
         self.df = df.copy()
         self.config = config or {}
         self.debug_analyzer = False
+        self._resolved_settings_payload = resolve_active_settings(self.config)
+        self._resolved_settings = self._resolved_settings_payload.get("resolved", {})
 
         technical_settings = (self.config or {}).get('technical_settings', {})
         sessions_config = (self.config or {}).get('sessions_config', {})
@@ -70,8 +83,12 @@ class GoldNDSAnalyzer:
         self.atr: Optional[float] = None
         self._point_size: Optional[float] = None
         self._point_size_source: Optional[str] = None
+        self.time_mode = DEFAULT_TIME_MODE
+        self.broker_utc_offset = DEFAULT_BROKER_OFFSET_HOURS
+        self.session_definitions: Dict[str, Dict[str, Any]] = dict(DEFAULT_SESSION_DEFINITIONS)
 
         self._apply_custom_config()
+        self._init_time_settings()
         self._validate_dataframe()
         self.timeframe = self._detect_timeframe()
         self._apply_timeframe_settings()
@@ -86,7 +103,7 @@ class GoldNDSAnalyzer:
 
     def _apply_custom_config(self) -> None:
         """اعمال تنظیمات سفارشی از config خارجی"""
-        if not self.config:
+        if self.config is None:
             return
 
         analyzer_config, sessions_config = self._extract_config_payload()
@@ -96,23 +113,44 @@ class GoldNDSAnalyzer:
         if sessions_config:
             self._apply_sessions_config(sessions_config)
 
+        flow_settings = self._resolved_settings.get("flow_settings", {})
+        momentum_settings = self._resolved_settings.get("momentum_settings", {})
+        risk_settings = self._resolved_settings.get("risk_settings", {})
+        trading_settings = self._resolved_settings.get("trading_settings", {})
+        for section in (flow_settings, momentum_settings, risk_settings, trading_settings):
+            if isinstance(section, dict):
+                self.GOLD_SETTINGS.update(section)
+
+    def _init_time_settings(self) -> None:
+        self.time_mode = str(get_setting(self.config, "trading_settings.TIME_MODE", DEFAULT_TIME_MODE) or DEFAULT_TIME_MODE).upper()
+        self.broker_utc_offset = float(
+            get_setting(self.config, "trading_settings.BROKER_UTC_OFFSET_HOURS", DEFAULT_BROKER_OFFSET_HOURS)
+            or DEFAULT_BROKER_OFFSET_HOURS
+        )
+        session_defs = get_setting(self.config, "trading_settings.SESSION_DEFINITIONS", None)
+        if not session_defs:
+            session_defs = get_setting(self.config, "sessions_config.BASE_TRADING_SESSIONS", {}) or self.TRADING_SESSIONS
+        session_defs = normalize_session_definitions(session_defs)
+        if not session_defs:
+            session_defs = dict(DEFAULT_SESSION_DEFINITIONS)
+        self.session_definitions = session_defs
+
     def _extract_config_payload(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """دریافت تنظیمات مجاز آنالایزر و سشن‌ها از کانفیگ اصلی"""
         analyzer_config: Dict[str, Any] = {}
         sessions_config: Dict[str, Any] = {}
 
-        if 'ANALYZER_SETTINGS' in self.config:
-            analyzer_config = self.config.get('ANALYZER_SETTINGS', {}) or {}
-        elif 'technical_settings' in self.config:
-            analyzer_config = self.config.get('technical_settings', {}) or {}
+        analyzer_config = get_setting(self.config, "ANALYZER_SETTINGS", None)
+        if not analyzer_config:
+            analyzer_config = get_setting(self.config, "technical_settings", {}) or {}
 
-        if 'DEBUG_ANALYZER' in self.config and 'DEBUG_ANALYZER' not in analyzer_config:
-            analyzer_config = {**analyzer_config, 'DEBUG_ANALYZER': self.config.get('DEBUG_ANALYZER')}
+        debug_flag = get_setting(self.config, "DEBUG_ANALYZER", None)
+        if debug_flag is not None and 'DEBUG_ANALYZER' not in analyzer_config:
+            analyzer_config = {**analyzer_config, 'DEBUG_ANALYZER': debug_flag}
 
-        if 'TRADING_SESSIONS' in self.config:
-            sessions_config = self.config.get('TRADING_SESSIONS', {}) or {}
-        else:
-            sessions_config = self.config.get('sessions_config', {}).get('TRADING_SESSIONS', {}) or {}
+        sessions_config = get_setting(self.config, "TRADING_SESSIONS", None)
+        if sessions_config is None:
+            sessions_config = get_setting(self.config, "sessions_config.TRADING_SESSIONS", {}) or {}
 
         return analyzer_config, sessions_config
 
@@ -206,6 +244,9 @@ class GoldNDSAnalyzer:
                 self.TRADING_SESSIONS[standard_name] = converted_session
 
             self._log_debug("[NDS][SESSIONS] applied config %s=%s", standard_name, converted_session)
+        normalized = normalize_session_definitions(self.TRADING_SESSIONS)
+        if normalized:
+            self.session_definitions = normalized
 
     def _log_debug(self, message: str, *args: Any) -> None:
         if self.debug_analyzer:
@@ -240,7 +281,12 @@ class GoldNDSAnalyzer:
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
 
-        self.df['time'] = pd.to_datetime(self.df['time'], utc=True)
+        self.df['time'] = pd.to_datetime(self.df['time'], errors="coerce")
+        try:
+            if getattr(self.df["time"].dt, "tz", None) is not None:
+                self.df["time"] = self.df["time"].dt.tz_convert(None)
+        except Exception:
+            pass
 
         if len(self.df) > 1 and self.df['time'].iloc[0] > self.df['time'].iloc[-1]:
             logger.warning("[NDS][INIT] DataFrame not sorted chronologically. Sorting...")
@@ -306,9 +352,19 @@ class GoldNDSAnalyzer:
         - is_active_session فقط وقتی False می‌شود که واقعاً untradable باشیم (market closed, data ناقص, spread غیرعادی, ...).
         """
         last_time = self.df['time'].iloc[-1]
-        hour = last_time.hour
+        parsed_time = parse_timestamp(last_time)
+        broker_time = to_broker_time(parsed_time, self.broker_utc_offset, self.time_mode) if parsed_time else None
 
-        session_info = self._is_valid_trading_session(last_time)
+        session_info = self._is_valid_trading_session(broker_time or last_time)
+        logger.info(
+            "[NDS][TIME] mode=%s broker_offset=%s ts_raw=%s ts_broker=%s session=%s overlap=%s",
+            self.time_mode,
+            self.broker_utc_offset,
+            last_time,
+            broker_time,
+            session_info.get("session", "UNKNOWN"),
+            session_info.get("is_overlap", False),
+        )
 
         # ---- RVOL (NaN-safe) ----
         rvol = volume_analysis.get('rvol', 1.0)
@@ -371,7 +427,7 @@ class GoldNDSAnalyzer:
             current_session=session_info.get('session', 'OTHER'),
             session_weight=session_info.get('weight', 0.5),
             weight=session_info.get('weight', 0.5),
-            gmt_hour=hour,
+            gmt_hour=broker_time.hour if isinstance(broker_time, datetime) else 0,
             # سیاست جدید: active فقط برای untradable false می‌شود
             is_active_session=is_active_session,
             is_overlap=session_info.get('is_overlap', False),
@@ -421,64 +477,32 @@ class GoldNDSAnalyzer:
         - is_valid فقط یعنی timestamp معتبر/قابل‌تحلیل است (نه تعطیلی بازار).
         - تشخیص untradable در _analyze_trading_sessions انجام می‌شود (با data_ok/spread/market_status).
         """
+        raw_time = check_time
         if not isinstance(check_time, datetime):
-            try:
-                check_time = pd.to_datetime(check_time)
-            except (ValueError, TypeError):
-                return {
-                    'is_valid': False, 'is_overlap': False, 'session': 'INVALID',
-                    'weight': 0.0, 'optimal_trading': False
-                }
+            check_time = parse_timestamp(check_time)
+        if not isinstance(check_time, datetime):
+            self._log_info(
+                "[NDS][TIME] parse_failed ts_raw=%s mode=%s broker_offset=%s",
+                raw_time,
+                self.time_mode,
+                self.broker_utc_offset,
+            )
+            return {
+                'is_valid': False, 'is_overlap': False, 'session': 'INVALID',
+                'weight': 0.0, 'optimal_trading': False
+            }
 
-        hour = check_time.hour
-        raw_sessions = self.TRADING_SESSIONS
-
-        sessions = {}
-        for config_name, data in raw_sessions.items():
-            standard_name = SESSION_MAPPING.get(config_name, config_name)
-            if standard_name not in sessions or data.get('weight', 0) > sessions[standard_name].get('weight', 0):
-                sessions[standard_name] = data
-
-        session_name = 'OTHER'
-        session_weight = 0.5
-        is_overlap = False
-
-        def check_in_session(name: str) -> Tuple[bool, float]:
-            session = sessions.get(name)
-            if session and self._hour_in_session(hour, session.get('start', 0), session.get('end', 0)):
-                return True, session.get('weight', 0.5)
-            return False, 0.0
-
-        in_overlap, weight = check_in_session('OVERLAP')
-        if in_overlap:
-            session_name = 'OVERLAP'
-            session_weight = weight
-            is_overlap = True
-        else:
-            in_london, weight = check_in_session('LONDON')
-            if in_london:
-                session_name = 'LONDON'
-                session_weight = weight
-            else:
-                in_ny, weight = check_in_session('NEW_YORK')
-                if in_ny:
-                    session_name = 'NEW_YORK'
-                    session_weight = weight
-                else:
-                    in_asia, weight = check_in_session('ASIA')
-                    if in_asia:
-                        session_name = 'ASIA'
-                        session_weight = weight
-
+        session_info = classify_session(check_time, self.session_definitions)
+        session_weight = float(session_info.get("weight", 0.5))
         optimal_trading = session_weight >= 1.0
 
         return {
             # سیاست جدید: معتبر بودن timestamp
             'is_valid': True,
-            'is_overlap': is_overlap,
-            'session': session_name,
+            'is_overlap': bool(session_info.get("is_overlap", False)),
+            'session': session_info.get("session", "UNKNOWN"),
             'weight': session_weight,
-            'hour': hour,
+            'hour': check_time.hour,
             'optimal_trading': optimal_trading
         }
 
@@ -530,6 +554,16 @@ class GoldNDSAnalyzer:
             atr_for_scoring = atr_short_value if (scalping_mode and atr_short_value) else atr_v
 
             volume_analysis = IndicatorCalculator.analyze_volume(self.df, 5 if scalping_mode else 20)
+            if "spread" in self.df.columns:
+                try:
+                    volume_analysis["spread"] = float(self.df["spread"].iloc[-1])
+                except Exception:
+                    pass
+            if "max_spread" not in volume_analysis:
+                try:
+                    volume_analysis["max_spread"] = float(self.GOLD_SETTINGS.get("SPREAD_MAX_PIPS", 2.5))
+                except Exception:
+                    volume_analysis["max_spread"] = None
             volatility_state = self._normalize_volatility_state(self._determine_volatility(atr_v, atr_for_scoring))
             session_analysis = self._analyze_trading_sessions(volume_analysis)
 
@@ -898,22 +932,8 @@ class GoldNDSAnalyzer:
 
     def _is_time_in_window(self, ts: datetime, start_str: str, end_str: str) -> Tuple[bool, Optional[str]]:
         """Check if timestamp is within [start, end) window (supports midnight wrap)."""
-        try:
-            start_parts = [int(p) for p in str(start_str).split(":")]
-            end_parts = [int(p) for p in str(end_str).split(":")]
-            start_h, start_m = (start_parts + [0, 0])[:2]
-            end_h, end_m = (end_parts + [0, 0])[:2]
-            start_t = time(start_h, start_m)
-            end_t = time(end_h, end_m)
-            now_t = ts.time()
-        except Exception as exc:
-            return False, f"time_parse_failed:{exc}"
-
-        if start_t == end_t:
-            return False, "time_window_zero"
-        if start_t < end_t:
-            return (start_t <= now_t < end_t), None
-        return (now_t >= start_t or now_t < end_t), None
+        broker_time = to_broker_time(parse_timestamp(ts) or ts, self.broker_utc_offset, self.time_mode)
+        return in_time_window(broker_time, start_str, end_str)
 
     def _compute_scalping_sl_tp(
         self,
@@ -929,6 +949,7 @@ class GoldNDSAnalyzer:
         sl_min_pips = float(settings.get("SL_MIN_PIPS", 10.0))
         sl_max_pips = float(settings.get("SL_MAX_PIPS", 40.0))
         tp1_pips = float(settings.get("TP1_PIPS", 35.0))
+        tp2_enabled = bool(settings.get("TP2_ENABLED", True))
         tp2_pips = float(settings.get("TP2_PIPS", tp1_pips * 2.0))
 
         recent_slice = self.df.tail(2)
@@ -984,11 +1005,19 @@ class GoldNDSAnalyzer:
         if signal == "BUY":
             stop_loss = float(entry_price) - sl_distance
             take_profit = float(entry_price) + pips_to_price(tp1_pips, point_size)
-            tp2_price = float(entry_price) + pips_to_price(tp2_pips, point_size)
+            tp2_price = (
+                float(entry_price) + pips_to_price(tp2_pips, point_size)
+                if tp2_enabled
+                else None
+            )
         else:
             stop_loss = float(entry_price) + sl_distance
             take_profit = float(entry_price) - pips_to_price(tp1_pips, point_size)
-            tp2_price = float(entry_price) - pips_to_price(tp2_pips, point_size)
+            tp2_price = (
+                float(entry_price) - pips_to_price(tp2_pips, point_size)
+                if tp2_enabled
+                else None
+            )
 
         return {
             "stop_loss": stop_loss,
@@ -1326,6 +1355,8 @@ class GoldNDSAnalyzer:
             session_only = bool(settings.get("MOMO_SESSION_ONLY", True))
 
             now_ts = self.df["time"].iloc[-1]
+            parsed_ts = parse_timestamp(now_ts)
+            broker_ts = to_broker_time(parsed_ts, self.broker_utc_offset, self.time_mode) if parsed_ts else None
             in_window, time_error = self._is_time_in_window(now_ts, time_start, time_end)
             if time_error:
                 momentum_block_reason = "time_parse_failed"
@@ -1334,6 +1365,19 @@ class GoldNDSAnalyzer:
                     "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
                     momentum_block_reason,
                 )
+                if momentum_block_reason in {"adx_below_min", "bias_mismatch", "liquidity_blocked", "untradable_market"}:
+                    self._log_info(
+                        "[NDS][MOMO_BLOCK] reason=%s session=%s ts_broker=%s",
+                        momentum_block_reason,
+                        session_name,
+                        broker_ts,
+                    )
+                self._log_info(
+                    "[NDS][MOMO_BLOCK] reason=time_parse_failed start=%s end=%s ts_broker=%s",
+                    time_start,
+                    time_end,
+                    broker_ts,
+                )
                 in_window = False
             elif not in_window:
                 momentum_block_reason = "time_outside_window"
@@ -1341,6 +1385,12 @@ class GoldNDSAnalyzer:
                 self._log_info(
                     "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
                     momentum_block_reason,
+                )
+                self._log_info(
+                    "[NDS][MOMO_BLOCK] reason=time_outside_window start=%s end=%s ts_broker=%s",
+                    time_start,
+                    time_end,
+                    broker_ts,
                 )
 
             session_name = self._normalize_session_name(
@@ -1354,7 +1404,10 @@ class GoldNDSAnalyzer:
                 elif isinstance(allowlist, (list, tuple, set)):
                     allowlist = [str(s).strip().upper() for s in allowlist if str(s).strip()]
                 else:
-                    allowlist = ["LONDON", "NEW_YORK", "OVERLAP"]
+                    allowlist = [
+                        name for name, data in self.session_definitions.items()
+                        if bool(data.get("allow_momentum", True))
+                    ] or ["LONDON", "NEW_YORK", "OVERLAP"]
                 session_ok = session_name in set(allowlist)
 
             liquidity_ok = bool(getattr(session_analysis, "is_active_session", True))
@@ -1412,6 +1465,11 @@ class GoldNDSAnalyzer:
                         momentum_block_reason = "adx_below_min"
                     elif not session_ok:
                         momentum_block_reason = "session_blocked"
+                        self._log_info(
+                            "[NDS][MOMO_BLOCK] reason=session_blocked session=%s allowlist=%s",
+                            session_name,
+                            allowlist,
+                        )
                     elif not liquidity_ok:
                         momentum_block_reason = "untradable_market" if market_status in {"CLOSED", "HALTED"} else "liquidity_blocked"
                     elif not bias_ok:

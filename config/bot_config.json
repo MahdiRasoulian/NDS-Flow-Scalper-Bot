@@ -27,7 +27,14 @@
     "SCALPING_RR": 0.9,
     "MAX_ENTRY_ATR_DEVIATION": 2.8,
     "MAX_PRICE_DEVIATION_PIPS": 70.0,
-    "LIMIT_ORDER_MIN_CONFIDENCE": 55.0
+    "LIMIT_ORDER_MIN_CONFIDENCE": 55.0,
+    "SCALP_ATR_SL_MULT": 1.5,
+    "SL_MIN_PIPS": 10.0,
+    "SL_MAX_PIPS": 40.0,
+    "TP1_PIPS": 35.0,
+    "TP2_ENABLED": true,
+    "TP2_PIPS": 70.0,
+    "SPREAD_MAX_PIPS": 2.5
   },
   "trading_settings": {
     "ENABLE_AUTO_TRADING": true,
@@ -54,7 +61,42 @@
       "SCALPING_BUY_THRESHOLD": 52,
       "SCALPING_SELL_THRESHOLD": 48
     },
-    "MODE": "live"
+    "MODE": "live",
+    "POINT_SIZE": 0.01,
+    "BROKER_UTC_OFFSET_HOURS": 2,
+    "TIME_MODE": "BROKER",
+    "SESSION_DEFINITIONS": {
+      "ASIA": {
+        "start": "02:00",
+        "end": "10:00",
+        "weight": 0.8,
+        "allow_momentum": false
+      },
+      "LONDON": {
+        "start": "10:00",
+        "end": "19:00",
+        "weight": 1.2,
+        "allow_momentum": true
+      },
+      "NEW_YORK": {
+        "start": "15:00",
+        "end": "22:00",
+        "weight": 1.3,
+        "allow_momentum": true
+      },
+      "OVERLAP": {
+        "start": "15:00",
+        "end": "19:00",
+        "weight": 1.5,
+        "allow_momentum": true
+      },
+      "OTHER": {
+        "start": "22:00",
+        "end": "02:00",
+        "weight": 0.4,
+        "allow_momentum": false
+      }
+    }
   },
   "technical_settings": {
     "ATR_WINDOW": 10,
@@ -371,5 +413,28 @@
     "POSITION_TIMEOUT_MINUTES": 300
   },
   "LOG_LEVEL": "INFO",
-  "DEBUG_LOG_FILE": "debug.log"
+  "DEBUG_LOG_FILE": "debug.log",
+  "flow_settings": {
+    "BRK_MAX_DIST_ATR": 0.5,
+    "BRK_MAX_AGE_BARS": 60,
+    "IFVG_MAX_DIST_ATR": 0.5,
+    "IFVG_MAX_AGE_BARS": 60,
+    "FLOW_MAX_TOUCHES": 2,
+    "FLOW_TOUCH_PENETRATION_ATR": 0.05,
+    "FLOW_TOUCH_PENALTY": 0.55,
+    "FLOW_RETEST_POLICY": "FIRST_TOUCH"
+  },
+  "momentum_settings": {
+    "MOMO_ADX_MIN": 35.0,
+    "MOMO_TIME_START": "10:00",
+    "MOMO_TIME_END": "18:00",
+    "MOMO_SESSION_ONLY": true,
+    "MOMO_SESSION_ALLOWLIST": [
+      "LONDON",
+      "NEW_YORK",
+      "OVERLAP"
+    ],
+    "MOMO_BUFFER_ATR_MULT": 0.1,
+    "MOMO_BUFFER_MIN_PIPS": 1.0
+  }
 }
