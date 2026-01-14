@@ -52,6 +52,7 @@ from src.trading_bot.nds.distance_utils import (
     calculate_distance_metrics,
     resolve_point_size_with_source,
 )
+from src.trading_bot.config_utils import log_active_settings
 from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.trade_tracker import TradeTracker
@@ -103,6 +104,7 @@ class NDSBot:
         self.config = config
         self.analyzer_config = None
         self.analyzer = None  # instance of GoldNDSAnalyzer (preferred)
+        log_active_settings(self.config, logger)
 
         self.price_monitor = RealTimePriceMonitor(config=self.config, bot_state=self.bot_state, logger=logger)
         self.trade_tracker = TradeTracker()

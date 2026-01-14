@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import logging
 from typing import Dict, List
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from src.trading_bot.nds.distance_utils import (
     resolve_point_size_from_config,
 )
 from src.trading_bot.risk_manager import ScalpingRiskManager
+from src.trading_bot.config_utils import log_active_settings
+from config.settings import config
 
 
 def _distance_pips(price_distance: float, point_size: float) -> float:
@@ -87,6 +90,8 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run(csv_path: str, limit: int | None, window: int, step: int, progress: int) -> int:
+    logging.basicConfig(level=logging.INFO)
+    log_active_settings(config, logging.getLogger(__name__))
     t0 = time.time()
 
     df = pd.read_csv(csv_path)
@@ -115,7 +120,7 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
         "FIRST_TOUCH_UNCONFIRMED": 0,
         "NO_CONFIRMED_TOUCH": 0,
     }
-    momentum_rejections: Dict[str, int] = {"time_outside_window": 0}
+    momentum_rejections: Dict[str, int] = {"time_outside_window": 0, "time_parse_failed": 0}
     spread_rejections: Dict[str, int] = {"spread_too_high": 0}
     sl_pips_by_tier: Dict[str, List[float]] = {}
     tp_pips_by_tier: Dict[str, List[float]] = {}
@@ -124,6 +129,7 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
     ifvg_zone_count = 0
 
     risk_manager = ScalpingRiskManager()
+    config_payload = config.get_full_config()
     inferred_point_size = infer_point_size_from_prices(df["close"].tail(window))
     resolved_point_size = resolve_point_size_from_config(risk_manager.settings, default=None)
     print(
@@ -147,7 +153,7 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
             print(f"[SMOKE][{iter_no}/{total_iters}] i={i} close={last_price:.3f} elapsed={elapsed:.1f}s")
 
         window_df = df.iloc[i - window + 1: i + 1]  # view, not copy
-        analyzer = GoldNDSAnalyzer(window_df, config=None)
+        analyzer = GoldNDSAnalyzer(window_df, config=config_payload)
 
         result = analyzer.generate_trading_signal(timeframe="M15", scalping_mode=True)
 
