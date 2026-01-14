@@ -119,7 +119,7 @@ class ScalpingRiskManager:
             self.GOLD_SPECS = {}
 
         # Conservative defaults (should be overridden by broker-specific config)
-        self.GOLD_SPECS.setdefault("point", 0.001)
+        self.GOLD_SPECS.setdefault("point", 0.01)
         self.GOLD_SPECS.setdefault("digits", 2)
         self.GOLD_SPECS.setdefault("contract_size", 100.0)
         self.GOLD_SPECS.setdefault("tick_value_per_lot", 1.0)
@@ -531,14 +531,14 @@ class ScalpingRiskManager:
         point_size = (
             gold_specs.get("point")
             or gold_specs.get("POINT")
-            or self._get_gold_spec("point", 0.001)
+            or self._get_gold_spec("point", 0.01)
         )
         try:
             point_size = float(point_size)
         except Exception:
-            point_size = 0.001
+            point_size = 0.01
         if point_size <= 0:
-            point_size = 0.001
+            point_size = 0.01
         return point_size
 
     def _compute_scalping_sl_tp(
@@ -819,7 +819,7 @@ class ScalpingRiskManager:
         deviation = abs(planned_entry - market_entry)
 
         gold_specs = self._normalize_gold_specs(trading_settings.get('GOLD_SPECIFICATIONS', {}))
-        point_size = gold_specs.get('point') or self._get_gold_spec('point', 0.001)
+        point_size = gold_specs.get('point') or self._get_gold_spec('point', 0.01)
         deviation_metrics = calculate_distance_metrics(
             entry_price=planned_entry,
             current_price=market_entry,
@@ -1124,7 +1124,7 @@ class ScalpingRiskManager:
             errors.append(f"Signal confidence ({confidence}%) below minimum ({min_confidence}%)")
 
         # بررسی فاصله استاپ برای اسکلپینگ (bounds in pips)
-        point_size = self._get_gold_spec('point', 0.001)
+        point_size = self._get_gold_spec('point', 0.01)
         sl_points = price_to_points(sl_distance, point_size)
         sl_pips = points_to_pips(sl_points)
         min_sl_pips = float(s.get('SL_MIN_PIPS', 10.0))
