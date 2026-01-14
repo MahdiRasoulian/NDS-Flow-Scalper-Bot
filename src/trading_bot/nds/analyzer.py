@@ -855,7 +855,7 @@ class GoldNDSAnalyzer:
     def _get_point_size(self) -> float:
         """Return configured point size with default."""
         try:
-            return float(self.GOLD_SETTINGS.get("POINT_SIZE", 0.001))
+            return float(self.GOLD_SETTINGS.get("POINT_SIZE", 0.01))
         except Exception:
             return 0.001
 
@@ -1480,7 +1480,7 @@ class GoldNDSAnalyzer:
         meta = symbol_meta if isinstance(symbol_meta, dict) else {}
         point_size = meta.get("point_size")
         if point_size is None:
-            point_size = self.GOLD_SETTINGS.get("POINT_SIZE", 0.001)
+            point_size = self.GOLD_SETTINGS.get("POINT_SIZE", 0.01)
         atr_source = atr_value
         if atr_source is None and meta:
             atr_source = meta.get("atr")
@@ -2959,7 +2959,7 @@ class GoldNDSAnalyzer:
             entry_metrics = self._calc_entry_distance_metrics(
                 entry_price=entry,
                 current_price=current_price,
-                symbol_meta={"point_size": self.GOLD_SETTINGS.get("POINT_SIZE", 0.001)},
+                symbol_meta={"point_size": self.GOLD_SETTINGS.get("POINT_SIZE", 0.01)},
                 atr_value=atr_value,
             )
             idea["entry_distance_pips"] = entry_metrics.get("dist_pips")
