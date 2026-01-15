@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import logging
+import sys
+import time
+import traceback
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -13,6 +18,54 @@ from .io import load_config, load_ohlcv, apply_overrides, slice_ohlcv
 from .metrics import summarize_cycle_log
 from .objectives import get_objective_config, objective_from_payload, score_objective
 from .plots import plot_drawdown, plot_equity_curve, plot_signal_diagnostics, plot_trade_pnl_hist
+
+
+# -----------------------------
+# Logging helpers
+# -----------------------------
+def _setup_logging(out_dir: Path, level: str = "INFO") -> logging.Logger:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "optimize.log"
+
+    logger = logging.getLogger("backtest.optimize")
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.propagate = False  # avoid double logs if root configured elsewhere
+
+    # Clear existing handlers (important if rerun in same process)
+    if logger.handlers:
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(getattr(logging, level.upper(), logging.INFO))
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    # File handler
+    fh = logging.FileHandler(str(log_path), encoding="utf-8")
+    fh.setLevel(getattr(logging, level.upper(), logging.INFO))
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    logger.info("✅ Logging initialized | level=%s | file=%s", level.upper(), str(log_path))
+    return logger
+
+
+def _fmt_sec(seconds: float) -> str:
+    if seconds < 0:
+        return "N/A"
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    ss = s % 60
+    if h > 0:
+        return f"{h}h {m}m {ss}s"
+    if m > 0:
+        return f"{m}m {ss}s"
+    return f"{ss}s"
 
 
 def _nested_override(path: str, value: Any) -> Dict[str, Any]:
@@ -84,69 +137,188 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=None)
     ap.add_argument("--days", type=int, default=None)
     ap.add_argument("--objective", type=str, default="net_pnl")
+    ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG/INFO/WARNING/ERROR")
     args = ap.parse_args()
 
-    df = load_ohlcv(args.data)
-    df = slice_ohlcv(df, rows=args.rows, days=args.days)
+    out_dir = Path(args.out)
+    logger = _setup_logging(out_dir, level=args.log_level)
 
+    t0 = time.perf_counter()
+    logger.info("==================================================")
+    logger.info("🚀 Backtest Optimization Started")
+    logger.info("data=%s", args.data)
+    logger.info("config=%s", args.config)
+    logger.info("grid=%s", args.grid)
+    logger.info("out=%s", str(out_dir))
+    logger.info("warmup=%s spread=%s slippage=%s rows=%s days=%s objective=%s",
+                args.warmup, args.spread, args.slippage, args.rows, args.days, args.objective)
+    logger.info("==================================================")
+
+    # Load data
+    logger.info("📥 Loading OHLCV: %s", args.data)
+    df = load_ohlcv(args.data)
+    logger.info("✅ OHLCV loaded | rows=%d | cols=%s", len(df), list(df.columns))
+
+    # Slice
+    logger.info("✂️ Slicing OHLCV | rows=%s days=%s", args.rows, args.days)
+    df = slice_ohlcv(df, rows=args.rows, days=args.days)
+    logger.info("✅ Slice complete | rows=%d | from=%s | to=%s",
+                len(df), str(df["time"].iloc[0]), str(df["time"].iloc[-1]))
+
+    # Load configs
+    logger.info("📦 Loading config: %s", args.config)
     config = load_config(args.config)
+    logger.info("✅ Config loaded | top_keys=%s", list(config.keys()))
+
+    logger.info("📦 Loading grid: %s", args.grid)
     grid_payload = json.loads(Path(args.grid).read_text(encoding="utf-8"))
     grid = grid_payload.get("grid", {})
     objective_payload = grid_payload.get("objective")
     failsafe = grid_payload.get("failsafe", {})
+    logger.info("✅ Grid loaded | grid_keys=%s | failsafe_keys=%s",
+                list(grid.keys()) if isinstance(grid, dict) else type(grid),
+                list(failsafe.keys()) if isinstance(failsafe, dict) else type(failsafe))
 
+    # Objective
     if objective_payload:
         objective = objective_from_payload(objective_payload)
+        logger.info("🎯 Objective: from grid payload")
     else:
         objective = get_objective_config(args.objective)
+        logger.info("🎯 Objective: %s", args.objective)
 
+    try:
+        logger.info("🎯 Objective config: %s", objective)
+    except Exception:
+        pass
+
+    # Build combos
+    logger.info("🧮 Building grid combinations ...")
     combinations = _grid_combinations(grid)
+    total = len(combinations)
+    logger.info("✅ Combinations generated: %d", total)
+
     results: List[Dict[str, Any]] = []
+    combo_times: List[float] = []
 
+    # Run grid
     for idx, override in enumerate(combinations, start=1):
-        merged_config = apply_overrides(config, [override])
-        bt_config = BacktestConfig.from_bot_config(
-            merged_config,
-            warmup=args.warmup,
-            spread=args.spread,
-            slippage=args.slippage,
-        )
-        engine = BacktestEngine(config=merged_config, bt_config=bt_config, overrides=override)
-        result = engine.run(df)
-        diagnostics = summarize_cycle_log(result.cycle_log)
-        score = score_objective(result.metrics, diagnostics, objective)
-        passed, reason = _passes_failsafe(result.metrics, diagnostics, failsafe)
+        combo_t0 = time.perf_counter()
         flat = _flatten_grid(override)
-        results.append(
-            {
-                "grid_id": idx,
-                **flat,
-                "score": score if passed else float("-inf"),
-                "passed": passed,
-                "failsafe_reason": reason,
-                "net_pnl": result.metrics.get("net_pnl"),
-                "profit_factor": result.metrics.get("profit_factor"),
-                "max_drawdown_pct": result.metrics.get("max_drawdown_pct"),
-                "trades": result.metrics.get("total_trades"),
-                "ab_ratio": diagnostics.tier_ratios.get("A+B", 0.0),
-            }
-        )
 
-    out_dir = Path(args.out)
+        logger.info("--------------------------------------------------")
+        logger.info("🔁 Running combo %d/%d | overrides=%s", idx, total, flat)
+
+        try:
+            merged_config = apply_overrides(config, [override])
+
+            bt_config = BacktestConfig.from_bot_config(
+                merged_config,
+                warmup=args.warmup,
+                spread=args.spread,
+                slippage=args.slippage,
+            )
+
+            # In case BacktestConfig is a dataclass
+            try:
+                logger.debug("BacktestConfig: %s", asdict(bt_config))  # type: ignore[arg-type]
+            except Exception:
+                logger.debug("BacktestConfig: %s", bt_config)
+
+            engine = BacktestEngine(config=merged_config, bt_config=bt_config, overrides=override)
+
+            logger.info("▶️ engine.run started | df_rows=%d", len(df))
+            result = engine.run(df)
+            logger.info("✅ engine.run finished")
+
+            diagnostics = summarize_cycle_log(result.cycle_log)
+            score = score_objective(result.metrics, diagnostics, objective)
+            passed, reason = _passes_failsafe(result.metrics, diagnostics, failsafe)
+
+            net_pnl = result.metrics.get("net_pnl")
+            pf = result.metrics.get("profit_factor")
+            mdd = result.metrics.get("max_drawdown_pct")
+            trades = result.metrics.get("total_trades")
+            ab_ratio = diagnostics.tier_ratios.get("A+B", 0.0)
+
+            logger.info(
+                "📊 Combo metrics | passed=%s reason=%s score=%s net_pnl=%s pf=%s mdd=%s trades=%s ab_ratio=%s",
+                passed, reason, score if passed else float("-inf"),
+                net_pnl, pf, mdd, trades, ab_ratio
+            )
+
+            results.append(
+                {
+                    "grid_id": idx,
+                    **flat,
+                    "score": score if passed else float("-inf"),
+                    "passed": passed,
+                    "failsafe_reason": reason,
+                    "net_pnl": net_pnl,
+                    "profit_factor": pf,
+                    "max_drawdown_pct": mdd,
+                    "trades": trades,
+                    "ab_ratio": ab_ratio,
+                }
+            )
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.error("❌ Combo %d failed: %s", idx, str(e))
+            logger.error("Traceback:\n%s", tb)
+
+            # Still record a row so optimization continues
+            results.append(
+                {
+                    "grid_id": idx,
+                    **flat,
+                    "score": float("-inf"),
+                    "passed": False,
+                    "failsafe_reason": f"EXCEPTION: {type(e).__name__}",
+                    "net_pnl": None,
+                    "profit_factor": None,
+                    "max_drawdown_pct": None,
+                    "trades": None,
+                    "ab_ratio": None,
+                }
+            )
+
+        combo_dt = time.perf_counter() - combo_t0
+        combo_times.append(combo_dt)
+        avg = sum(combo_times) / len(combo_times)
+        remaining = (total - idx) * avg
+        logger.info("⏱️ Combo time=%s | avg=%s | ETA=%s",
+                    _fmt_sec(combo_dt), _fmt_sec(avg), _fmt_sec(remaining))
+
+    # Save overall results
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    results_df = pd.DataFrame(results).sort_values("score", ascending=False)
-    results_df.to_csv(out_dir / "grid_results.csv", index=False, encoding="utf-8-sig")
+    results_df = pd.DataFrame(results)
+    if not results_df.empty:
+        results_df = results_df.sort_values("score", ascending=False)
 
-    best_row = results_df[results_df["passed"]].head(1)
+    results_path = out_dir / "grid_results.csv"
+    results_df.to_csv(results_path, index=False, encoding="utf-8-sig")
+    logger.info("💾 Saved: %s (rows=%d)", str(results_path), len(results_df))
+
+    # Find best passed
+    best_row = results_df[results_df["passed"] == True].head(1)  # noqa: E712
     if best_row.empty:
+        logger.warning("⚠️ No configuration passed failsafe filters.")
         print("No configuration passed failsafe filters.")
+        logger.info("Total elapsed: %s", _fmt_sec(time.perf_counter() - t0))
         return
 
-    best_index = int(best_row["grid_id"].iloc[0]) - 1
+    best_grid_id = int(best_row["grid_id"].iloc[0])
+    best_index = best_grid_id - 1
     best_override = combinations[best_index]
-    (out_dir / "best_overrides.json").write_text(json.dumps(best_override, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    overrides_path = out_dir / "best_overrides.json"
+    overrides_path.write_text(json.dumps(best_override, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("🏆 Best grid_id=%d saved overrides: %s", best_grid_id, str(overrides_path))
+
+    # Run best again (full artifacts)
+    logger.info("🔁 Re-running best configuration to export artifacts ...")
     best_config = apply_overrides(config, [best_override])
     best_bt_config = BacktestConfig.from_bot_config(
         best_config,
@@ -156,21 +328,63 @@ def main() -> None:
     )
 
     best_engine = BacktestEngine(config=best_config, bt_config=best_bt_config, overrides=best_override)
+    logger.info("▶️ best_engine.run started | df_rows=%d", len(df))
     best_result = best_engine.run(df)
+    logger.info("✅ best_engine.run finished")
 
-    (out_dir / "best_metrics.json").write_text(json.dumps(best_result.metrics, indent=2, ensure_ascii=False), encoding="utf-8")
-    best_result.trades.to_csv(out_dir / "best_trades.csv", index=False, encoding="utf-8-sig")
-    best_result.equity_curve.to_csv(out_dir / "best_equity_curve.csv", encoding="utf-8-sig")
+    metrics_path = out_dir / "best_metrics.json"
+    metrics_path.write_text(json.dumps(best_result.metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("💾 Saved: %s", str(metrics_path))
+
+    trades_path = out_dir / "best_trades.csv"
+    best_result.trades.to_csv(trades_path, index=False, encoding="utf-8-sig")
+    logger.info("💾 Saved: %s (rows=%d)", str(trades_path), len(best_result.trades))
+
+    eq_path = out_dir / "best_equity_curve.csv"
+    best_result.equity_curve.to_csv(eq_path, encoding="utf-8-sig")
+    logger.info("💾 Saved: %s (rows=%d)", str(eq_path), len(best_result.equity_curve))
+
     if not best_result.cycle_log.empty:
-        best_result.cycle_log.to_csv(out_dir / "best_cycle_log.csv", encoding="utf-8-sig")
+        cycle_path = out_dir / "best_cycle_log.csv"
+        best_result.cycle_log.to_csv(cycle_path, encoding="utf-8-sig")
+        logger.info("💾 Saved: %s (rows=%d)", str(cycle_path), len(best_result.cycle_log))
+    else:
+        logger.info("ℹ️ best_result.cycle_log is empty; skipped saving best_cycle_log.csv")
 
-    plot_equity_curve(best_result.equity_curve, out_path=str(out_dir / "best_equity_curve.png"))
-    plot_drawdown(best_result.equity_curve, out_path=str(out_dir / "best_drawdown.png"))
+    # Plots
+    logger.info("🖼️ Generating plots ...")
+    try:
+        plot_equity_curve(best_result.equity_curve, out_path=str(out_dir / "best_equity_curve.png"))
+        logger.info("✅ Plot saved: best_equity_curve.png")
+    except Exception as e:
+        logger.error("Plot equity_curve failed: %s", e)
+
+    try:
+        plot_drawdown(best_result.equity_curve, out_path=str(out_dir / "best_drawdown.png"))
+        logger.info("✅ Plot saved: best_drawdown.png")
+    except Exception as e:
+        logger.error("Plot drawdown failed: %s", e)
+
     if not best_result.trades.empty:
-        plot_trade_pnl_hist(best_result.trades, out_path=str(out_dir / "best_pnl_hist.png"))
-    if not best_result.cycle_log.empty:
-        plot_signal_diagnostics(best_result.cycle_log, out_path=str(out_dir / "best_score_conf.png"))
+        try:
+            plot_trade_pnl_hist(best_result.trades, out_path=str(out_dir / "best_pnl_hist.png"))
+            logger.info("✅ Plot saved: best_pnl_hist.png")
+        except Exception as e:
+            logger.error("Plot pnl_hist failed: %s", e)
+    else:
+        logger.info("ℹ️ No trades; skipped best_pnl_hist.png")
 
+    if not best_result.cycle_log.empty:
+        try:
+            plot_signal_diagnostics(best_result.cycle_log, out_path=str(out_dir / "best_score_conf.png"))
+            logger.info("✅ Plot saved: best_score_conf.png")
+        except Exception as e:
+            logger.error("Plot signal_diagnostics failed: %s", e)
+    else:
+        logger.info("ℹ️ No cycle_log; skipped best_score_conf.png")
+
+    total_dt = time.perf_counter() - t0
+    logger.info("✅ Optimization complete | elapsed=%s", _fmt_sec(total_dt))
     print("Optimization complete.")
 
 
