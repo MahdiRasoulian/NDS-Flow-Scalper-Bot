@@ -213,13 +213,13 @@ class ScalpingRiskManager:
         # لاگ مشخصات Gold Specs برای عیب‌یابی
         self._logger.info(
             "🧩 GOLD_SPECS: point=%s digits=%s min_lot=%s max_lot=%s lot_step=%s contract_size=%s tick_value_per_lot=%s",
-            self._get_gold_spec("point"),
-            self._get_gold_spec("digits"),
-            self._get_gold_spec("min_lot"),
-            self._get_gold_spec("max_lot"),
-            self._get_gold_spec("lot_step"),
-            self._get_gold_spec("contract_size"),
-            self._get_gold_spec("tick_value_per_lot"),
+            self._get_gold_spec("POINT"),
+            self._get_gold_spec("DIGITS"),
+            self._get_gold_spec("MIN_LOT"),
+            self._get_gold_spec("MAX_LOT"),
+            self._get_gold_spec("LOT_STEP"),
+            self._get_gold_spec("CONTRACT_SIZE"),
+            self._get_gold_spec("TICK_VALUE_PER_LOT"),
         )
 
     def _merge_with_config(self, config: Dict, merged_config: Dict) -> Dict:
@@ -460,7 +460,7 @@ class ScalpingRiskManager:
         lot_size = self._calculate_scalping_lot_size(entry_price, stop_loss, risk_amount, sl_distance)
 
         # 11. محاسبات مالی
-        contract_size = float(self._get_gold_spec('contract_size', 100.0))
+        contract_size = float(self._get_gold_spec('CONTRACT_SIZE', 100.0))
         position_value = lot_size * contract_size * entry_price
         margin_required = self._calculate_scalping_margin(lot_size, entry_price)
         actual_risk = self._calculate_actual_scalping_risk(lot_size, entry_price, stop_loss)
@@ -1093,16 +1093,9 @@ class ScalpingRiskManager:
         # ===============================
         # ✅ FIX: support both upper/lower keys for MIN/MAX lot
         # ===============================
-        min_lot = (
-            gold_specs.get('min_lot')
-            or gold_specs.get('MIN_LOT')
-            or self._get_gold_spec('min_lot', 0.01)
-        )
-        max_lot_spec = (
-            gold_specs.get('max_lot')
-            or gold_specs.get('MAX_LOT')
-            or self._get_gold_spec('max_lot', 50.0)
-        )
+        min_lot = self._get_gold_spec('MIN_LOT', 0.01)
+        max_lot_spec = self._get_gold_spec('MAX_LOT', 50.0)
+        lot_step = self._get_gold_spec('LOT_STEP', 0.01)
 
         max_lot_limit = risk_manager_config.get('MAX_LOT_SIZE')
         lot_size = risk_params.lot_size
@@ -1296,10 +1289,10 @@ class ScalpingRiskManager:
     def _calculate_scalping_lot_size(self, entry_price: float, stop_loss: float,
                                     risk_amount: float, sl_distance: float) -> float:
         """محاسبه حجم اسکلپینگ با دقت بالا (SAFE SPECS)"""
-        tick_value_per_lot = float(self._get_gold_spec('tick_value_per_lot', 1.0))
-        min_lot = float(self._get_gold_spec('min_lot', 0.01))
-        max_lot_spec = float(self._get_gold_spec('max_lot', 50.0))
-        lot_step = float(self._get_gold_spec('lot_step', 0.01))
+        tick_value_per_lot = float(self._get_gold_spec('TICK_VALUE_PER_LOT', 1.0))
+        min_lot = float(self._get_gold_spec('MIN_LOT', 0.01))
+        max_lot_spec = float(self._get_gold_spec('MAX_LOT', 50.0))
+        lot_step = float(self._get_gold_spec('LOT_STEP', 0.01))
 
         risk_per_standard_lot = sl_distance * tick_value_per_lot
 
@@ -1326,7 +1319,7 @@ class ScalpingRiskManager:
 
     def _calculate_scalping_margin(self, lot_size: float, entry_price: float) -> float:
         """محاسبه مارجین برای اسکلپینگ (SAFE SPECS)"""
-        contract_size = float(self._get_gold_spec('contract_size', 100.0))
+        contract_size = float(self._get_gold_spec('CONTRACT_SIZE', 100.0))
         contract_value = float(lot_size) * contract_size * float(entry_price)
         leverage = self.settings.get('MAX_LEVERAGE', 50)
         margin = contract_value / leverage if leverage else contract_value
@@ -1336,7 +1329,7 @@ class ScalpingRiskManager:
                                         stop_loss: float) -> float:
         """محاسبه ریسک واقعی اسکلپینگ"""
         sl_distance = abs(entry_price - stop_loss)
-        tick_value_per_lot = float(self._get_gold_spec('tick_value_per_lot', 1.0))
+        tick_value_per_lot = float(self._get_gold_spec('TICK_VALUE_PER_LOT', 1.0))
         risk_per_tick = lot_size * tick_value_per_lot
         return sl_distance * risk_per_tick
 
