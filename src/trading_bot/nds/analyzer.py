@@ -34,7 +34,7 @@ from .constants import (
 )
 from .models import (
     AnalysisResult, SessionAnalysis,
-    OrderBlock, FVG, MarketStructure, MarketTrend
+    OrderBlock, FVG, FVGType, MarketStructure, MarketTrend
 )
 from .indicators import IndicatorCalculator
 from .smc import SMCAnalyzer
@@ -798,6 +798,18 @@ class GoldNDSAnalyzer:
             result_payload["signal"] = signal
             result_payload["entry_reason"] = entry_reason
 
+            if signal in {"BUY", "SELL"} and entry_price is not None:
+                tp1_target = self._resolve_opposing_structure_target(
+                    signal=signal,
+                    entry_price=float(entry_price),
+                    fvgs=fvgs,
+                    order_blocks=order_blocks,
+                )
+                entry_context = dict(entry_context)
+                entry_context["tp1_target_price"] = tp1_target.get("price")
+                entry_context["tp1_target_source"] = tp1_target.get("source")
+                entry_context["tp1_target_reason"] = tp1_target.get("reason")
+
             entry_signal_context = {
                 "signal": signal,
                 "entry_price": entry_price,
@@ -862,6 +874,55 @@ class GoldNDSAnalyzer:
         recent_low = float(self.df['low'].tail(lookback_bars).min())
         recent_range = recent_high - recent_low
         return (current_price - recent_low) / recent_range if recent_range > 0 else 0.5
+
+    def _resolve_opposing_structure_target(
+        self,
+        signal: str,
+        entry_price: float,
+        fvgs: List[FVG],
+        order_blocks: List[OrderBlock],
+    ) -> Dict[str, Any]:
+        """Find nearest opposing structure level for dynamic TP1 planning."""
+        if signal not in {"BUY", "SELL"}:
+            return {"price": None, "source": None, "reason": "no_signal"}
+        if entry_price is None:
+            return {"price": None, "source": None, "reason": "no_entry"}
+
+        candidates: List[Tuple[float, str]] = []
+
+        for fvg in fvgs:
+            if getattr(fvg, "filled", False) or getattr(fvg, "stale", False):
+                continue
+            if signal == "BUY" and fvg.type == FVGType.BEARISH:
+                target = float(fvg.bottom)
+                if target > entry_price:
+                    candidates.append((target, "BEARISH_FVG"))
+            elif signal == "SELL" and fvg.type == FVGType.BULLISH:
+                target = float(fvg.top)
+                if target < entry_price:
+                    candidates.append((target, "BULLISH_FVG"))
+
+        for ob in order_blocks:
+            if getattr(ob, "stale", False):
+                continue
+            if signal == "BUY" and ob.type == "BEARISH_OB":
+                target = float(ob.low)
+                if target > entry_price:
+                    candidates.append((target, "BEARISH_OB"))
+            elif signal == "SELL" and ob.type == "BULLISH_OB":
+                target = float(ob.high)
+                if target < entry_price:
+                    candidates.append((target, "BULLISH_OB"))
+
+        if not candidates:
+            return {"price": None, "source": None, "reason": "no_opposing_structure"}
+
+        if signal == "BUY":
+            target_price, source = min(candidates, key=lambda c: c[0])
+        else:
+            target_price, source = max(candidates, key=lambda c: c[0])
+
+        return {"price": float(target_price), "source": source, "reason": "nearest_opposing_structure"}
 
     def _normalize_structure_score(self, raw_score: Optional[float]) -> float:
         """نرمال‌سازی structure_score به بازه 0..100"""
@@ -2762,6 +2823,33 @@ class GoldNDSAnalyzer:
 
         if original_signal != 'NONE':
             settings = self.GOLD_SETTINGS
+
+            cooldown_start = str(settings.get("FLOW_NY_OPEN_COOLDOWN_START", "15:00"))
+            cooldown_end = str(settings.get("FLOW_NY_OPEN_COOLDOWN_END", "15:15"))
+            last_time = self.df["time"].iloc[-1] if "time" in self.df.columns else None
+            if last_time is not None:
+                in_cooldown, time_error = self._is_time_in_window(last_time, cooldown_start, cooldown_end)
+                if time_error:
+                    self._log_debug("[NDS][FILTER] cooldown time parse failed: %s", time_error)
+                elif in_cooldown:
+                    analysis_result['signal'] = 'NONE'
+                    self._append_reason(
+                        reasons,
+                        f"Cooling-off window active ({cooldown_start}-{cooldown_end} broker time)"
+                    )
+
+            if analysis_result.get('signal') in {'BUY', 'SELL'}:
+                atr_spike_mult = float(settings.get("FLOW_ATR_SPIKE_MULT", 3.0))
+                market_metrics = analysis_result.get('market_metrics', {})
+                atr_value = float(market_metrics.get("atr", 0.0) or 0.0)
+                if atr_value > 0 and "high" in self.df.columns and "low" in self.df.columns:
+                    last_range = float(self.df["high"].iloc[-1]) - float(self.df["low"].iloc[-1])
+                    if last_range > (atr_spike_mult * atr_value):
+                        analysis_result['signal'] = 'NONE'
+                        self._append_reason(
+                            reasons,
+                            f"ATR spike filter ({last_range:.2f} > {atr_spike_mult:.2f}x ATR)"
+                        )
 
             if scalping_mode:
                 base_min_rvol = settings.get('MIN_RVOL_SCALPING', 0.75)
