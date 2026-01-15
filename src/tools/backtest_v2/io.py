@@ -77,10 +77,75 @@ def _coerce_time_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _list_data_files(folder: Path) -> str:
+    if not folder.exists() or not folder.is_dir():
+        return "-"
+    items = []
+    for ext in ("*.csv", "*.xlsx", "*.xls"):
+        items.extend(sorted(folder.glob(ext)))
+    return ", ".join([p.name for p in items]) if items else "-"
+
+
+def _resolve_data_path(path: str) -> Path:
+    # 1) پاکسازی کوتیشن‌های احتمالی
+    raw = (path or "").strip().strip('"').strip("'")
+    p = Path(raw)
+
+    if p.exists():
+        return p
+
+    # 2) تلاش برای resolve مسیرهای relative
+    try:
+        rp = p.resolve()
+        if rp.exists():
+            return rp
+    except Exception:
+        pass
+
+    # 3) اگر فایل نبود، چند الگوی رایج نام‌گذاری را امتحان کن
+    parent = p.parent if p.parent else Path.cwd()
+    name = p.name
+
+    candidates = [p]
+
+    # ! <-> _
+    if "!" in name:
+        candidates.append(parent / name.replace("!", "_"))
+        candidates.append(parent / name.replace("!", ""))
+    else:
+        # اگر ! در اسم نیست، احتمال دارد فایل واقعی با ! باشد
+        candidates.append(parent / name.replace("_", "!_") if "_15_" in name else parent / f"!{name}")
+
+    # همچنین اگر XAUUSD_... بوده، احتمال XAUUSD!_...
+    if "XAUUSD_" in name and "!" not in name:
+        candidates.append(parent / name.replace("XAUUSD_", "XAUUSD!_"))
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    # 4) در نهایت، اگر در همان فولدر فایلی با همین stem پیدا شد، انتخاب کن
+    if parent.exists():
+        stem = p.stem
+        near = list(parent.glob(stem + ".*"))
+        for n in near:
+            if n.suffix.lower() in {".csv", ".xlsx", ".xls"} and n.exists():
+                return n
+
+    return p  # همان ورودی (برای خطای دقیق‌تر)
+
+
 def load_ohlcv(path: str, dayfirst: bool = False) -> pd.DataFrame:
-    source = Path(path)
+    source = _resolve_data_path(path)
     if not source.exists():
-        raise FileNotFoundError(f"Data file not found: {path}")
+        folder = Path(path.strip().strip('"').strip("'")).parent
+        available = _list_data_files(folder)
+        raise FileNotFoundError(
+            f"Data file not found: {path}\n"
+            f"Resolved tried: {str(source)}\n"
+            f"Folder: {folder}\n"
+            f"Available data files: {available}"
+        )
 
     if source.suffix.lower() in {".xlsx", ".xls"}:
         df = pd.read_excel(source)
