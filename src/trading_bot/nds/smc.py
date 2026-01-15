@@ -279,18 +279,30 @@ class SMCAnalyzer:
     ) -> int:
         touches = 0
         status = "OUTSIDE"
+        last_touch_idx: Optional[int] = None
+        outside_count = 0
         exit_threshold = self._touch_exit_threshold_price(atr_value)
+        min_separation = int(self.settings.get("FLOW_TOUCH_MIN_SEPARATION_BARS", 6))
+        exit_confirm_bars = 2
         for j in range(start_idx, len(df)):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
             close = float(df["close"].iloc[j])
             touched = self._is_zone_touch(high, low, close, top, bottom, atr_value)
             if status == "OUTSIDE" and touched:
-                touches += 1
+                if last_touch_idx is None or (j - last_touch_idx) >= min_separation:
+                    touches += 1
+                    last_touch_idx = j
                 status = "INSIDE"
+                outside_count = 0
             elif status == "INSIDE":
-                if self._distance_from_zone(close, top, bottom) > exit_threshold:
-                    status = "OUTSIDE"
+                if touched:
+                    outside_count = 0
+                elif self._distance_from_zone(close, top, bottom) > exit_threshold:
+                    outside_count += 1
+                    if outside_count >= exit_confirm_bars:
+                        status = "OUTSIDE"
+                        outside_count = 0
         return touches
 
     def _touch_exit_threshold_price(self, atr_value: float) -> float:
@@ -319,26 +331,46 @@ class SMCAnalyzer:
         atr_value: float,
         retest_policy: str,
         zone_id: Optional[str] = None,
+        zone_meta: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[int], Optional[int], int, bool, str]:
         _ = self._resolve_touch_mode("_scan_zone_touches")
         touch_indices: List[int] = []
         confirmed_hits: List[Tuple[int, str, int]] = []
         first_touch_idx = None
+        last_touch_idx: Optional[int] = None
+        enter_idx: Optional[int] = None
+        exit_idx: Optional[int] = None
+        merged_clusters = 0
         max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
         status = "OUTSIDE"
         current_touch_idx: Optional[int] = None
         exit_threshold = self._touch_exit_threshold_price(atr_value)
+        min_separation = int(self.settings.get("FLOW_TOUCH_MIN_SEPARATION_BARS", 6))
+        exit_confirm_bars = 2
+        outside_count = 0
+        consume_on_first = bool(self.settings.get("FLOW_CONSUME_ON_FIRST_VALID_TOUCH", True))
+        penetration_threshold = self._zone_penetration(atr_value)
+        stop_scanning = False
 
         for j in range(start_idx, len(df)):
+            if stop_scanning:
+                break
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
             close = float(df["close"].iloc[j])
             touched = self._is_zone_touch(high, low, close, top, bottom, atr_value)
             if status == "OUTSIDE" and touched:
                 status = "INSIDE"
-                current_touch_idx = j
-                touch_indices.append(j)
-                first_touch_idx = first_touch_idx or j
+                enter_idx = j
+                if last_touch_idx is None or (j - last_touch_idx) >= min_separation:
+                    current_touch_idx = j
+                    touch_indices.append(j)
+                    first_touch_idx = first_touch_idx or j
+                    last_touch_idx = j
+                else:
+                    merged_clusters += 1
+                    current_touch_idx = last_touch_idx
+                outside_count = 0
                 if zone_id:
                     candle_time = None
                     if "time" in df.columns:
@@ -352,7 +384,7 @@ class SMCAnalyzer:
                     )
             if touched and status == "INSIDE":
                 if current_touch_idx is None:
-                    current_touch_idx = j
+                    current_touch_idx = last_touch_idx or j
                 confirmed, reason = self._confirm_retest(
                     df=df,
                     retest_idx=j,
@@ -363,9 +395,19 @@ class SMCAnalyzer:
                 )
                 if confirmed and current_touch_idx is not None:
                     confirmed_hits.append((j, reason, current_touch_idx))
-            if status == "INSIDE" and self._distance_from_zone(close, top, bottom) > exit_threshold:
-                status = "OUTSIDE"
-                current_touch_idx = None
+                    if consume_on_first and str(retest_policy or "").upper() == "FIRST_TOUCH":
+                        stop_scanning = True
+                outside_count = 0
+            if status == "INSIDE" and not touched:
+                if self._distance_from_zone(close, top, bottom) > exit_threshold:
+                    outside_count += 1
+                    if outside_count >= exit_confirm_bars:
+                        status = "OUTSIDE"
+                        current_touch_idx = None
+                        exit_idx = j
+                        outside_count = 0
+                else:
+                    outside_count = 0
 
         touch_count = len(touch_indices)
         retest_idx = None
@@ -387,6 +429,9 @@ class SMCAnalyzer:
             if confirmed_first:
                 retest_idx, retest_reason = confirmed_first
                 eligible = True
+                if consume_on_first:
+                    retest_reason = "CONSUMED_AFTER_FIRST_TOUCH"
+                    eligible = False
             else:
                 retest_reason = "FIRST_TOUCH_UNCONFIRMED"
         else:
@@ -403,6 +448,43 @@ class SMCAnalyzer:
             retest_reason = "TOO_MANY_TOUCHES"
             if retest_idx is None:
                 retest_idx = touch_indices[-1]
+
+        if touch_count >= 3 or retest_reason not in {"", "NO_TOUCH"} or not eligible:
+            origin_idx = zone_meta.get("origin_idx") if zone_meta else None
+            break_idx = zone_meta.get("break_idx") if zone_meta else None
+            origin_time = zone_meta.get("origin_time") if zone_meta else None
+            break_time = zone_meta.get("break_time") if zone_meta else None
+            current_price = None
+            if df is not None and len(df) > 0:
+                try:
+                    current_price = float(df["close"].iloc[-1])
+                except Exception:
+                    current_price = None
+            self._log_info(
+                "[NDS][FLOW][TOUCH_SCAN] zone_id=%s type=%s origin_idx=%s origin_time=%s break_idx=%s break_time=%s "
+                "top=%.5f bottom=%.5f current_price=%s touches=%s last_touch_idx=%s enter_idx=%s exit_idx=%s "
+                "exit_threshold=%.5f penetration_threshold=%.5f touch_min_sep=%s merged_clusters=%s eligible=%s "
+                "retest_reason=%s",
+                zone_id,
+                zone_type,
+                origin_idx,
+                origin_time,
+                break_idx,
+                break_time,
+                float(top),
+                float(bottom),
+                current_price,
+                touch_count,
+                last_touch_idx,
+                enter_idx,
+                exit_idx,
+                float(exit_threshold),
+                float(penetration_threshold),
+                min_separation,
+                merged_clusters,
+                eligible,
+                retest_reason,
+            )
 
         return first_touch_idx, retest_idx, touch_count, eligible, retest_reason
 
@@ -476,11 +558,35 @@ class SMCAnalyzer:
         require_sweep = bool(self.settings.get("BRK_REQUIRE_SWEEP", True))
         min_body_ratio = float(self.settings.get("BRK_DISPLACEMENT_MIN_BODY_RATIO", 0.55))
         time_to_index = {}
+        time_series = None
         if "time" in df.columns:
             try:
                 time_to_index = {t: idx for idx, t in zip(df.index, df["time"])}
+                time_series = pd.to_datetime(df["time"])
             except Exception:
                 time_to_index = {}
+                time_series = None
+
+        def _resolve_sweep_index(sweep_time: Any) -> Optional[int]:
+            if sweep_time is None:
+                return None
+            if sweep_time in time_to_index:
+                try:
+                    return int(time_to_index[sweep_time])
+                except Exception:
+                    return None
+            if time_series is None:
+                return None
+            try:
+                sweep_ts = pd.to_datetime(sweep_time)
+                pos = time_series.searchsorted(sweep_ts)
+                if pos < len(time_series) and time_series.iloc[pos] == sweep_ts:
+                    return int(df.index[pos])
+                if pos > 0:
+                    return int(df.index[pos - 1])
+            except Exception:
+                return None
+            return None
 
         def _has_recent_sweep(ob_idx: int, ob_type: str) -> bool:
             if not require_sweep:
@@ -489,16 +595,21 @@ class SMCAnalyzer:
             for sweep in sweeps:
                 if sweep.type != desired:
                     continue
-                sweep_idx = time_to_index.get(sweep.time)
+                sweep_idx = _resolve_sweep_index(sweep.time)
                 if sweep_idx is None:
-                    continue
-                try:
-                    sweep_idx = int(sweep_idx)
-                except Exception:
                     continue
                 if sweep_idx < ob_idx and (ob_idx - sweep_idx) <= sweep_lookback:
                     return True
             return False
+        sweep_not_found = 0
+        mitigation_missing = 0
+        break_not_found = 0
+        displacement_low = 0
+        after_sweep = 0
+        after_displacement = 0
+        age_dist_reject = 0
+        after_age_dist = 0
+        candidates_before_filters = 0
         for i in range(start_idx, len(df) - 2):
             candle_a = df.iloc[i]
             candle_b = df.iloc[i + 1]
@@ -524,12 +635,15 @@ class SMCAnalyzer:
                     {"type": "BULLISH_OB", "high": a_high, "low": a_low, "index": i}
                 )
 
+        candidates_before_filters = len(raw_obs)
         for ob in raw_obs:
             ob_high = float(ob["high"])
             ob_low = float(ob["low"])
             ob_idx = int(ob["index"])
             if not _has_recent_sweep(ob_idx, ob["type"]):
+                sweep_not_found += 1
                 continue
+            after_sweep += 1
 
             mitigation_idx = None
             break_idx = None
@@ -549,12 +663,16 @@ class SMCAnalyzer:
                     break
 
             if mitigation_idx is None:
+                mitigation_missing += 1
                 continue
 
+            break_found = False
+            displacement_flagged = False
             for j in range(mitigation_idx + 1, len(df)):
                 candle = df.iloc[j]
                 close = float(candle["close"])
                 if ob["type"] == "BEARISH_OB" and close > ob_high:
+                    break_found = True
                     disp_meta = self._displacement_score(
                         candle,
                         atr_value,
@@ -563,7 +681,11 @@ class SMCAnalyzer:
                     if disp_meta["ok"] and disp_meta.get("body_ratio", 0.0) >= min_body_ratio:
                         break_idx = j
                         break
+                    if not displacement_flagged:
+                        displacement_low += 1
+                        displacement_flagged = True
                 if ob["type"] == "BULLISH_OB" and close < ob_low:
+                    break_found = True
                     disp_meta = self._displacement_score(
                         candle,
                         atr_value,
@@ -572,9 +694,15 @@ class SMCAnalyzer:
                     if disp_meta["ok"] and disp_meta.get("body_ratio", 0.0) >= min_body_ratio:
                         break_idx = j
                         break
+                    if not displacement_flagged:
+                        displacement_low += 1
+                        displacement_flagged = True
 
             if break_idx is None:
+                if not break_found:
+                    break_not_found += 1
                 continue
+            after_displacement += 1
 
             retest_idx = None
             zone_type = "BULLISH_BREAKER" if ob["type"] == "BEARISH_OB" else "BEARISH_BREAKER"
@@ -591,6 +719,12 @@ class SMCAnalyzer:
                 atr_value=atr_value,
                 retest_policy=retest_policy,
                 zone_id=zone_id,
+                zone_meta={
+                    "origin_idx": ob_idx,
+                    "origin_time": origin_time,
+                    "break_idx": break_idx,
+                    "break_time": break_time,
+                },
             )
 
             max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
@@ -603,6 +737,19 @@ class SMCAnalyzer:
             confidence *= max(0.3, 1.0 - (age_bars / 200.0))
             if not fresh:
                 confidence *= touch_penalty
+            brk_max_age = int(self.settings.get("BRK_MAX_AGE_BARS", 60))
+            brk_max_dist = float(self.settings.get("BRK_MAX_DIST_ATR", 2.0))
+            last_close = float(df["close"].iloc[-1])
+            if ob_low <= last_close <= ob_high:
+                dist_atr = 0.0
+            elif last_close > ob_high:
+                dist_atr = abs(last_close - ob_high) / atr_value if atr_value > 0 else 999.0
+            else:
+                dist_atr = abs(last_close - ob_low) / atr_value if atr_value > 0 else 999.0
+            if age_bars > brk_max_age or dist_atr > brk_max_dist:
+                age_dist_reject += 1
+            else:
+                after_age_dist += 1
 
             zone_payload = {
                     "type": zone_type,
@@ -692,6 +839,23 @@ class SMCAnalyzer:
                 )
 
         self._log_info("[NDS][SMC][BREAKER] detected=%s", len(breakers))
+        self._log_info(
+            "[NDS][SMC][BREAKER_DIAG] candidates=%s after_sweep=%s sweep_not_found=%s mitigation_missing=%s "
+            "after_displacement=%s displacement_low=%s break_not_found=%s after_age_dist=%s age_dist_reject=%s "
+            "final_breakers=%s require_sweep=%s min_body_ratio=%.2f",
+            candidates_before_filters,
+            after_sweep,
+            sweep_not_found,
+            mitigation_missing,
+            after_displacement,
+            displacement_low,
+            break_not_found,
+            after_age_dist,
+            age_dist_reject,
+            len(breakers),
+            require_sweep,
+            min_body_ratio,
+        )
         if self.debug_smc and breakers:
             for z in breakers[:6]:
                 self._log_verbose(
@@ -775,6 +939,12 @@ class SMCAnalyzer:
                 atr_value=atr_value,
                 retest_policy=retest_policy,
                 zone_id=zone_id,
+                zone_meta={
+                    "origin_idx": fvg_idx,
+                    "origin_time": origin_time,
+                    "break_idx": break_idx,
+                    "break_time": break_time,
+                },
             )
 
             max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
