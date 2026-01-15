@@ -31,6 +31,8 @@ DEFAULT_ACTIVE_SETTINGS: Dict[str, Dict[str, Any]] = {
         "FLOW_TOUCH_PENETRATION_ATR": 0.05,
         "FLOW_TOUCH_PENALTY": 0.55,
         "FLOW_RETEST_POLICY": "FIRST_TOUCH",
+        "FLOW_TOUCH_MIN_SEPARATION_BARS": 6,
+        "FLOW_CONSUME_ON_FIRST_VALID_TOUCH": True,
         "FLOW_NEAREST_ZONES": 5,
     },
     "momentum_settings": {
