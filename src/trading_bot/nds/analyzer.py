@@ -181,6 +181,8 @@ class GoldNDSAnalyzer:
             'FLOW_TOUCH_EXIT_ATR': float,
             'FLOW_TOUCH_EXIT_PIPS': float,
             'FLOW_TOUCH_MIN_SEPARATION_BARS': int,
+            'FLOW_TOUCH_EXIT_CONFIRM_BARS': int,
+            'FLOW_TOUCH_COUNT_WINDOW_BARS': int,
             'FLOW_CONSUME_ON_FIRST_VALID_TOUCH': bool,
             'FLOW_ZONE_KEY_PRECISION': int,
             'FLOW_NEAREST_ZONES': int,
