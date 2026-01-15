@@ -279,6 +279,14 @@ class ScalpingRiskManager:
                 'MAX_LOT': 'MAX_LOT_SIZE',  # مپ کردن MAX_LOT به نام مورد استفاده در محاسبات لات
                 'MAX_LOT_SIZE': 'MAX_LOT_SIZE',
                 'POSITION_TIMEOUT_MINUTES': 'POSITION_TIMEOUT_MINUTES'
+            },
+            'flow_settings': {
+                'FLOW_TP1_MIN_RR': 'FLOW_TP1_MIN_RR',
+                'FLOW_TP1_USE_OPPOSING_STRUCTURE': 'FLOW_TP1_USE_OPPOSING_STRUCTURE',
+                'FLOW_TP1_PARTIAL_CLOSE_PCT': 'FLOW_TP1_PARTIAL_CLOSE_PCT',
+                'FLOW_TP1_MOVE_SL_TO_BE': 'FLOW_TP1_MOVE_SL_TO_BE',
+                'FLOW_TRAIL_ATR_MULT': 'FLOW_TRAIL_ATR_MULT',
+                'FLOW_TRAIL_AFTER_TP1': 'FLOW_TRAIL_AFTER_TP1',
             }
         }
 
@@ -530,6 +538,7 @@ class ScalpingRiskManager:
         recent_high: Optional[float],
         config_payload: Dict[str, Any],
         point_size: Optional[float] = None,
+        tp1_target_price: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Compute scalping SL/TP with ATR and recent candle extrema reference."""
         settings = self.settings
@@ -544,6 +553,9 @@ class ScalpingRiskManager:
         tp1_pips = float(settings.get("TP1_PIPS", 35.0))
         tp2_enabled = bool(settings.get("TP2_ENABLED", True))
         tp2_pips = float(settings.get("TP2_PIPS", tp1_pips * 2.0))
+        tp1_source = "fixed_pips"
+        use_opposing = bool(settings.get("FLOW_TP1_USE_OPPOSING_STRUCTURE", True))
+        min_rr = float(settings.get("FLOW_TP1_MIN_RR", 1.5))
 
         atr_value = float(atr_value) if atr_value is not None else 0.0
         atr_distance = atr_value * atr_mult if atr_value > 0 else 0.0
@@ -591,6 +603,10 @@ class ScalpingRiskManager:
         if signal == "BUY":
             stop_loss = float(entry_price) - sl_distance
             take_profit = float(entry_price) + pips_to_price(tp1_pips, point_size)
+            if use_opposing and tp1_target_price is not None and tp1_target_price > entry_price:
+                min_rr_price = float(entry_price) + (sl_distance * min_rr)
+                take_profit = max(float(tp1_target_price), min_rr_price)
+                tp1_source = "opposing_structure" if take_profit == float(tp1_target_price) else "min_rr_floor"
             tp2_price = (
                 float(entry_price) + pips_to_price(tp2_pips, point_size)
                 if tp2_enabled
@@ -599,11 +615,25 @@ class ScalpingRiskManager:
         else:
             stop_loss = float(entry_price) + sl_distance
             take_profit = float(entry_price) - pips_to_price(tp1_pips, point_size)
+            if use_opposing and tp1_target_price is not None and tp1_target_price < entry_price:
+                min_rr_price = float(entry_price) - (sl_distance * min_rr)
+                take_profit = min(float(tp1_target_price), min_rr_price)
+                tp1_source = "opposing_structure" if take_profit == float(tp1_target_price) else "min_rr_floor"
             tp2_price = (
                 float(entry_price) - pips_to_price(tp2_pips, point_size)
                 if tp2_enabled
                 else None
             )
+
+        tp_metrics = calculate_distance_metrics(
+            entry_price=float(entry_price),
+            current_price=float(take_profit),
+            point_size=point_size,
+        )
+        tp1_pips = float(tp_metrics.get("dist_pips") or 0.0)
+
+        if bool(settings.get("FLOW_TRAIL_AFTER_TP1", True)):
+            tp2_price = None
 
         return {
             "stop_loss": stop_loss,
@@ -611,6 +641,7 @@ class ScalpingRiskManager:
             "tp1_pips": tp1_pips,
             "tp2_pips": tp2_pips,
             "tp2_price": tp2_price,
+            "tp1_source": tp1_source,
             "sl_pips": sl_pips,
             "sl_distance": sl_distance,
             "atr_distance": atr_distance,
@@ -861,6 +892,7 @@ class ScalpingRiskManager:
         )
         recent_low = entry_context.get("recent_low")
         recent_high = entry_context.get("recent_high")
+        tp1_target_price = entry_context.get("tp1_target_price")
         sltp = self._compute_scalping_sl_tp(
             signal=signal,
             entry_price=entry_price,
@@ -869,11 +901,19 @@ class ScalpingRiskManager:
             recent_high=recent_high,
             config_payload=config,
             point_size=point_size,
+            tp1_target_price=tp1_target_price,
         )
         stop_loss = sltp.get("stop_loss")
         take_profit = sltp.get("take_profit")
         tp2_price = sltp.get("tp2_price")
         decision_notes.append("SL/TP computed by risk manager scalping model.")
+        tp1_source = sltp.get("tp1_source", "fixed_pips")
+        tp1_partial = float(self.settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5))
+        move_sl_to_be = bool(self.settings.get("FLOW_TP1_MOVE_SL_TO_BE", True))
+        trail_atr_mult = float(self.settings.get("FLOW_TRAIL_ATR_MULT", 2.0))
+        decision_notes.append(
+            f"TP1 plan: {tp1_source} close {tp1_partial:.0%} at TP1; move SL to BE={move_sl_to_be}; trail {trail_atr_mult:.2f}x ATR after TP1."
+        )
         if tp2_price is not None:
             self._logger.info("[NDS][TP2_PLAN] tp2=%.2f intent=runner optional=true", float(tp2_price))
 

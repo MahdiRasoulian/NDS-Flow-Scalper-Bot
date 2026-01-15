@@ -471,6 +471,34 @@ class SMCAnalyzer:
         last_idx = len(df) - 1
 
         raw_obs: List[Dict[str, Any]] = []
+        sweeps = self.detect_liquidity_sweeps(swings) if swings else []
+        sweep_lookback = int(self.settings.get("BRK_SWEEP_LOOKBACK_BARS", 40))
+        require_sweep = bool(self.settings.get("BRK_REQUIRE_SWEEP", True))
+        min_body_ratio = float(self.settings.get("BRK_DISPLACEMENT_MIN_BODY_RATIO", 0.55))
+        time_to_index = {}
+        if "time" in df.columns:
+            try:
+                time_to_index = {t: idx for idx, t in zip(df.index, df["time"])}
+            except Exception:
+                time_to_index = {}
+
+        def _has_recent_sweep(ob_idx: int, ob_type: str) -> bool:
+            if not require_sweep:
+                return True
+            desired = "BULLISH_SWEEP" if ob_type == "BEARISH_OB" else "BEARISH_SWEEP"
+            for sweep in sweeps:
+                if sweep.type != desired:
+                    continue
+                sweep_idx = time_to_index.get(sweep.time)
+                if sweep_idx is None:
+                    continue
+                try:
+                    sweep_idx = int(sweep_idx)
+                except Exception:
+                    continue
+                if sweep_idx < ob_idx and (ob_idx - sweep_idx) <= sweep_lookback:
+                    return True
+            return False
         for i in range(start_idx, len(df) - 2):
             candle_a = df.iloc[i]
             candle_b = df.iloc[i + 1]
@@ -500,10 +528,30 @@ class SMCAnalyzer:
             ob_high = float(ob["high"])
             ob_low = float(ob["low"])
             ob_idx = int(ob["index"])
+            if not _has_recent_sweep(ob_idx, ob["type"]):
+                continue
+
+            mitigation_idx = None
             break_idx = None
             disp_meta = None
 
             for j in range(ob_idx + 1, len(df)):
+                candle = df.iloc[j]
+                if self._is_zone_touch(
+                    high=float(candle["high"]),
+                    low=float(candle["low"]),
+                    close=float(candle["close"]),
+                    top=ob_high,
+                    bottom=ob_low,
+                    atr_value=atr_value,
+                ):
+                    mitigation_idx = j
+                    break
+
+            if mitigation_idx is None:
+                continue
+
+            for j in range(mitigation_idx + 1, len(df)):
                 candle = df.iloc[j]
                 close = float(candle["close"])
                 if ob["type"] == "BEARISH_OB" and close > ob_high:
@@ -512,7 +560,7 @@ class SMCAnalyzer:
                         atr_value,
                         rvol=candle.get("rvol") if "rvol" in df.columns else None,
                     )
-                    if disp_meta["ok"]:
+                    if disp_meta["ok"] and disp_meta.get("body_ratio", 0.0) >= min_body_ratio:
                         break_idx = j
                         break
                 if ob["type"] == "BULLISH_OB" and close < ob_low:
@@ -521,7 +569,7 @@ class SMCAnalyzer:
                         atr_value,
                         rvol=candle.get("rvol") if "rvol" in df.columns else None,
                     )
-                    if disp_meta["ok"]:
+                    if disp_meta["ok"] and disp_meta.get("body_ratio", 0.0) >= min_body_ratio:
                         break_idx = j
                         break
 
