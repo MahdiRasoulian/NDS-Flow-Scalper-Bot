@@ -283,8 +283,17 @@ class SMCAnalyzer:
         outside_count = 0
         exit_threshold = self._touch_exit_threshold_price(atr_value)
         min_separation = int(self.settings.get("FLOW_TOUCH_MIN_SEPARATION_BARS", 6))
-        exit_confirm_bars = 2
-        for j in range(start_idx, len(df)):
+        exit_confirm_bars = max(1, int(self.settings.get("FLOW_TOUCH_EXIT_CONFIRM_BARS", 2)))
+        window_limit = self.settings.get("FLOW_TOUCH_COUNT_WINDOW_BARS")
+        end_idx = len(df)
+        if window_limit is not None:
+            try:
+                window_limit = int(window_limit)
+            except (TypeError, ValueError):
+                window_limit = None
+        if window_limit and window_limit > 0:
+            end_idx = min(len(df), start_idx + window_limit)
+        for j in range(start_idx, end_idx):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
             close = float(df["close"].iloc[j])
@@ -342,17 +351,29 @@ class SMCAnalyzer:
         exit_idx: Optional[int] = None
         merged_clusters = 0
         max_touches = int(self.settings.get("FLOW_MAX_TOUCHES", 2))
+        max_touch_buffer = 1
         status = "OUTSIDE"
         current_touch_idx: Optional[int] = None
         exit_threshold = self._touch_exit_threshold_price(atr_value)
         min_separation = int(self.settings.get("FLOW_TOUCH_MIN_SEPARATION_BARS", 6))
-        exit_confirm_bars = 2
+        exit_confirm_bars = max(1, int(self.settings.get("FLOW_TOUCH_EXIT_CONFIRM_BARS", 2)))
         outside_count = 0
         consume_on_first = bool(self.settings.get("FLOW_CONSUME_ON_FIRST_VALID_TOUCH", True))
         penetration_threshold = self._zone_penetration(atr_value)
         stop_scanning = False
+        early_retest_reason: Optional[str] = None
+        early_retest_idx: Optional[int] = None
+        window_limit = self.settings.get("FLOW_TOUCH_COUNT_WINDOW_BARS")
+        end_idx = len(df)
+        if window_limit is not None:
+            try:
+                window_limit = int(window_limit)
+            except (TypeError, ValueError):
+                window_limit = None
+        if window_limit and window_limit > 0:
+            end_idx = min(len(df), start_idx + window_limit)
 
-        for j in range(start_idx, len(df)):
+        for j in range(start_idx, end_idx):
             if stop_scanning:
                 break
             high = float(df["high"].iloc[j])
@@ -371,17 +392,35 @@ class SMCAnalyzer:
                     merged_clusters += 1
                     current_touch_idx = last_touch_idx
                 outside_count = 0
-                if zone_id:
+                touch_total = len(touch_indices)
+                if zone_id and (touch_total >= 3 or touch_total > max_touches):
                     candle_time = None
                     if "time" in df.columns:
                         candle_time = df["time"].iloc[j]
                     self._log_debug(
-                        "[NDS][FLOW_DEBUG][TOUCH_INCREMENT] zone_id=%s idx=%s time=%s touches=%s",
+                        "[NDS][FLOW_DEBUG][TOUCH_INCREMENT] zone_id=%s idx=%s time=%s touches=%s sep=%s exit_confirm=%s",
                         zone_id,
                         j,
                         candle_time,
-                        len(touch_indices),
+                        touch_total,
+                        min_separation,
+                        exit_confirm_bars,
                     )
+                if touch_total > max_touches + max_touch_buffer:
+                    stop_scanning = True
+                    early_retest_reason = "TOO_MANY_TOUCHES"
+                    early_retest_idx = touch_indices[-1]
+                    if zone_id:
+                        self._log_info(
+                            "[NDS][FLOW][RETEST_REJECT] reason=TOO_MANY_TOUCHES zone_id=%s touches=%s "
+                            "max_touches=%s start_idx=%s end_idx=%s",
+                            zone_id,
+                            touch_total,
+                            max_touches,
+                            start_idx,
+                            end_idx,
+                        )
+                    break
             if touched and status == "INSIDE":
                 if current_touch_idx is None:
                     current_touch_idx = last_touch_idx or j
@@ -405,6 +444,14 @@ class SMCAnalyzer:
                         status = "OUTSIDE"
                         current_touch_idx = None
                         exit_idx = j
+                        if zone_id:
+                            self._log_debug(
+                                "[NDS][FLOW_DEBUG][TOUCH_EXIT] zone_id=%s idx=%s outside_streak=%s exit_threshold=%.5f",
+                                zone_id,
+                                j,
+                                outside_count,
+                                float(exit_threshold),
+                            )
                         outside_count = 0
                 else:
                     outside_count = 0
@@ -414,7 +461,15 @@ class SMCAnalyzer:
         retest_reason = "NO_TOUCH"
         eligible = False
 
-        if touch_count == 0:
+        if early_retest_reason:
+            retest_reason = early_retest_reason
+            retest_idx = early_retest_idx
+            eligible = False
+
+        if touch_count == 0 and not early_retest_reason:
+            return first_touch_idx, retest_idx, touch_count, eligible, retest_reason
+
+        if early_retest_reason:
             return first_touch_idx, retest_idx, touch_count, eligible, retest_reason
 
         retest_policy = str(retest_policy or "").upper()
@@ -448,6 +503,16 @@ class SMCAnalyzer:
             retest_reason = "TOO_MANY_TOUCHES"
             if retest_idx is None:
                 retest_idx = touch_indices[-1]
+            if zone_id:
+                self._log_info(
+                    "[NDS][FLOW][RETEST_REJECT] reason=TOO_MANY_TOUCHES zone_id=%s touches=%s "
+                    "max_touches=%s start_idx=%s end_idx=%s",
+                    zone_id,
+                    touch_count,
+                    max_touches,
+                    start_idx,
+                    end_idx,
+                )
 
         if touch_count >= 3 or retest_reason not in {"", "NO_TOUCH"} or not eligible:
             origin_idx = zone_meta.get("origin_idx") if zone_meta else None
