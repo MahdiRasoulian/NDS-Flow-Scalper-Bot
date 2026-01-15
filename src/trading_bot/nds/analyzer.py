@@ -180,6 +180,8 @@ class GoldNDSAnalyzer:
             'FLOW_TOUCH_PENALTY': float,
             'FLOW_TOUCH_EXIT_ATR': float,
             'FLOW_TOUCH_EXIT_PIPS': float,
+            'FLOW_TOUCH_MIN_SEPARATION_BARS': int,
+            'FLOW_CONSUME_ON_FIRST_VALID_TOUCH': bool,
             'FLOW_ZONE_KEY_PRECISION': int,
             'FLOW_NEAREST_ZONES': int,
             'MOMO_SESSION_ALLOWLIST': list,
@@ -1284,6 +1286,7 @@ class GoldNDSAnalyzer:
             "TOO_MANY_TOUCHES": 0,
             "FIRST_TOUCH_UNCONFIRMED": 0,
             "NO_CONFIRMED_TOUCH": 0,
+            "CONSUMED_AFTER_FIRST_TOUCH": 0,
         }
 
         def _tier_candidates(zones: List[Dict[str, Any]], side: str, max_dist_atr: float, max_age: int) -> List[Dict[str, Any]]:
