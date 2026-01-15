@@ -1,0 +1,21 @@
+{
+  "grid": {
+    "technical_settings.ENTRY_FACTOR": [0.2, 0.25],
+    "technical_settings.SCALPING_MIN_CONFIDENCE": [34, 38, 42],
+    "risk_settings.MAX_PRICE_DEVIATION_PIPS": [50, 70],
+    "flow_settings.FLOW_MAX_TOUCHES": [4, 5],
+    "flow_settings.FLOW_TOUCH_MIN_SEPARATION_BARS": [6, 8]
+  },
+  "objective": {
+    "name": "balanced",
+    "lambda_dd": 0.5,
+    "lambda_pf": 50.0,
+    "lambda_ab": 100.0,
+    "lambda_overtrade": 10.0
+  },
+  "failsafe": {
+    "min_ab_ratio": 0.25,
+    "max_too_many_touches": 500,
+    "min_profit_factor": 1.1
+  }
+}
