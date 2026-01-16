@@ -97,6 +97,7 @@ class GoldNDSAnalyzer:
         self._apply_timeframe_settings()
 
         self._score_hist = _SCORE_HIST
+        self._threshold_ema = {"buy": None, "sell": None}
 
         self._log_info(
             "[NDS][INIT] initialized candles=%s timeframe=%s",
@@ -202,10 +203,26 @@ class GoldNDSAnalyzer:
             'SMC_MAX_OB_AGE_BARS': int,
             'SMC_MIN_FVG_SIZE_ATR': float,
             'SMC_MIN_OB_SIZE_ATR': float,
+            'SMC_OB_RELAX_MIN_SIZE_MULT': float,
+            'SMC_OB_FALLBACK_TOP_K': int,
+            'SMC_OB_FALLBACK_MAX_AGE_MULT': float,
+            'SMC_OB_FALLBACK_MAX_DIST_MULT': float,
+            'SMC_OB_FALLBACK_MIN_STRENGTH': float,
             'SMC_ZONE_MAX_DIST_ATR': float,
             'SMC_ZONE_TIGHTEN_MULT': float,
             'SMC_FVG_RANK_WEIGHTS': dict,
             'SMC_OB_RANK_WEIGHTS': dict,
+            'SCALPING_THRESHOLD_MODE': str,
+            'SIGNAL_THRESHOLD_MODE': str,
+            'SIGNAL_BUY_PERCENTILE': float,
+            'SIGNAL_SELL_PERCENTILE': float,
+            'PERCENTILE_MIN_HISTORY': int,
+            'SIGNAL_MIN_THRESHOLD_SPREAD': float,
+            'SIGNAL_BUY_THRESHOLD_MIN': float,
+            'SIGNAL_BUY_THRESHOLD_MAX': float,
+            'SIGNAL_SELL_THRESHOLD_MIN': float,
+            'SIGNAL_SELL_THRESHOLD_MAX': float,
+            'SIGNAL_THRESHOLD_EMA_ALPHA': float,
             'INTEGRITY_LOW_LIQUIDITY_RVOL_MAX': float,
             'INTEGRITY_LOW_LIQUIDITY_SESSION_ACTIVITY': str,
             'INTEGRITY_LOW_LIQUIDITY_FORCE_NONE': bool,
@@ -3022,6 +3039,8 @@ class GoldNDSAnalyzer:
                 trading_settings.SCALPING_BUY_THRESHOLD
                 trading_settings.SCALPING_SELL_THRESHOLD
             """
+            settings = self.GOLD_SETTINGS
+
             # --- Default thresholds (legacy behaviour)
             if scalping_mode:
                 volatility_state = self._normalize_volatility_state(volatility_state)
@@ -3063,15 +3082,27 @@ class GoldNDSAnalyzer:
                 # never let config parsing break signal generation
                 pass
 
-            threshold_mode = str(settings.get("SIGNAL_THRESHOLD_MODE", "STATIC") or "STATIC").upper()
+            threshold_mode = str(settings.get("SIGNAL_THRESHOLD_MODE") or "STATIC").upper()
             if scalping_mode:
-                threshold_mode = str(settings.get("SCALPING_THRESHOLD_MODE", threshold_mode) or threshold_mode).upper()
+                threshold_mode = str(settings.get("SCALPING_THRESHOLD_MODE") or threshold_mode).upper()
             if threshold_mode == "PERCENTILE":
                 hist = list(self._score_hist)
-                min_hist = int(settings.get("SIGNAL_MIN_HISTORY", 60))
-                if len(hist) >= min_hist:
-                    buy_pct = float(settings.get("SIGNAL_BUY_PERCENTILE", 0.8))
-                    sell_pct = float(settings.get("SIGNAL_SELL_PERCENTILE", 0.2))
+                min_hist = settings.get("PERCENTILE_MIN_HISTORY")
+                if min_hist is None:
+                    min_hist = settings.get("SIGNAL_MIN_HISTORY")
+                try:
+                    min_hist = int(min_hist)
+                except (TypeError, ValueError):
+                    min_hist = 60
+                if len(hist) >= max(1, min_hist):
+                    buy_pct_raw = settings.get("SIGNAL_BUY_PERCENTILE")
+                    sell_pct_raw = settings.get("SIGNAL_SELL_PERCENTILE")
+                    try:
+                        buy_pct = float(buy_pct_raw)
+                        sell_pct = float(sell_pct_raw)
+                    except (TypeError, ValueError):
+                        buy_pct = 0.8
+                        sell_pct = 0.2
                     buy_threshold = self._percentile(hist, buy_pct)
                     sell_threshold = self._percentile(hist, sell_pct)
                     min_spread = float(settings.get("SIGNAL_MIN_THRESHOLD_SPREAD", 3.0))
@@ -3087,6 +3118,44 @@ class GoldNDSAnalyzer:
                         buy_threshold,
                         sell_threshold,
                     )
+                else:
+                    self._log_info(
+                        "[NDS][THRESH] mode=percentile warmup n=%s min=%s -> fallback=STATIC",
+                        len(hist),
+                        min_hist,
+                    )
+
+            try:
+                buy_min_raw = settings.get("SIGNAL_BUY_THRESHOLD_MIN")
+                buy_max_raw = settings.get("SIGNAL_BUY_THRESHOLD_MAX")
+                sell_min_raw = settings.get("SIGNAL_SELL_THRESHOLD_MIN")
+                sell_max_raw = settings.get("SIGNAL_SELL_THRESHOLD_MAX")
+                if None not in (buy_min_raw, buy_max_raw, sell_min_raw, sell_max_raw):
+                    buy_min = float(buy_min_raw)
+                    buy_max = float(buy_max_raw)
+                    sell_min = float(sell_min_raw)
+                    sell_max = float(sell_max_raw)
+                    buy_threshold = min(max(float(buy_threshold), buy_min), buy_max)
+                    sell_threshold = min(max(float(sell_threshold), sell_min), sell_max)
+            except Exception:
+                pass
+
+            ema_alpha_raw = settings.get("SIGNAL_THRESHOLD_EMA_ALPHA")
+            try:
+                ema_alpha = float(ema_alpha_raw)
+            except (TypeError, ValueError):
+                ema_alpha = 0.0
+            if 0.0 < ema_alpha < 1.0:
+                prev_buy = self._threshold_ema.get("buy")
+                prev_sell = self._threshold_ema.get("sell")
+                if prev_buy is None:
+                    prev_buy = buy_threshold
+                if prev_sell is None:
+                    prev_sell = sell_threshold
+                buy_threshold = (ema_alpha * buy_threshold) + ((1.0 - ema_alpha) * prev_buy)
+                sell_threshold = (ema_alpha * sell_threshold) + ((1.0 - ema_alpha) * prev_sell)
+                self._threshold_ema["buy"] = buy_threshold
+                self._threshold_ema["sell"] = sell_threshold
 
             # Safety: ensure thresholds are sensible
             try:
@@ -3108,7 +3177,6 @@ class GoldNDSAnalyzer:
             else:
                 return "NONE"
 
-            settings = self.GOLD_SETTINGS
             volatility_state = self._normalize_volatility_state(volatility_state)
             try:
                 min_conf_base = float(settings.get("SIGNAL_MIN_CONF", 42.0))

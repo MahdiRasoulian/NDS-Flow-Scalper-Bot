@@ -436,17 +436,42 @@ class SMCAnalyzer:
                 max_age,
             )
 
+        if self.debug_smc and order_blocks:
+            preview: List[Tuple[OrderBlock, float, float, int, float]] = []
+            for ob in order_blocks:
+                age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
+                size = abs(float(getattr(ob, "high", 0.0)) - float(getattr(ob, "low", 0.0)))
+                size_atr = size / atr_value if atr_value > 0 else 0.0
+                dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
+                strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
+                preview.append((ob, strength_score, size_atr, age, dist_atr))
+            preview.sort(key=lambda item: (-item[1], item[3], item[4]))
+            for ob, strength_score, size_atr, age, dist_atr in preview[:5]:
+                self._log_debug(
+                    "[NDS][SMC][OB] raw idx=%s type=%s size_atr=%.3f age=%s dist_atr=%.3f strength=%.2f",
+                    getattr(ob, "index", "n/a"),
+                    getattr(ob, "type", "UNKNOWN"),
+                    size_atr,
+                    age,
+                    dist_atr,
+                    strength_score,
+                )
+
         filtered: List[Tuple[OrderBlock, float, int]] = []
+        strict_rejects = {"too_old": 0, "too_small": 0, "too_far": 0}
         for ob in order_blocks:
             age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
             size = abs(float(getattr(ob, "high", 0.0)) - float(getattr(ob, "low", 0.0)))
             size_atr = size / atr_value if atr_value > 0 else 0.0
             if age > max_age:
+                strict_rejects["too_old"] += 1
                 continue
             if size_atr < min_size_atr:
+                strict_rejects["too_small"] += 1
                 continue
             dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
             if dist_atr > max_dist_atr:
+                strict_rejects["too_far"] += 1
                 continue
             recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
             strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
@@ -470,6 +495,13 @@ class SMCAnalyzer:
             min_size_atr,
             max_age,
         )
+        if not trimmed:
+            self._log_info(
+                "[NDS][SMC][OB] rejected strict too_old=%s too_small=%s too_far=%s",
+                strict_rejects["too_old"],
+                strict_rejects["too_small"],
+                strict_rejects["too_far"],
+            )
         if trimmed:
             return trimmed
 
@@ -484,16 +516,20 @@ class SMCAnalyzer:
         )
 
         relaxed_filtered: List[Tuple[OrderBlock, float, int]] = []
+        relaxed_rejects = {"too_old": 0, "too_small": 0, "too_far": 0}
         for ob in order_blocks:
             age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
             size = abs(float(getattr(ob, "high", 0.0)) - float(getattr(ob, "low", 0.0)))
             size_atr = size / atr_value if atr_value > 0 else 0.0
             if age > max_age:
+                relaxed_rejects["too_old"] += 1
                 continue
             dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
             if dist_atr > max_dist_atr:
+                relaxed_rejects["too_far"] += 1
                 continue
             if size_atr < relaxed_min_size_atr:
+                relaxed_rejects["too_small"] += 1
                 continue
             recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
             strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
@@ -516,18 +552,36 @@ class SMCAnalyzer:
                 fallback_top_k,
             )
             return trimmed_relaxed
+        self._log_info(
+            "[NDS][SMC][OB] rejected relaxed too_old=%s too_small=%s too_far=%s",
+            relaxed_rejects["too_old"],
+            relaxed_rejects["too_small"],
+            relaxed_rejects["too_far"],
+        )
+
+        fallback_age_mult = float(self.settings.get("SMC_OB_FALLBACK_MAX_AGE_MULT", 1.5))
+        fallback_dist_mult = float(self.settings.get("SMC_OB_FALLBACK_MAX_DIST_MULT", 1.5))
+        fallback_min_strength = float(self.settings.get("SMC_OB_FALLBACK_MIN_STRENGTH", 0.15))
+        fallback_max_age = int(max_age * max(1.0, fallback_age_mult))
+        fallback_max_dist = max_dist_atr * max(1.0, fallback_dist_mult)
 
         fallback_candidates: List[Tuple[OrderBlock, float, int]] = []
+        fallback_rejects = {"too_old": 0, "too_far": 0, "too_weak": 0}
         for ob in order_blocks:
             age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
-            if age > max_age:
+            if age > fallback_max_age:
+                fallback_rejects["too_old"] += 1
                 continue
             dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
-            if dist_atr > max_dist_atr:
+            if dist_atr > fallback_max_dist:
+                fallback_rejects["too_far"] += 1
                 continue
             strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
+            if strength_score < fallback_min_strength:
+                fallback_rejects["too_weak"] += 1
+                continue
             recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
-            proximity = max(0.0, 1.0 - (dist_atr / max_dist_atr if max_dist_atr > 0 else 1.0))
+            proximity = max(0.0, 1.0 - (dist_atr / fallback_max_dist if fallback_max_dist > 0 else 1.0))
             score = (
                 ob_weights.get("strength", 0.6) * strength_score
                 + ob_weights.get("recency", 0.25) * recency
@@ -538,10 +592,21 @@ class SMCAnalyzer:
         fallback_candidates.sort(key=lambda item: (-item[1], item[2], item[0].index))
         trimmed_fallback = [item[0] for item in fallback_candidates[:max(1, fallback_top_k)]]
         self._log_info(
-            "[NDS][SMC][OB] fallback kept=%s fallback_top_k=%s",
+            "[NDS][SMC][OB] fallback kept=%s fallback_top_k=%s max_age=%s max_dist=%.2f min_strength=%.2f",
             len(trimmed_fallback),
             fallback_top_k,
+            fallback_max_age,
+            fallback_max_dist,
+            fallback_min_strength,
         )
+        if not trimmed_fallback:
+            self._log_warning(
+                "[NDS][SMC][OB] fallback empty raw=%s rejected too_old=%s too_far=%s too_weak=%s",
+                total_raw,
+                fallback_rejects["too_old"],
+                fallback_rejects["too_far"],
+                fallback_rejects["too_weak"],
+            )
         return trimmed_fallback
 
     def _scan_zone_touches(
