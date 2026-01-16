@@ -41,12 +41,14 @@ class RealTimePriceMonitor:
             if self.mt5_client and self.mt5_client.connected:
                 tick = self.mt5_client.get_current_tick(symbol)
                 if tick:
+                    spread_price = tick.get('spread_price', tick.get('spread', 0))
                     self.real_time_prices[symbol] = {
                         'bid': tick.get('bid', 0),
                         'ask': tick.get('ask', 0),
                         'last': tick.get('last', 0),
                         'time': tick.get('time', datetime.now()),
-                        'spread': tick.get('spread', 0)
+                        'spread': tick.get('spread', 0),
+                        'spread_price': spread_price,
                     }
                     self.last_tick_time[symbol] = datetime.now()
                     return {
@@ -55,6 +57,7 @@ class RealTimePriceMonitor:
                         'last': tick.get('last', 0),
                         'time': tick.get('time', datetime.now()),
                         'spread': tick.get('spread', 0),
+                        'spread_price': spread_price,
                         'source': tick.get('source', 'mt5_client')
                     }
 
@@ -64,6 +67,7 @@ class RealTimePriceMonitor:
                 'last': 0,
                 'time': datetime.now(),
                 'spread': 0,
+                'spread_price': 0,
                 'source': 'no_data',
                 'error': 'No price data available'
             }
@@ -76,6 +80,7 @@ class RealTimePriceMonitor:
                 'last': 0,
                 'time': datetime.now(),
                 'spread': 0,
+                'spread_price': 0,
                 'source': 'error',
                 'error': str(e)
             }

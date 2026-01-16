@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ACTIVE_SETTINGS: Dict[str, Dict[str, Any]] = {
     "trading_settings": {
         "POINT_SIZE": DEFAULT_POINT_SIZE,
+        "PIP_SIZE": DEFAULT_POINT_SIZE * 10,
         "BROKER_UTC_OFFSET_HOURS": DEFAULT_BROKER_OFFSET_HOURS,
         "TIME_MODE": DEFAULT_TIME_MODE,
         "SESSION_DEFINITIONS": DEFAULT_SESSION_DEFINITIONS,
