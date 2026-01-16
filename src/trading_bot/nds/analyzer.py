@@ -186,11 +186,34 @@ class GoldNDSAnalyzer:
             'FLOW_TOUCH_MIN_SEPARATION_BARS': int,
             'FLOW_TOUCH_EXIT_CONFIRM_BARS': int,
             'FLOW_TOUCH_COUNT_WINDOW_BARS': int,
+            'FLOW_TOUCH_COOLDOWN_BARS': int,
             'FLOW_CONSUME_ON_FIRST_VALID_TOUCH': bool,
             'FLOW_ZONE_KEY_PRECISION': int,
             'FLOW_NEAREST_ZONES': int,
+            'FLOW_SETUP_WEIGHTS': dict,
+            'FLOW_SETUP_TOP_K': int,
+            'FLOW_SETUP_DISPLACEMENT_ATR_TARGET': float,
             'MOMO_SESSION_ALLOWLIST': list,
             'MIN_SL_PIPS': float,
+            'SMC_MIN_CANDLES': int,
+            'SMC_MAX_FVG_COUNT': int,
+            'SMC_MAX_OB_COUNT': int,
+            'SMC_MAX_FVG_AGE_BARS': int,
+            'SMC_MAX_OB_AGE_BARS': int,
+            'SMC_MIN_FVG_SIZE_ATR': float,
+            'SMC_MIN_OB_SIZE_ATR': float,
+            'SMC_ZONE_MAX_DIST_ATR': float,
+            'SMC_ZONE_TIGHTEN_MULT': float,
+            'SMC_FVG_RANK_WEIGHTS': dict,
+            'SMC_OB_RANK_WEIGHTS': dict,
+            'INTEGRITY_LOW_LIQUIDITY_RVOL_MAX': float,
+            'INTEGRITY_LOW_LIQUIDITY_SESSION_ACTIVITY': str,
+            'INTEGRITY_LOW_LIQUIDITY_FORCE_NONE': bool,
+            'INTEGRITY_EXCEPTIONAL_SETUP_SCORE': float,
+            'REGIME_ADX_WEAK_MAX': float,
+            'REGIME_TREND_WEIGHT_MULT_LOW_ADX': float,
+            'REGIME_FVG_WEIGHT_MULT_LOW_RVOL': float,
+            'REGIME_OB_WEIGHT_MULT_LOW_RVOL': float,
         }
 
         validated_config: Dict[str, Any] = {}
@@ -218,6 +241,11 @@ class GoldNDSAnalyzer:
                     parsed_value = [str(v).strip() for v in value if str(v).strip()]
                 elif isinstance(value, str):
                     parsed_value = [v.strip() for v in value.split(",") if v.strip()]
+            elif target_type is dict:
+                if isinstance(value, dict):
+                    parsed_value = value
+                else:
+                    parsed_value = None
             else:
                 try:
                     parsed_value = target_type(value)
@@ -581,6 +609,14 @@ class GoldNDSAnalyzer:
             volume_analysis.setdefault("max_spread", max_spread_pips)
             volatility_state = self._normalize_volatility_state(self._determine_volatility(atr_v, atr_for_scoring))
             session_analysis = self._analyze_trading_sessions(volume_analysis)
+            session_activity = str(
+                getattr(session_analysis, "session_activity", None)
+                or getattr(session_analysis, "activity", None)
+                or "UNKNOWN"
+            ).upper()
+            low_liq_session = str(self.GOLD_SETTINGS.get("INTEGRITY_LOW_LIQUIDITY_SESSION_ACTIVITY", "LOW")).upper()
+            low_liq_rvol_max = float(self.GOLD_SETTINGS.get("INTEGRITY_LOW_LIQUIDITY_RVOL_MAX", 0.55))
+            low_liquidity = float(volume_analysis.get("rvol", 1.0)) <= low_liq_rvol_max and session_activity == low_liq_session
 
             last_candle = self.df.iloc[-1]
             self._log_debug(
@@ -594,10 +630,27 @@ class GoldNDSAnalyzer:
             )
 
             smc = SMCAnalyzer(self.df, self.atr, self.GOLD_SETTINGS)
-            swings = smc.detect_swings(timeframe)
-            fvgs = smc.detect_fvgs()
-            order_blocks = smc.detect_order_blocks()
-            sweeps = smc.detect_liquidity_sweeps(swings)
+            integrity_flags: List[str] = []
+            if low_liquidity:
+                integrity_flags.append("low_liquidity")
+            min_smc_candles = int(self.GOLD_SETTINGS.get("SMC_MIN_CANDLES", 300))
+            smc_ready = len(self.df) >= min_smc_candles
+            if not smc_ready:
+                integrity_flags.append(f"smc_skipped_candles<{min_smc_candles}")
+                self._log_info(
+                    "[NDS][INTEGRITY] SMC skipped (candles=%s min_required=%s)",
+                    len(self.df),
+                    min_smc_candles,
+                )
+                swings = []
+                fvgs = []
+                order_blocks = []
+                sweeps = []
+            else:
+                swings = smc.detect_swings(timeframe)
+                fvgs = smc.detect_fvgs()
+                order_blocks = smc.detect_order_blocks()
+                sweeps = smc.detect_liquidity_sweeps(swings)
 
             structure = smc.determine_market_structure(
                 swings=swings,
@@ -795,6 +848,34 @@ class GoldNDSAnalyzer:
                 order_blocks=order_blocks,
             )
 
+            if low_liquidity and entry_idea.get("signal") in {"BUY", "SELL"}:
+                exceptional_threshold = float(self.GOLD_SETTINGS.get("INTEGRITY_EXCEPTIONAL_SETUP_SCORE", 0.78))
+                force_none = bool(self.GOLD_SETTINGS.get("INTEGRITY_LOW_LIQUIDITY_FORCE_NONE", True))
+                setup_score = None
+                if isinstance(entry_idea.get("zone"), dict):
+                    setup_score = entry_idea["zone"].get("setup_score")
+                if setup_score is None and isinstance(entry_idea.get("metrics"), dict):
+                    setup_score = entry_idea["metrics"].get("setup_score")
+                setup_score = float(setup_score or 0.0)
+                if force_none and setup_score < exceptional_threshold:
+                    entry_idea["blocked_setup"] = entry_idea.get("zone")
+                    entry_idea["signal"] = "NONE"
+                    entry_idea["entry_level"] = None
+                    entry_idea["entry_type"] = "NONE"
+                    entry_idea["entry_model"] = "NONE"
+                    entry_idea["reject_reason"] = "INTEGRITY_LOW_LIQUIDITY"
+                    self._append_reason(
+                        reasons,
+                        f"Low liquidity gate (rvol={float(volume_analysis.get('rvol', 0.0)):.2f}, session_activity={session_activity})",
+                    )
+                else:
+                    confidence = round(float(confidence) * 0.7, 1)
+                    self._append_reason(
+                        reasons,
+                        f"Low liquidity penalty (setup_score={setup_score:.2f} >= {exceptional_threshold:.2f})",
+                    )
+            result_payload["confidence"] = confidence
+
             entry_price = entry_idea.get("entry_level")
             entry_type = entry_idea.get("entry_type", "NONE")
             entry_model = entry_idea.get("entry_model", "NONE")
@@ -851,6 +932,39 @@ class GoldNDSAnalyzer:
                 result_payload["context"]["signal_context"] = entry_signal_context
             except Exception as _ctx_e:
                 self._log_debug("[NDS][SIGNAL][CONTEXT] failed to attach flow entry context: %s", _ctx_e)
+
+            analysis_trace = self._build_analysis_trace(
+                signal=signal,
+                confidence=confidence,
+                score=score,
+                volume_analysis=volume_analysis,
+                session_analysis=session_analysis,
+                signal_context=analysis_signal_context,
+                entry_idea=entry_idea,
+                reasons=reasons,
+                integrity_flags=integrity_flags,
+            )
+            result_payload["analysis_trace"] = analysis_trace
+            result_payload["context"]["analysis_trace"] = analysis_trace
+
+            top_setup = analysis_trace.get("setup", {})
+            gates = analysis_trace.get("gates", {})
+            reasons_str = ",".join(analysis_trace.get("decision_notes", [])[:6])
+            self._log_info(
+                "[NDS][SUMMARY] signal=%s score=%.1f conf=%.1f gates=%s top_setup=%s reasons=[%s]",
+                signal,
+                float(score),
+                float(confidence),
+                gates,
+                {
+                    "type": top_setup.get("selected_zone_type"),
+                    "id": top_setup.get("selected_zone_id"),
+                    "retest": top_setup.get("retest_reason"),
+                    "touches": top_setup.get("touches"),
+                    "dist_atr": top_setup.get("distance_to_zone_atr"),
+                },
+                reasons_str,
+            )
 
             return self._build_analysis_result(
                 signal=signal,
@@ -933,6 +1047,75 @@ class GoldNDSAnalyzer:
             target_price, source = max(candidates, key=lambda c: c[0])
 
         return {"price": float(target_price), "source": source, "reason": "nearest_opposing_structure"}
+
+    def _score_flow_setup(
+        self,
+        zone: Dict[str, Any],
+        dist_atr: float,
+        max_dist_atr: float,
+        signal: str,
+        session_analysis: SessionAnalysis,
+        volume_analysis: Dict[str, Any],
+        signal_context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        settings = self.GOLD_SETTINGS
+        weights = settings.get("FLOW_SETUP_WEIGHTS") or {
+            "retest_quality": 0.25,
+            "freshness": 0.2,
+            "proximity": 0.2,
+            "displacement": 0.15,
+            "trend_alignment": 0.1,
+            "liquidity": 0.1,
+        }
+
+        retest_reason = str(zone.get("retest_reason", "") or "").upper()
+        retest_quality_map = {
+            "CLOSE_RECLAIM": 1.0,
+            "CLOSE_REJECT": 1.0,
+            "MID_TOUCH_DISPLACEMENT": 0.9,
+            "WICK_REJECTION": 0.8,
+            "NO_CONFIRMED_TOUCH": 0.45,
+            "FIRST_TOUCH_UNCONFIRMED": 0.35,
+            "CONSUMED_AFTER_FIRST_TOUCH": 0.25,
+        }
+        retest_quality = retest_quality_map.get(retest_reason, 0.5)
+
+        touch_count = int(zone.get("touch_count", 1))
+        freshness_map = {1: 1.0, 2: 0.75, 3: 0.55}
+        freshness = freshness_map.get(touch_count, 0.35)
+
+        proximity = 1.0 if dist_atr <= 0 else max(0.0, 1.0 - (dist_atr / max(max_dist_atr, 0.01)))
+        disp_target = float(settings.get("FLOW_SETUP_DISPLACEMENT_ATR_TARGET", 1.0))
+        displacement = min(1.0, float(zone.get("disp_atr", 0.0)) / max(disp_target, 0.01))
+
+        bias = str(signal_context.get("bias", "") or "")
+        trend_alignment = 0.7
+        if bias in {"BULLISH", "BEARISH"}:
+            trend_alignment = 1.0 if ((bias == "BULLISH" and signal == "BUY") or (bias == "BEARISH" and signal == "SELL")) else 0.4
+
+        session_weight = float(getattr(session_analysis, "session_weight", 1.0))
+        rvol = float(volume_analysis.get("rvol", 1.0))
+        liquidity = min(1.0, (0.6 * min(1.0, rvol / 1.0)) + (0.4 * min(1.0, session_weight / 1.2)))
+
+        total_weight = sum(float(w) for w in weights.values()) or 1.0
+        setup_score = (
+            float(weights.get("retest_quality", 0.0)) * retest_quality
+            + float(weights.get("freshness", 0.0)) * freshness
+            + float(weights.get("proximity", 0.0)) * proximity
+            + float(weights.get("displacement", 0.0)) * displacement
+            + float(weights.get("trend_alignment", 0.0)) * trend_alignment
+            + float(weights.get("liquidity", 0.0)) * liquidity
+        ) / total_weight
+
+        return {
+            "retest_quality": retest_quality,
+            "freshness": freshness,
+            "proximity": proximity,
+            "displacement": displacement,
+            "trend_alignment": trend_alignment,
+            "liquidity": liquidity,
+            "setup_score": setup_score,
+        }
 
     def _normalize_structure_score(self, raw_score: Optional[float]) -> float:
         """نرمال‌سازی structure_score به بازه 0..100"""
@@ -1479,7 +1662,16 @@ class GoldNDSAnalyzer:
                 util = confidence - (0.5 * dist_atr) - (0.1 * (age / max_age if max_age > 0 else 1.0))
                 if touch_count > 1:
                     util *= freshness_penalty
-                candidates.append({**zone, "dist_atr": dist_atr, "util": util})
+                setup_scores = self._score_flow_setup(
+                    zone=zone,
+                    dist_atr=dist_atr,
+                    max_dist_atr=max_dist_atr,
+                    signal=side,
+                    session_analysis=session_analysis,
+                    volume_analysis=volume_analysis,
+                    signal_context=signal_context,
+                )
+                candidates.append({**zone, "dist_atr": dist_atr, "util": util, **setup_scores})
             return candidates
 
         def _resolve_entry_model(side: str, top: float, bottom: float) -> Tuple[str, float, str]:
@@ -1547,8 +1739,18 @@ class GoldNDSAnalyzer:
         entry_confidence = 0.0
         reject_reason = "NO_ELIGIBLE_ZONE"
 
+        top_k = int(settings.get("FLOW_SETUP_TOP_K", 3))
+        runner_ups: List[Dict[str, Any]] = []
         if brk_candidates:
-            pick = max(brk_candidates, key=lambda z: float(z.get("util", 0.0)))
+            brk_candidates.sort(
+                key=lambda z: (
+                    -float(z.get("setup_score", 0.0)),
+                    float(z.get("dist_atr", 999.0)),
+                    int(z.get("age_bars", 9999)),
+                )
+            )
+            pick = brk_candidates[0]
+            runner_ups = brk_candidates[1:top_k]
             entry_type = "BREAKER"
             entry_source = pick
             entry_model, entry_level, entry_reason = _resolve_entry_model(signal, float(pick.get("top")), float(pick.get("bottom")))
@@ -1557,7 +1759,15 @@ class GoldNDSAnalyzer:
             entry_confidence = float(pick.get("confidence", 0.0))
             reject_reason = None
         elif ifvg_candidates:
-            pick = max(ifvg_candidates, key=lambda z: float(z.get("util", 0.0)))
+            ifvg_candidates.sort(
+                key=lambda z: (
+                    -float(z.get("setup_score", 0.0)),
+                    float(z.get("dist_atr", 999.0)),
+                    int(z.get("age_bars", 9999)),
+                )
+            )
+            pick = ifvg_candidates[0]
+            runner_ups = ifvg_candidates[1:top_k]
             entry_type = "IFVG"
             entry_source = pick
             entry_model, entry_level, entry_reason = _resolve_entry_model(signal, float(pick.get("top")), float(pick.get("bottom")))
@@ -1741,6 +1951,8 @@ class GoldNDSAnalyzer:
                 "retest_rejections": dict(retest_rejection_counts),
             }
         )
+        if isinstance(entry_source, dict):
+            entry_context.setdefault("setup_score", entry_source.get("setup_score"))
 
         allowed = entry_level is not None
         if allowed:
@@ -1773,6 +1985,7 @@ class GoldNDSAnalyzer:
             "reason": entry_reason,
             "reject_reason": reject_reason,
             "metrics": entry_context,
+            "runner_ups": runner_ups,
         }
 
     def _calc_entry_distance_metrics(
@@ -1940,6 +2153,26 @@ class GoldNDSAnalyzer:
         breakdown['raw_signals']['adx'] = adx_value
         breakdown['raw_signals']['rvol'] = rvol
 
+        regime_adx_max = float(settings.get("REGIME_ADX_WEAK_MAX", 18.0))
+        trend_weight_mult = float(settings.get("REGIME_TREND_WEIGHT_MULT_LOW_ADX", 0.6))
+        if adx_value < regime_adx_max:
+            trend_sub *= trend_weight_mult
+            breakdown['sub_scores']['trend'] = trend_sub
+            breakdown.setdefault('modifiers', {})
+            breakdown['modifiers']['regime_trend_weight'] = {
+                'applied': True,
+                'adx': round(adx_value, 2),
+                'threshold': round(regime_adx_max, 2),
+                'mult': round(trend_weight_mult, 3),
+            }
+        else:
+            breakdown.setdefault('modifiers', {})
+            breakdown['modifiers']['regime_trend_weight'] = {
+                'applied': False,
+                'adx': round(adx_value, 2),
+                'threshold': round(regime_adx_max, 2),
+            }
+
         fvg_sub = 0.0
         valid_fvgs = [f for f in fvgs if not f.filled]
         recent_fvgs = [f for f in valid_fvgs if (len(self.df) - 1 - f.index) <= 10]
@@ -1979,6 +2212,15 @@ class GoldNDSAnalyzer:
 
         if fvg_values:
             fvg_sub = self._bounded(sum(fvg_values) / len(fvg_values))
+        fvg_weight_mult = float(settings.get("REGIME_FVG_WEIGHT_MULT_LOW_RVOL", 0.7))
+        if rvol < 0.8:
+            fvg_sub *= fvg_weight_mult
+            breakdown.setdefault('modifiers', {})
+            breakdown['modifiers']['regime_fvg_weight'] = {
+                'applied': True,
+                'rvol': round(rvol, 2),
+                'mult': round(fvg_weight_mult, 3),
+            }
         breakdown['sub_scores']['fvg'] = fvg_sub
 
         sweep_values: List[float] = []
@@ -2035,6 +2277,15 @@ class GoldNDSAnalyzer:
                 )
 
         ob_sub = self._bounded(sum(ob_values) / len(ob_values)) if ob_values else 0.0
+        ob_weight_mult = float(settings.get("REGIME_OB_WEIGHT_MULT_LOW_RVOL", 0.7))
+        if rvol < 0.8:
+            ob_sub *= ob_weight_mult
+            breakdown.setdefault('modifiers', {})
+            breakdown['modifiers']['regime_ob_weight'] = {
+                'applied': True,
+                'rvol': round(rvol, 2),
+                'mult': round(ob_weight_mult, 3),
+            }
         breakdown['sub_scores']['order_blocks'] = ob_sub
 
         session_weight = float(session_analysis.weight)
@@ -2868,6 +3119,89 @@ class GoldNDSAnalyzer:
             result["market_metrics"]["atr_short"] = round(atr_short_value, 2)
 
         return result
+
+    def _build_analysis_trace(
+        self,
+        signal: str,
+        confidence: float,
+        score: float,
+        volume_analysis: Dict[str, Any],
+        session_analysis: SessionAnalysis,
+        signal_context: Dict[str, Any],
+        entry_idea: Dict[str, Any],
+        reasons: List[str],
+        integrity_flags: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        min_session_weight = float(self.GOLD_SETTINGS.get("MIN_SESSION_WEIGHT", 0.35))
+        min_rvol = float(self.GOLD_SETTINGS.get("MIN_RVOL_SCALPING", 0.35))
+        adx_threshold = float(self.GOLD_SETTINGS.get("ADX_THRESHOLD_WEAK", 20.0))
+
+        spread_pips = volume_analysis.get("spread_pips", volume_analysis.get("spread"))
+        max_spread_pips = volume_analysis.get("max_spread_pips", volume_analysis.get("max_spread"))
+        spread_ok = True
+        if spread_pips is not None and max_spread_pips is not None:
+            spread_ok = float(spread_pips) <= float(max_spread_pips)
+
+        session_weight = float(getattr(session_analysis, "session_weight", session_analysis.weight))
+        session_ok = bool(getattr(session_analysis, "is_active_session", True)) and session_weight >= min_session_weight
+
+        market_status = str(volume_analysis.get("market_status", "") or "").upper()
+        liquidity_ok = market_status not in {"CLOSED", "HALTED"} and float(volume_analysis.get("rvol", 1.0)) >= min_rvol
+
+        trend_ok = float(signal_context.get("adx", 0.0)) >= adx_threshold
+
+        zone = entry_idea.get("zone") if isinstance(entry_idea, dict) else None
+        setup_payload = {}
+        if isinstance(zone, dict):
+            setup_payload = {
+                "selected_zone_type": zone.get("type"),
+                "selected_zone_id": zone.get("zone_id"),
+                "retest_reason": zone.get("retest_reason"),
+                "freshness": zone.get("fresh"),
+                "touches": zone.get("touch_count"),
+                "distance_to_zone_atr": zone.get("dist_atr"),
+                "setup_score": zone.get("setup_score"),
+            }
+
+        market_state = {
+            "trend": signal_context.get("trend"),
+            "volatility_state": signal_context.get("volatility_state"),
+            "volume_zone": volume_analysis.get("volume_zone"),
+            "session": getattr(session_analysis, "current_session", None),
+        }
+
+        decision_notes = []
+        for reason in reasons:
+            if reason not in decision_notes:
+                decision_notes.append(reason)
+            if len(decision_notes) >= 8:
+                break
+        if signal == "NONE":
+            if not spread_ok:
+                decision_notes.append("gate:spread")
+            if not session_ok:
+                decision_notes.append("gate:session")
+            if not liquidity_ok:
+                decision_notes.append("gate:liquidity")
+            if not trend_ok:
+                decision_notes.append("gate:trend")
+        if integrity_flags:
+            decision_notes.extend([f"integrity:{flag}" for flag in integrity_flags])
+
+        return {
+            "signal": signal,
+            "confidence": round(float(confidence), 2),
+            "normalized_score": round(float(score), 2),
+            "market_state": market_state,
+            "gates": {
+                "spread_ok": spread_ok,
+                "session_ok": session_ok,
+                "liquidity_ok": liquidity_ok,
+                "trend_ok": trend_ok,
+            },
+            "setup": setup_payload,
+            "decision_notes": decision_notes,
+        }
 
     def _adaptive_min_rvol(self, base_min_rvol: float, structure_score: float) -> float:
         if structure_score >= 90.0:
