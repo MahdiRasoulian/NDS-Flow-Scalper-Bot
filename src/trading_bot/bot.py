@@ -1482,7 +1482,17 @@ class NDSBot:
                 )
 
                 try:
-                    self.notifier.send_signal_notification(params=finalized_params, symbol=SYMBOL)
+                        tg_payload = {
+                        "signal": signal_data.get("signal"),
+                        "entry_price": float(actual_entry_price),
+                        "stop_loss": float(actual_sl),
+                        "take_profit": float(actual_tp),
+                        "confidence": float(signal_data.get("confidence") or 0.0),
+                        "order_type": order_type,
+                        "order_ticket": order_id,
+                        "position_ticket": position_ticket,
+                    }
+                    self.notifier.send_signal_notification(params=tg_payload, symbol=SYMBOL)
                 except Exception as t_err:
                     logger.warning(f"⚠️ خطای غیربحرانی در ارسال تلگرام: {t_err}", exc_info=True)
 
