@@ -381,6 +381,8 @@ class ScalpingRiskManager:
     ) -> Tuple[SessionDecision, str]:
         if isinstance(signal_data, dict):
             payload_decision = signal_data.get("session_decision")
+            if not payload_decision and isinstance(signal_data.get("session"), dict):
+                payload_decision = signal_data.get("session")
             session_analysis = (
                 signal_data.get("session_analysis")
                 if isinstance(signal_data.get("session_analysis"), dict)
@@ -429,6 +431,10 @@ class ScalpingRiskManager:
                 pass
 
         session = signal_data.get("session")
+        if isinstance(session, dict):
+            session_name = session.get("session_name") or session.get("name")
+            if session_name:
+                return str(session_name).upper(), "payload"
         session_analysis = (
             signal_data.get("session_analysis")
             if isinstance(signal_data.get("session_analysis"), dict)
@@ -663,12 +669,19 @@ class ScalpingRiskManager:
         if analysis is None:
             return {}
         if isinstance(analysis, dict):
-            return analysis
-        if hasattr(analysis, "__dataclass_fields__"):
-            return asdict(analysis)
-        if hasattr(analysis, "__dict__"):
-            return dict(analysis.__dict__)
-        return {}
+            payload = dict(analysis)
+        elif hasattr(analysis, "__dataclass_fields__"):
+            payload = asdict(analysis)
+        elif hasattr(analysis, "__dict__"):
+            payload = dict(analysis.__dict__)
+        else:
+            return {}
+
+        if payload.get("entry_level") is None and payload.get("entry_price") is not None:
+            payload["entry_level"] = payload.get("entry_price")
+        if payload.get("entry_price") is None and payload.get("entry_level") is not None:
+            payload["entry_price"] = payload.get("entry_level")
+        return payload
 
     def _get_point_size(self, config_payload: Dict[str, Any]) -> float:
         """Resolve point size with default for XAUUSD mapping."""
@@ -870,15 +883,54 @@ class ScalpingRiskManager:
             point_source,
         )
 
+        def _finalize(
+            *,
+            signal: str,
+            order_type: str,
+            entry_price: float,
+            stop_loss: float,
+            take_profit: float,
+            lot_size: float,
+            risk_amount_usd: float,
+            rr_ratio: float,
+            deviation_pips: float,
+            decision_notes: List[str],
+            is_trade_allowed: bool,
+            reject_reason: Optional[str],
+            take_profit2: Optional[float] = None,
+        ) -> FinalizedOrderParams:
+            return FinalizedOrderParams(
+                signal=signal,
+                order_type=order_type,
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=lot_size,
+                risk_amount_usd=risk_amount_usd,
+                rr_ratio=rr_ratio,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=is_trade_allowed,
+                reject_reason=reject_reason,
+                take_profit2=take_profit2,
+                tp2=take_profit2,
+                final_entry=entry_price,
+                final_stop_loss=stop_loss,
+                final_take_profit=take_profit,
+                final_sl=stop_loss,
+                final_tp=take_profit,
+                lot=lot_size,
+            )
+
         decision_notes: List[str] = []
         analysis_reasons = analysis_payload.get('reasons') or []
         decision_notes.extend(list(analysis_reasons))
         signal = analysis_payload.get('signal')
         if not signal or signal in ['NONE', 'NEUTRAL']:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal or 'NONE',
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=0.0,
                 stop_loss=0.0,
                 take_profit=0.0,
@@ -888,10 +940,10 @@ class ScalpingRiskManager:
                 deviation_pips=0.0,
                 decision_notes=["No actionable signal from analyzer."],
                 is_trade_allowed=False,
-                reject_reason="Signal is NONE/NEUTRAL."
+                reject_reason="Signal is NONE/NEUTRAL.",
             )
 
-        planned_entry = analysis_payload.get('entry_price')
+        planned_entry = analysis_payload.get('entry_level') or analysis_payload.get('entry_price')
         stop_loss = None
         take_profit = None
         confidence = analysis_payload.get('confidence')
@@ -902,20 +954,19 @@ class ScalpingRiskManager:
         bid = live_payload.get('bid')
         ask = live_payload.get('ask')
         if bid is None or ask is None:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
-                entry_price=planned_entry,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
+                entry_price=planned_entry or 0.0,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
                 lot_size=0.0,
                 risk_amount_usd=0.0,
                 rr_ratio=0.0,
                 deviation_pips=0.0,
                 decision_notes=["Live snapshot missing bid/ask."],
                 is_trade_allowed=False,
-                reject_reason="Live prices unavailable."
+                reject_reason="Live prices unavailable.",
             )
 
         spread = float(ask) - float(bid)
@@ -933,11 +984,10 @@ class ScalpingRiskManager:
                 spread_max_pips,
                 point_size,
             )
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
-                entry_price=planned_entry,
+                entry_price=planned_entry or 0.0,
                 stop_loss=stop_loss or 0.0,
                 take_profit=take_profit or 0.0,
                 lot_size=0.0,
@@ -946,7 +996,7 @@ class ScalpingRiskManager:
                 deviation_pips=0.0,
                 decision_notes=[f"Spread too high ({spread_pips:.2f} > {spread_max_pips:.2f})"],
                 is_trade_allowed=False,
-                reject_reason="Spread too high."
+                reject_reason="Spread too high.",
             )
 
         analysis_context = analysis_payload.get('context', {}) or {}
@@ -955,19 +1005,23 @@ class ScalpingRiskManager:
             or analysis_context.get("entry_idea", {})
             or {}
         )
-        entry_model = entry_idea.get("entry_model") or analysis_payload.get("entry_model") or "MARKET"
-        planned_entry = entry_idea.get("entry_level")
+        entry_model = (
+            entry_idea.get("entry_model")
+            or analysis_payload.get("entry_model")
+            or "MARKET"
+        )
+        planned_entry = (
+            entry_idea.get("entry_level")
+            or analysis_payload.get("entry_level")
+            or analysis_payload.get("entry_price")
+        )
         market_metrics = analysis_payload.get('market_metrics') or analysis_context.get('market_metrics', {})
         atr_value = market_metrics.get('atr_short') or market_metrics.get('atr')
 
         if planned_entry is None:
-            planned_entry = analysis_payload.get('entry_price')
-
-        if planned_entry is None:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=0.0,
                 stop_loss=0.0,
                 take_profit=0.0,
@@ -977,7 +1031,7 @@ class ScalpingRiskManager:
                 deviation_pips=0.0,
                 decision_notes=["Missing entry idea from analyzer."],
                 is_trade_allowed=False,
-                reject_reason="Missing entry idea."
+                reject_reason="Missing entry idea.",
             )
 
         risk_settings = config.get('risk_settings', {})
@@ -988,10 +1042,9 @@ class ScalpingRiskManager:
         min_rr_ratio = risk_manager_config.get('MIN_RR_RATIO')
 
         if min_rr_ratio is None:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=planned_entry or 0.0,
                 stop_loss=stop_loss or 0.0,
                 take_profit=take_profit or 0.0,
@@ -1001,7 +1054,7 @@ class ScalpingRiskManager:
                 deviation_pips=0.0,
                 decision_notes=["Missing risk settings in config."],
                 is_trade_allowed=False,
-                reject_reason="Risk settings missing from config."
+                reject_reason="Risk settings missing from config.",
             )
 
         market_entry = ask if signal == 'BUY' else bid
@@ -1019,8 +1072,14 @@ class ScalpingRiskManager:
             f"PlannedEntry={planned_entry:.2f} MarketEntry={market_entry:.2f} deviation_pips={deviation_pips:.1f} conf={float(confidence):.1f}"
         )
 
-        order_type = "STOP" if str(entry_model).upper() == "STOP" else "MARKET"
-        entry_price = planned_entry if order_type == "STOP" else market_entry
+        entry_model = str(entry_model or "MARKET").upper()
+        if entry_model == "STOP":
+            order_type = "STOP"
+        elif entry_model == "LIMIT":
+            order_type = "LIMIT"
+        else:
+            order_type = "MARKET"
+        entry_price = planned_entry if order_type in ("STOP", "LIMIT") else market_entry
 
         if order_type == "STOP":
             if signal == "BUY" and planned_entry <= ask:
@@ -1029,6 +1088,15 @@ class ScalpingRiskManager:
                 entry_price = market_entry
             elif signal == "SELL" and planned_entry >= bid:
                 decision_notes.append("Stop already triggered; switching to MARKET.")
+                order_type = "MARKET"
+                entry_price = market_entry
+        elif order_type == "LIMIT":
+            if signal == "BUY" and planned_entry >= ask:
+                decision_notes.append("Limit already at/inside market; switching to MARKET.")
+                order_type = "MARKET"
+                entry_price = market_entry
+            elif signal == "SELL" and planned_entry <= bid:
+                decision_notes.append("Limit already at/inside market; switching to MARKET.")
                 order_type = "MARKET"
                 entry_price = market_entry
 
@@ -1065,10 +1133,9 @@ class ScalpingRiskManager:
             self._logger.info("[NDS][TP2_PLAN] tp2=%.2f intent=runner optional=true", float(tp2_price))
 
         if stop_loss is None or take_profit is None:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=entry_price,
                 stop_loss=stop_loss or 0.0,
                 take_profit=take_profit or 0.0,
@@ -1078,7 +1145,7 @@ class ScalpingRiskManager:
                 deviation_pips=0.0,
                 decision_notes=["Missing SL/TP from risk manager."],
                 is_trade_allowed=False,
-                reject_reason="Missing SL/TP."
+                reject_reason="Missing SL/TP.",
             )
 
         ok_dist, dist_reason = self._distance_sanity_check(
@@ -1090,10 +1157,9 @@ class ScalpingRiskManager:
         )
         if not ok_dist:
             self._logger.warning("[NDS][DIST_SANITY_FAIL] %s", dist_reason)
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -1103,7 +1169,7 @@ class ScalpingRiskManager:
                 deviation_pips=deviation_pips,
                 decision_notes=[f"Distance sanity failed: {dist_reason}"],
                 is_trade_allowed=False,
-                reject_reason="Distance sanity failed."
+                reject_reason="Distance sanity failed.",
             )
 
         # ===============================
@@ -1123,10 +1189,9 @@ class ScalpingRiskManager:
                 decision_notes.append(
                     f"Entry deviation {atr_deviation:.2f} ATR > max {max_entry_atr_deviation:.2f}."
                 )
-                return FinalizedOrderParams(
+                return _finalize(
                     signal=signal,
                     order_type='NONE',
-                    symbol=symbol,
                     entry_price=entry_price,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
@@ -1136,16 +1201,15 @@ class ScalpingRiskManager:
                     deviation_pips=deviation_pips,
                     decision_notes=decision_notes,
                     is_trade_allowed=False,
-                    reject_reason="Entry deviates beyond ATR threshold."
+                    reject_reason="Entry deviates beyond ATR threshold.",
                 )
 
         sl_distance = entry_price - stop_loss if signal == 'BUY' else stop_loss - entry_price
         tp_distance = take_profit - entry_price if signal == 'BUY' else entry_price - take_profit
         if sl_distance <= 0 or tp_distance <= 0:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -1155,7 +1219,7 @@ class ScalpingRiskManager:
                 deviation_pips=deviation_pips,
                 decision_notes=["Invalid SL/TP distances from risk model."],
                 is_trade_allowed=False,
-                reject_reason="SL/TP distances invalid for signal."
+                reject_reason="SL/TP distances invalid for signal.",
             )
 
         rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
@@ -1164,10 +1228,9 @@ class ScalpingRiskManager:
             decision_notes.append(
                 f"RR {rr_ratio:.2f} below minimum {min_rr_ratio:.2f}."
             )
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -1177,16 +1240,15 @@ class ScalpingRiskManager:
                 deviation_pips=deviation_pips,
                 decision_notes=decision_notes,
                 is_trade_allowed=False,
-                reject_reason="RR ratio below minimum."
+                reject_reason="RR ratio below minimum.",
             )
 
         account_equity = config.get('ACCOUNT_BALANCE')
         max_risk_usd = risk_settings.get('RISK_AMOUNT_USD')
         if account_equity is None or max_risk_usd is None:
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -1196,7 +1258,7 @@ class ScalpingRiskManager:
                 deviation_pips=deviation_pips,
                 decision_notes=["Missing account balance or risk amount in config."],
                 is_trade_allowed=False,
-                reject_reason="Risk amount settings missing."
+                reject_reason="Risk amount settings missing.",
             )
 
         current_session, _session_source = self._resolve_session_from_signal(analysis_payload)
@@ -1214,10 +1276,9 @@ class ScalpingRiskManager:
 
         if not risk_params.validation_passed:
             decision_notes.extend(risk_params.warnings)
-            return FinalizedOrderParams(
+            return _finalize(
                 signal=signal,
                 order_type='NONE',
-                symbol=symbol,
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -1227,7 +1288,7 @@ class ScalpingRiskManager:
                 deviation_pips=deviation_pips,
                 decision_notes=decision_notes,
                 is_trade_allowed=False,
-                reject_reason="Risk validation failed."
+                reject_reason="Risk validation failed.",
             )
 
         # ===============================
@@ -1263,14 +1324,12 @@ class ScalpingRiskManager:
             f"Final entry {entry_price:.2f} SL {stop_loss:.2f} TP {take_profit:.2f} lot {lot_size:.3f}."
         )
 
-        return FinalizedOrderParams(
+        return _finalize(
             signal=signal,
             order_type=order_type,
-            symbol=symbol,
             entry_price=entry_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            take_profit2=tp2_price,
             lot_size=lot_size,
             risk_amount_usd=risk_params.risk_amount,
             rr_ratio=rr_ratio,
@@ -1278,7 +1337,7 @@ class ScalpingRiskManager:
             decision_notes=decision_notes,
             is_trade_allowed=True,
             reject_reason=None,
-            tp2=tp2_price,
+            take_profit2=tp2_price,
         )
 
 
