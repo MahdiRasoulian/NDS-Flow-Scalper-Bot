@@ -1155,6 +1155,22 @@ class GoldNDSAnalyzer:
             k = 0.35
         return max(0.01, float(atr_value) * k)
 
+    def _percentile(self, data: List[float], pct: float) -> float:
+        """Compute percentile with linear interpolation."""
+        if not data:
+            return 50.0
+        pct = max(0.0, min(1.0, float(pct)))
+        values = sorted(float(v) for v in data)
+        if len(values) == 1:
+            return values[0]
+        idx = pct * (len(values) - 1)
+        lo = int(math.floor(idx))
+        hi = int(math.ceil(idx))
+        if lo == hi:
+            return values[lo]
+        frac = idx - lo
+        return (values[lo] * (1.0 - frac)) + (values[hi] * frac)
+
     def _resolve_point_size(self) -> Tuple[float, str]:
         default_point_size = self.GOLD_SETTINGS.get("POINT_SIZE")
         point_size, source = resolve_point_size_with_source(self.config, default=default_point_size)
@@ -1365,6 +1381,16 @@ class GoldNDSAnalyzer:
         """Single authoritative entry idea selector for Flow-tier logic."""
         base_signal = str(market_metrics.get("signal", "NONE") or "NONE")
         if base_signal not in {"BUY", "SELL"}:
+            override_entry = self._select_flow_entry_override(
+                structure=structure,
+                market_metrics=market_metrics,
+                session_analysis=session_analysis,
+                signal_context=signal_context,
+                volume_analysis=volume_analysis,
+                scalping_mode=scalping_mode,
+            )
+            if override_entry.get("signal") in {"BUY", "SELL"}:
+                return override_entry
             self._log_info(
                 "[NDS][FLOW_DECISION] tier=NONE type=NONE allowed=false reject=BASE_SIGNAL_NONE reason=no_base_signal",
             )
@@ -1413,6 +1439,110 @@ class GoldNDSAnalyzer:
             return legacy_entry
 
         return flow_entry
+
+    def _select_flow_entry_override(
+        self,
+        structure: MarketStructure,
+        market_metrics: Dict[str, Any],
+        session_analysis: SessionAnalysis,
+        signal_context: Dict[str, Any],
+        volume_analysis: Dict[str, Any],
+        scalping_mode: bool,
+    ) -> Dict[str, Any]:
+        """Allow high-quality flow setups to override a neutral base score."""
+        settings = self.GOLD_SETTINGS
+        current_price = float(market_metrics.get("current_price", 0.0) or 0.0)
+        atr_value = float(market_metrics.get("atr_short") or market_metrics.get("atr") or 0.0)
+        adx_value = float(market_metrics.get("adx") or 0.0)
+
+        min_setup = float(settings.get("FLOW_OVERRIDE_MIN_SETUP_SCORE", 0.7))
+        min_conf = float(settings.get("FLOW_OVERRIDE_MIN_CONFIDENCE", 0.6))
+        max_touches = int(settings.get("FLOW_OVERRIDE_MAX_TOUCHES", settings.get("FLOW_MAX_TOUCHES", 5)))
+        ct_bonus = float(settings.get("FLOW_OVERRIDE_COUNTERTREND_SCORE_BONUS", 0.08))
+        allowed_retests = {
+            "CLOSE_RECLAIM",
+            "CLOSE_REJECT",
+            "WICK_REJECTION",
+            "MID_TOUCH_DISPLACEMENT",
+        }
+
+        candidates = []
+        for side in ("BUY", "SELL"):
+            entry = self._select_flow_entry(
+                signal=side,
+                structure=structure,
+                current_price=current_price,
+                atr_value=atr_value,
+                adx_value=adx_value,
+                session_analysis=session_analysis,
+                volume_analysis=volume_analysis,
+                scalping_mode=scalping_mode,
+                signal_context=signal_context,
+            )
+            if entry.get("signal") not in {"BUY", "SELL"}:
+                continue
+
+            zone = entry.get("zone") if isinstance(entry, dict) else None
+            if not isinstance(zone, dict):
+                continue
+
+            retest_reason = str(zone.get("retest_reason") or "").upper()
+            touch_count = int(zone.get("touch_count", 0))
+            setup_score = zone.get("setup_score")
+            if setup_score is None and isinstance(entry.get("metrics"), dict):
+                setup_score = entry["metrics"].get("setup_score")
+            setup_score = float(setup_score or 0.0)
+            entry_conf = float(entry.get("confidence", 0.0) or 0.0)
+
+            if retest_reason and retest_reason not in allowed_retests:
+                continue
+            if touch_count > max_touches:
+                continue
+
+            bias = str(signal_context.get("bias", "") or "")
+            strong_trend = bool(signal_context.get("strong_trend"))
+            reversal_ok = bool(signal_context.get("reversal_ok"))
+            counter_trend = (bias == "BULLISH" and side == "SELL") or (bias == "BEARISH" and side == "BUY")
+            required_setup = min_setup + (ct_bonus if (counter_trend and strong_trend and not reversal_ok) else 0.0)
+
+            if setup_score < required_setup or entry_conf < min_conf:
+                continue
+
+            entry.setdefault("metrics", {})
+            entry["metrics"]["override"] = True
+            entry["metrics"]["override_reason"] = "flow_override"
+            entry["reason"] = f"{entry.get('reason', 'flow_override')} | override"
+            candidates.append(entry)
+
+        if not candidates:
+            return {
+                "signal": "NONE",
+                "tier": "NONE",
+                "entry_type": "NONE",
+                "entry_model": "NONE",
+                "entry_level": None,
+                "zone": None,
+                "confidence": 0.0,
+                "reason": "flow_override_no_match",
+                "reject_reason": "BASE_SIGNAL_NONE",
+                "metrics": {},
+            }
+
+        candidates.sort(
+            key=lambda e: (
+                -float((e.get("zone") or {}).get("setup_score", 0.0) or 0.0),
+                -float(e.get("confidence", 0.0) or 0.0),
+            )
+        )
+        best = candidates[0]
+        self._log_info(
+            "[NDS][FLOW_OVERRIDE] signal=%s setup_score=%.2f conf=%.2f reason=%s",
+            best.get("signal"),
+            float((best.get("zone") or {}).get("setup_score", 0.0) or 0.0),
+            float(best.get("confidence", 0.0) or 0.0),
+            best.get("reason"),
+        )
+        return best
 
     def _select_legacy_entry_idea(
         self,
@@ -2932,6 +3062,31 @@ class GoldNDSAnalyzer:
             except Exception:
                 # never let config parsing break signal generation
                 pass
+
+            threshold_mode = str(settings.get("SIGNAL_THRESHOLD_MODE", "STATIC") or "STATIC").upper()
+            if scalping_mode:
+                threshold_mode = str(settings.get("SCALPING_THRESHOLD_MODE", threshold_mode) or threshold_mode).upper()
+            if threshold_mode == "PERCENTILE":
+                hist = list(self._score_hist)
+                min_hist = int(settings.get("SIGNAL_MIN_HISTORY", 60))
+                if len(hist) >= min_hist:
+                    buy_pct = float(settings.get("SIGNAL_BUY_PERCENTILE", 0.8))
+                    sell_pct = float(settings.get("SIGNAL_SELL_PERCENTILE", 0.2))
+                    buy_threshold = self._percentile(hist, buy_pct)
+                    sell_threshold = self._percentile(hist, sell_pct)
+                    min_spread = float(settings.get("SIGNAL_MIN_THRESHOLD_SPREAD", 3.0))
+                    if (buy_threshold - sell_threshold) < min_spread:
+                        mid = (buy_threshold + sell_threshold) / 2.0
+                        buy_threshold = mid + (min_spread / 2.0)
+                        sell_threshold = mid - (min_spread / 2.0)
+                    self._log_debug(
+                        "[NDS][THRESH] mode=percentile n=%s buy_pct=%.2f sell_pct=%.2f buy=%.2f sell=%.2f",
+                        len(hist),
+                        buy_pct,
+                        sell_pct,
+                        buy_threshold,
+                        sell_threshold,
+                    )
 
             # Safety: ensure thresholds are sensible
             try:

@@ -287,6 +287,7 @@ class SMCAnalyzer:
         min_separation = max(min_separation, cooldown_bars)
         exit_confirm_bars = max(1, int(self.settings.get("FLOW_TOUCH_EXIT_CONFIRM_BARS", 2)))
         window_limit = self.settings.get("FLOW_TOUCH_COUNT_WINDOW_BARS")
+        touch_window_mode = str(self.settings.get("FLOW_TOUCH_COUNT_MODE", "BREAK_WINDOW") or "BREAK_WINDOW").upper()
         end_idx = len(df)
         if window_limit is not None:
             try:
@@ -294,7 +295,10 @@ class SMCAnalyzer:
             except (TypeError, ValueError):
                 window_limit = None
         if window_limit and window_limit > 0:
-            end_idx = min(len(df), start_idx + window_limit)
+            if touch_window_mode == "ROLLING_WINDOW":
+                start_idx = max(start_idx, max(0, len(df) - window_limit))
+            else:
+                end_idx = min(len(df), start_idx + window_limit)
         for j in range(start_idx, end_idx):
             high = float(df["high"].iloc[j])
             low = float(df["low"].iloc[j])
@@ -466,7 +470,79 @@ class SMCAnalyzer:
             min_size_atr,
             max_age,
         )
-        return trimmed
+        if trimmed:
+            return trimmed
+
+        relax_mult = float(self.settings.get("SMC_OB_RELAX_MIN_SIZE_MULT", 0.7))
+        fallback_top_k = int(self.settings.get("SMC_OB_FALLBACK_TOP_K", 3))
+        relaxed_min_size_atr = max(0.01, min_size_atr * max(0.1, relax_mult))
+        self._log_info(
+            "[NDS][SMC][OB] relax filters raw=%s relax_min_size_atr=%.3f fallback_top_k=%s",
+            total_raw,
+            relaxed_min_size_atr,
+            fallback_top_k,
+        )
+
+        relaxed_filtered: List[Tuple[OrderBlock, float, int]] = []
+        for ob in order_blocks:
+            age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
+            size = abs(float(getattr(ob, "high", 0.0)) - float(getattr(ob, "low", 0.0)))
+            size_atr = size / atr_value if atr_value > 0 else 0.0
+            if age > max_age:
+                continue
+            dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
+            if dist_atr > max_dist_atr:
+                continue
+            if size_atr < relaxed_min_size_atr:
+                continue
+            recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
+            strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
+            size_score = min(1.0, size_atr / max(relaxed_min_size_atr, 0.01))
+            proximity = max(0.0, 1.0 - (dist_atr / max_dist_atr if max_dist_atr > 0 else 1.0))
+            score = (
+                ob_weights.get("strength", 0.45) * strength_score
+                + ob_weights.get("recency", 0.25) * recency
+                + ob_weights.get("proximity", 0.2) * proximity
+                + ob_weights.get("size", 0.1) * size_score
+            )
+            relaxed_filtered.append((ob, score, age))
+
+        relaxed_filtered.sort(key=lambda item: (-item[1], item[2], item[0].index))
+        trimmed_relaxed = [item[0] for item in relaxed_filtered[:max(1, fallback_top_k)]]
+        if trimmed_relaxed:
+            self._log_info(
+                "[NDS][SMC][OB] relaxed kept=%s fallback_top_k=%s",
+                len(trimmed_relaxed),
+                fallback_top_k,
+            )
+            return trimmed_relaxed
+
+        fallback_candidates: List[Tuple[OrderBlock, float, int]] = []
+        for ob in order_blocks:
+            age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
+            if age > max_age:
+                continue
+            dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
+            if dist_atr > max_dist_atr:
+                continue
+            strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
+            recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
+            proximity = max(0.0, 1.0 - (dist_atr / max_dist_atr if max_dist_atr > 0 else 1.0))
+            score = (
+                ob_weights.get("strength", 0.6) * strength_score
+                + ob_weights.get("recency", 0.25) * recency
+                + ob_weights.get("proximity", 0.15) * proximity
+            )
+            fallback_candidates.append((ob, score, age))
+
+        fallback_candidates.sort(key=lambda item: (-item[1], item[2], item[0].index))
+        trimmed_fallback = [item[0] for item in fallback_candidates[:max(1, fallback_top_k)]]
+        self._log_info(
+            "[NDS][SMC][OB] fallback kept=%s fallback_top_k=%s",
+            len(trimmed_fallback),
+            fallback_top_k,
+        )
+        return trimmed_fallback
 
     def _scan_zone_touches(
         self,
@@ -504,6 +580,7 @@ class SMCAnalyzer:
         early_retest_reason: Optional[str] = None
         early_retest_idx: Optional[int] = None
         window_limit = self.settings.get("FLOW_TOUCH_COUNT_WINDOW_BARS")
+        touch_window_mode = str(self.settings.get("FLOW_TOUCH_COUNT_MODE", "BREAK_WINDOW") or "BREAK_WINDOW").upper()
         end_idx = len(df)
         if window_limit is not None:
             try:
@@ -511,7 +588,10 @@ class SMCAnalyzer:
             except (TypeError, ValueError):
                 window_limit = None
         if window_limit and window_limit > 0:
-            end_idx = min(len(df), start_idx + window_limit)
+            if touch_window_mode == "ROLLING_WINDOW":
+                start_idx = max(start_idx, max(0, len(df) - window_limit))
+            else:
+                end_idx = min(len(df), start_idx + window_limit)
 
         for j in range(start_idx, end_idx):
             if stop_scanning:
