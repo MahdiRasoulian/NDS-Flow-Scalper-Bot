@@ -477,7 +477,10 @@ class GoldNDSAnalyzer:
             optimal_trading=session_info.get(
                 'optimal_trading',
                 session_info.get('weight', 0.5) >= 1.2
-            )
+            ),
+            ts_broker=broker_time if isinstance(broker_time, datetime) else None,
+            time_mode=self.time_mode,
+            broker_utc_offset_hours=self.broker_utc_offset,
         )
 
         # لاگ ارتقا یافته: active و دلیل untradable هم چاپ می‌شود
@@ -3078,6 +3081,18 @@ class GoldNDSAnalyzer:
             "confidence": confidence,
             "score": round(score, 1),
             "reasons": reasons[:8],
+            "session": getattr(session_analysis, "current_session", None),
+            "session_activity": getattr(session_analysis, "session_activity", None),
+            "ts_broker": (
+                session_analysis.ts_broker.isoformat()
+                if getattr(session_analysis, "ts_broker", None) is not None
+                else None
+            ),
+            "time_mode": getattr(session_analysis, "time_mode", None),
+            "broker_utc_offset_hours": getattr(session_analysis, "broker_utc_offset_hours", None),
+            "adx": float(adx_value),
+            "plus_di": float(plus_di),
+            "minus_di": float(minus_di),
             "structure": {
                 "trend": structure.trend.value,
                 "bos": structure.bos,
@@ -3108,6 +3123,14 @@ class GoldNDSAnalyzer:
                 "is_active_session": session_analysis.is_active_session,
                 "optimal_trading": session_analysis.optimal_trading,
                 "weight": session_analysis.weight,
+                "session_activity": session_analysis.session_activity,
+                "ts_broker": (
+                    session_analysis.ts_broker.isoformat()
+                    if session_analysis.ts_broker is not None
+                    else None
+                ),
+                "time_mode": session_analysis.time_mode,
+                "broker_utc_offset_hours": session_analysis.broker_utc_offset_hours,
             },
             "timestamp": datetime.now().isoformat(),
             "current_price": current_price,

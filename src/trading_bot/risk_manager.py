@@ -182,6 +182,8 @@ class ScalpingRiskManager:
 
         self.last_signal_confidence = 0.0
         self.last_adx = 0.0
+        self.last_session = "UNKNOWN"
+        self._unknown_session_logged = False
 
 
 
@@ -318,23 +320,47 @@ class ScalpingRiskManager:
         return merged_config
 
     # ==================== متدهای کمکی سشن‌ها ====================
-    @staticmethod
-    def get_current_scalping_session(dt: datetime = None) -> str:
+    def get_current_scalping_session(
+        self,
+        dt: datetime = None,
+        time_mode: Optional[str] = None,
+        broker_utc_offset_hours: Optional[float] = None,
+    ) -> str:
         """
         Detect current scalping session based on broker trading time.
         """
-        time_mode = str(get_setting(config, "trading_settings.TIME_MODE", "BROKER") or "BROKER").upper()
-        offset = float(get_setting(config, "trading_settings.BROKER_UTC_OFFSET_HOURS", 2) or 2)
+        resolved_mode = str(
+            time_mode
+            or get_setting(config, "trading_settings.TIME_MODE", "BROKER")
+            or "BROKER"
+        ).upper()
+        resolved_offset = float(
+            broker_utc_offset_hours
+            if broker_utc_offset_hours is not None
+            else get_setting(config, "trading_settings.BROKER_UTC_OFFSET_HOURS", 2) or 2
+        )
+        raw_dt = dt
         if dt is None:
-            dt = get_broker_now(offset)
+            dt = get_broker_now(resolved_offset)
         else:
             parsed = parse_timestamp(dt) or dt
-            dt = to_broker_time(parsed, offset, time_mode)
+            dt = to_broker_time(parsed, resolved_offset, resolved_mode)
 
         sessions = get_setting(config, "sessions_config.SCALPING_SESSIONS", {})
         definitions = normalize_session_definitions(sessions)
         session_info = classify_session(dt, definitions)
         session = session_info.get("session", "UNKNOWN")
+        if session == "UNKNOWN" and not self._unknown_session_logged:
+            self._unknown_session_logged = True
+            self._logger.warning(
+                "[RISK][SESSION][UNKNOWN] dt_raw=%s dt_broker=%s mode=%s offset=%.2f definitions=%s result=%s",
+                raw_dt,
+                dt,
+                resolved_mode,
+                resolved_offset,
+                list(definitions.keys()),
+                session_info,
+            )
         return "DEAD_ZONE" if session == "UNKNOWN" else session
 
     @staticmethod
@@ -364,10 +390,110 @@ class ScalpingRiskManager:
         multipliers = self.settings.get('SCALPING_SESSION_MULTIPLIERS', {})
 
         # مقادیر از 0.1 (Dead Zone) تا 1.0 (Overlap) متغیر هستند
-        multiplier = multipliers.get(session, 0.5)
+        if session in multipliers:
+            multiplier = multipliers.get(session)
+        elif session == "DEAD_ZONE":
+            multiplier = multipliers.get("DEAD_ZONE", 0.1)
+        else:
+            multiplier = 0.1
 
         self._logger.debug(f"🔍 Scalping Session Multiplier for {session}: {multiplier}")
         return multiplier
+
+    def _resolve_session_from_signal(
+        self,
+        signal_data: Optional[Dict[str, Any]],
+    ) -> Tuple[str, str]:
+        if not isinstance(signal_data, dict):
+            return self.get_current_scalping_session(), "fallback"
+
+        session = signal_data.get("session")
+        session_analysis = (
+            signal_data.get("session_analysis")
+            if isinstance(signal_data.get("session_analysis"), dict)
+            else {}
+        )
+        if not session:
+            session = session_analysis.get("current_session")
+        if not session:
+            analysis_trace = (
+                signal_data.get("analysis_trace")
+                if isinstance(signal_data.get("analysis_trace"), dict)
+                else {}
+            )
+            market_state = (
+                analysis_trace.get("market_state")
+                if isinstance(analysis_trace.get("market_state"), dict)
+                else {}
+            )
+            session = market_state.get("session")
+        if session:
+            return str(session).upper(), "payload"
+
+        ts_broker = signal_data.get("ts_broker") or session_analysis.get("ts_broker")
+        time_mode = signal_data.get("time_mode") or session_analysis.get("time_mode")
+        offset = signal_data.get("broker_utc_offset_hours")
+        if offset is None:
+            offset = session_analysis.get("broker_utc_offset_hours")
+        return (
+            self.get_current_scalping_session(
+                dt=ts_broker,
+                time_mode=time_mode,
+                broker_utc_offset_hours=offset,
+            ),
+            "fallback",
+        )
+
+    def _resolve_adx_from_signal(
+        self,
+        signal_data: Optional[Dict[str, Any]],
+    ) -> Tuple[float, str]:
+        if not isinstance(signal_data, dict):
+            return 0.0, "missing"
+
+        def _get_nested(payload: Dict[str, Any], path: str) -> Any:
+            current: Any = payload
+            for part in path.split("."):
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(part)
+            return current
+
+        candidates = [
+            ("payload", signal_data.get("adx")),
+            ("payload", signal_data.get("ADX")),
+            ("payload", signal_data.get("adx_value")),
+            ("payload", _get_nested(signal_data, "market_metrics.adx")),
+            ("legacy", _get_nested(signal_data, "indicators.adx")),
+            ("legacy", _get_nested(signal_data, "indicators.adx_value")),
+            ("legacy", _get_nested(signal_data, "indicators.adx_analysis.adx")),
+            ("legacy", _get_nested(signal_data, "analysis_trace.indicators.adx")),
+            ("legacy", _get_nested(signal_data, "analysis_trace.market_state.adx")),
+            ("legacy", _get_nested(signal_data, "context.market_metrics.adx")),
+        ]
+
+        for source, value in candidates:
+            if value is None:
+                continue
+            try:
+                adx_val = float(value or 0.0)
+            except Exception:
+                continue
+            if adx_val > 0:
+                return adx_val, source
+        return 0.0, "missing"
+
+    def _resolve_confidence_from_signal(self, signal_data: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(signal_data, dict):
+            return float(getattr(self, "last_signal_confidence", 0.0) or 0.0)
+        for key in ("confidence", "conf", "confidence_pct"):
+            if signal_data.get(key) is None:
+                continue
+            try:
+                return float(signal_data.get(key) or 0.0)
+            except Exception:
+                continue
+        return float(getattr(self, "last_signal_confidence", 0.0) or 0.0)
 
     def get_max_holding_time(self, session: str) -> int:
         """دریافت حداکثر زمان نگهداری بر اساس سشن (دقیقه)."""
@@ -967,15 +1093,8 @@ class ScalpingRiskManager:
         except Exception:
             self.last_signal_confidence = 0.0
 
-        adx_val = market_metrics.get('adx')
-        if adx_val is None:
-            # تلاش برای پیدا کردن ADX در payloadهای دیگر (اگر موجود باشد)
-            adx_val = analysis_payload.get('adx') or analysis_context.get('adx')
-
-        try:
-            self.last_adx = float(adx_val) if adx_val is not None else 0.0
-        except Exception:
-            self.last_adx = 0.0
+        adx_val, _adx_source = self._resolve_adx_from_signal(analysis_payload)
+        self.last_adx = float(adx_val or 0.0)
 
         if atr_value and max_entry_atr_deviation is not None:
             atr_deviation = deviation / atr_value if atr_value > 0 else 0.0
@@ -1059,7 +1178,7 @@ class ScalpingRiskManager:
                 reject_reason="Risk amount settings missing."
             )
 
-        current_session = self.get_current_scalping_session()
+        current_session, _session_source = self._resolve_session_from_signal(analysis_payload)
         risk_params = self.calculate_scalping_position_size(
             account_equity=account_equity,
             entry_price=entry_price,
@@ -1404,11 +1523,19 @@ class ScalpingRiskManager:
 
         self._logger.info(f"Scalping trade result: PnL=${profit_loss:.2f}, Daily PnL=${self.daily_profit_loss:.2f}")
 
-    def can_scalp(self, account_equity: float) -> Tuple[bool, str]:
+    def can_scalp(
+        self,
+        account_equity: float,
+        signal_data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
         """
         بررسی امکان اسکلپینگ جدید با تنظیمات مپ شده
         - بدون حذف منطق‌های قبلی
         - با DEAD_ZONE override واقعی و enforce شده
+
+        canonical payload keys (preferred in signal_data):
+        - session, session_activity, ts_broker, time_mode, broker_utc_offset_hours
+        - adx, plus_di, minus_di, confidence, score
         """
         reasons = []
         s = self.settings
@@ -1448,7 +1575,7 @@ class ScalpingRiskManager:
         # ===============================
         # 5. Scalping Session Handling (FIXED / ENFORCED)
         # ===============================
-        current_session = self.get_current_scalping_session()
+        current_session, session_source = self._resolve_session_from_signal(signal_data)
 
         # --- LOG: وضعیت سشن و ورودی‌های تصمیم ---
         try:
@@ -1456,12 +1583,24 @@ class ScalpingRiskManager:
         except Exception:
             friendly = False
 
-        confidence = float(getattr(self, 'last_signal_confidence', 0.0) or 0.0)
-        adx = float(getattr(self, 'last_adx', 0.0) or 0.0)
+        confidence = self._resolve_confidence_from_signal(signal_data)
+        adx, adx_source = self._resolve_adx_from_signal(signal_data)
+
+        self.last_signal_confidence = float(confidence or 0.0)
+        self.last_adx = float(adx or 0.0)
+        self.last_session = str(current_session or "UNKNOWN")
+
+        if adx_source == "missing":
+            self._logger.warning("[RISK][ADX] missing in payload; defaulting to 0.0")
 
         self._logger.info(
-            "[RISK][SESSION] current_session=%s friendly=%s last_conf=%.1f last_adx=%.1f",
-            current_session, friendly, confidence, adx
+            "[RISK][SESSION] current_session=%s(source=%s) friendly=%s last_conf=%.1f adx=%.1f(source=%s)",
+            current_session,
+            session_source,
+            friendly,
+            confidence,
+            adx,
+            adx_source,
         )
 
         # ✅ CRITICAL FIX:

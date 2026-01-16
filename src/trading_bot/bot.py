@@ -239,6 +239,39 @@ class NDSBot:
                     market_metrics[dst_k] = ctx.get(src_k)
         d["market_metrics"] = market_metrics
 
+        # --- canonical session/time keys ---
+        if not d.get("session_analysis") and isinstance(ctx.get("session_analysis"), dict):
+            d["session_analysis"] = ctx.get("session_analysis")
+        session_analysis = d.get("session_analysis") if isinstance(d.get("session_analysis"), dict) else {}
+        if not d.get("session"):
+            d["session"] = session_analysis.get("current_session")
+        if not d.get("session") and ctx.get("session") is not None:
+            d["session"] = ctx.get("session")
+        if not d.get("session_activity"):
+            d["session_activity"] = session_analysis.get("session_activity")
+        if not d.get("session_activity") and ctx.get("session_activity") is not None:
+            d["session_activity"] = ctx.get("session_activity")
+        if not d.get("ts_broker"):
+            d["ts_broker"] = session_analysis.get("ts_broker")
+        if not d.get("ts_broker") and ctx.get("ts_broker") is not None:
+            d["ts_broker"] = ctx.get("ts_broker")
+        if not d.get("time_mode"):
+            d["time_mode"] = session_analysis.get("time_mode")
+        if not d.get("time_mode") and ctx.get("time_mode") is not None:
+            d["time_mode"] = ctx.get("time_mode")
+        if d.get("broker_utc_offset_hours") is None:
+            d["broker_utc_offset_hours"] = session_analysis.get("broker_utc_offset_hours")
+        if d.get("broker_utc_offset_hours") is None and ctx.get("broker_utc_offset_hours") is not None:
+            d["broker_utc_offset_hours"] = ctx.get("broker_utc_offset_hours")
+
+        # --- canonical indicator keys ---
+        if d.get("adx") is None:
+            d["adx"] = market_metrics.get("adx")
+        if d.get("plus_di") is None:
+            d["plus_di"] = market_metrics.get("plus_di")
+        if d.get("minus_di") is None:
+            d["minus_di"] = market_metrics.get("minus_di")
+
         # --- structure ---
         structure = d.get("structure") if isinstance(d.get("structure"), dict) else {}
         if ctx and isinstance(ctx.get("structure"), dict):
@@ -274,6 +307,32 @@ class NDSBot:
             d["scalping_mode"] = True
 
         return d
+
+    def _extract_adx_value(self, result: Dict[str, Any]) -> float:
+        """Extract ADX from normalized analyzer payload with legacy fallbacks."""
+        if not isinstance(result, dict):
+            return 0.0
+        adx_candidates = [
+            result.get("adx"),
+            result.get("ADX"),
+            result.get("adx_value"),
+        ]
+        market_metrics = result.get("market_metrics") if isinstance(result.get("market_metrics"), dict) else {}
+        adx_candidates.append(market_metrics.get("adx"))
+        indicators = result.get("indicators") if isinstance(result.get("indicators"), dict) else {}
+        adx_candidates.append(indicators.get("adx"))
+        adx_candidates.append(indicators.get("adx_value"))
+        adx_analysis = indicators.get("adx_analysis") if isinstance(indicators.get("adx_analysis"), dict) else {}
+        adx_candidates.append(adx_analysis.get("adx"))
+
+        for candidate in adx_candidates:
+            if candidate is None:
+                continue
+            try:
+                return float(candidate or 0.0)
+            except Exception:
+                continue
+        return 0.0
 
     def _normalize_signal(self, signal_value: str) -> str:
         """
@@ -598,24 +657,9 @@ class NDSBot:
             untradable_reasons = str(sess.get("untradable_reasons", "-"))
 
             # --- استخراج ADX به شکل مقاوم (برای DEAD_ZONE override در RiskManager) ---
-            # چون خروجی analyzer ممکن است کلیدهای متفاوت داشته باشد، چند مسیر را پوشش می‌دهیم.
-            adx_value = 0.0
-            try:
-                if result.get("adx") is not None:
-                    adx_value = float(result.get("adx") or 0.0)
-                elif result.get("adx_value") is not None:
-                    adx_value = float(result.get("adx_value") or 0.0)
-                else:
-                    ind = result.get("indicators") or {}
-                    if isinstance(ind, dict):
-                        if ind.get("adx") is not None:
-                            adx_value = float(ind.get("adx") or 0.0)
-                        elif ind.get("adx_value") is not None:
-                            adx_value = float(ind.get("adx_value") or 0.0)
-                        elif ind.get("adx_analysis") and isinstance(ind.get("adx_analysis"), dict):
-                            adx_value = float(ind["adx_analysis"].get("adx", 0.0) or 0.0)
-            except Exception:
-                adx_value = 0.0
+            adx_value = self._extract_adx_value(result)
+            if result.get("adx") is None:
+                result["adx"] = adx_value
 
             # --- منطق تصمیم‌گیری (Decision Logic) ---
             final_signal = analyzer_signal
@@ -677,6 +721,13 @@ class NDSBot:
                         # اگر به هر دلیل attribute set نشد، اجازه نمی‌دهیم سیکل کرش کند
                         pass
 
+                    logger.info(
+                        "[BOT][RISK][PAYLOAD] session=%s adx=%.1f ts_broker=%s",
+                        result.get("session"),
+                        float(adx_value or 0.0),
+                        result.get("ts_broker"),
+                    )
+
                     # ✅ لاگ برای اثبات اینکه RiskManager مقدار واقعی دریافت کرده
                     logger.info(
                         "[RISK][SESSION] session=%s weight=%.2f act=%s untradable=%s | "
@@ -698,7 +749,10 @@ class NDSBot:
                             float(getattr(self.risk_manager, "last_adx", 0.0) or 0.0),
                         )
 
-                    can_trade, reason = self.risk_manager.can_scalp(account_equity=ACCOUNT_BALANCE)
+                    can_trade, reason = self.risk_manager.can_scalp(
+                        account_equity=ACCOUNT_BALANCE,
+                        signal_data=result,
+                    )
                     if not can_trade:
                         logger.info(f"⏸️ ریسک منیجر: {reason}")
                         return
