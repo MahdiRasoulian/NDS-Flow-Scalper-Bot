@@ -1,16 +1,16 @@
 {
   "bot_name": "NDS Trading Bot Pro",
   "version": "5.2",
-  "ACCOUNT_BALANCE": 873.53,
+  "ACCOUNT_BALANCE": 1000.00,
   "trading_rules": {
-    "MIN_CANDLES_BETWEEN_TRADES": 10,
+    "MIN_CANDLES_BETWEEN_TRADES": 4,
     "MAX_POSITIONS": 5,
     "ALLOW_MULTIPLE_POSITIONS": true,
     "WAIT_FOR_CLOSE_BEFORE_NEW_TRADE": false,
     "DAILY_MAX_TRADES": 40,
     "MAX_CONSECUTIVE_LOSSES": 3,
-    "MIN_CANDLES_BETWEEN": 10,
-    "MIN_TIME_BETWEEN_TRADES_MINUTES": 60
+    "MIN_CANDLES_BETWEEN": 4,
+    "MIN_TIME_BETWEEN_TRADES_MINUTES": 20
   },
   "risk_settings": {
     "RISK_PERCENT": 1.2,
@@ -42,7 +42,7 @@
     "ENABLE_DRY_RUN": false,
     "ENABLE_RISK_MANAGER": true,
     "SYMBOL": "XAUUSD!",
-    "TIMEFRAME": "M15",
+    "TIMEFRAME": "M5",
     "ANALYSIS_INTERVAL_MINUTES": 0.1,
     "BARS_TO_FETCH": 800,
     "TICK_UPDATE_INTERVAL": 1.0,
