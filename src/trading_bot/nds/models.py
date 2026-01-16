@@ -160,6 +160,12 @@ class SessionAnalysis:
     ts_broker: Optional[datetime] = None
     time_mode: Optional[str] = None
     broker_utc_offset_hours: Optional[float] = None
+    policy_mode: Optional[str] = None
+    is_tradable: Optional[bool] = None
+    block_reason: Optional[str] = None
+    untradable: bool = False
+    untradable_reasons: Optional[str] = None
+    session_decision: Optional[Dict[str, Any]] = None
 
 @dataclass
 class MarketMetrics:
