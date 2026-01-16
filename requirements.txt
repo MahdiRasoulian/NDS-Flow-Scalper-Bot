@@ -11,3 +11,4 @@ scipy
 colorama
 tqdm
 requests
+python-dotenv
