@@ -38,12 +38,20 @@ def main() -> int:
     spread_points = float(normalized.get("spread_points") or 0.0)
     spread_pips = float(normalized.get("spread_pips") or 0.0)
 
+    normalized_points = normalize_spread(19, point_size=point_size, pip_size=pip_size, raw_unit="points")
+    legacy_price = float(normalized_points.get("spread_price") or 0.0)
+    legacy_pips = float(normalized_points.get("spread_pips") or 0.0)
+
     if not _is_close(spread_price, 0.19):
         raise AssertionError(f"Expected spread_price 0.19, got {spread_price}")
     if not _is_close(spread_points, 19.0):
         raise AssertionError(f"Expected spread_points 19.0, got {spread_points}")
     if not _is_close(spread_pips, 1.9):
         raise AssertionError(f"Expected spread_pips 1.9, got {spread_pips}")
+    if not _is_close(legacy_price, 0.19):
+        raise AssertionError(f"Expected legacy spread_price 0.19, got {legacy_price}")
+    if not _is_close(legacy_pips, 1.9):
+        raise AssertionError(f"Expected legacy spread_pips 1.9, got {legacy_pips}")
 
     max_spread_pips = 2.5
     if spread_pips > max_spread_pips:
