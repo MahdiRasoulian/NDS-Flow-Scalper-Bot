@@ -13,6 +13,7 @@ import signal
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
+from dotenv import load_dotenv
 
 
 # ------------------------------------------------------------
