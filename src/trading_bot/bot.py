@@ -1482,7 +1482,7 @@ class NDSBot:
                 )
 
                 try:
-                    self.notifier.send_signal_notification(params=signal_data, symbol=SYMBOL)
+                    self.notifier.send_signal_notification(params=finalized_params, symbol=SYMBOL)
                 except Exception as t_err:
                     logger.warning(f"⚠️ خطای غیربحرانی در ارسال تلگرام: {t_err}", exc_info=True)
 
