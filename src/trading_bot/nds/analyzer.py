@@ -540,6 +540,10 @@ class GoldNDSAnalyzer:
             point_size,
             source,
         )
+        self._log_info(
+            "[NDS][PIP_SIZE] pip_size=%.4f",
+            pip_size,
+        )
 
         try:
             atr_window = self.GOLD_SETTINGS.get('ATR_WINDOW', 14)
@@ -983,15 +987,18 @@ class GoldNDSAnalyzer:
         if "spread_price" in self.df.columns:
             raw_spread = self.df["spread_price"].iloc[-1]
             raw_unit = "price"
-        elif "spread" in self.df.columns:
-            raw_spread = self.df["spread"].iloc[-1]
-            raw_unit = "price"
-        elif "spread_points" in self.df.columns:
-            raw_spread = self.df["spread_points"].iloc[-1]
-            raw_unit = "points"
         elif "spread_pips" in self.df.columns:
             raw_spread = self.df["spread_pips"].iloc[-1]
             raw_unit = "pips"
+        elif "spread_points" in self.df.columns:
+            raw_spread = self.df["spread_points"].iloc[-1]
+            raw_unit = "points"
+        elif "spread" in self.df.columns:
+            raw_spread = self.df["spread"].iloc[-1]
+            raw_unit = "points"
+
+        if raw_spread is None:
+            return {}
 
         normalized = normalize_spread(raw_spread, point_size, pip_size, raw_unit or "price")
         if normalized.get("spread_price") is None:
@@ -999,9 +1006,10 @@ class GoldNDSAnalyzer:
 
         max_spread_pips = float(self.GOLD_SETTINGS.get("SPREAD_MAX_PIPS", 2.5))
         self._log_info(
-            "[NDS][SPREAD][NORMALIZE] raw_spread=%s spread_price=%.4f spread_points=%.2f spread_pips=%.2f "
-            "point_size=%.4f pip_size=%.4f max_spread_pips=%.2f",
+            "[NDS][SPREAD][NORMALIZE] raw_spread=%s raw_unit=%s spread_price=%.4f spread_points=%.2f "
+            "spread_pips=%.2f point_size=%.4f pip_size=%.4f max_spread_pips=%.2f",
             normalized.get("raw_spread"),
+            normalized.get("raw_unit"),
             float(normalized.get("spread_price") or 0.0),
             float(normalized.get("spread_points") or 0.0),
             float(normalized.get("spread_pips") or 0.0),
@@ -1313,15 +1321,15 @@ class GoldNDSAnalyzer:
         recent_high = float(recent_slice["high"].max()) if not recent_slice.empty else None
 
         spread_price = volume_analysis.get("spread_price")
-        spread_buffer = 0.0
+        spread_buffer_price = 0.0
         if spread_price is not None:
             try:
-                spread_buffer = float(spread_price) * 1.2
+                spread_buffer_price = float(spread_price) * 1.2
             except Exception:
-                spread_buffer = 0.0
+                spread_buffer_price = 0.0
         buffer_atr = float(settings.get("FLOW_STOP_BUFFER_ATR", 0.05))
         atr_buffer = float(atr_value) * buffer_atr if atr_value else 0.0
-        buffer_price = max(spread_buffer, atr_buffer)
+        buffer_price = max(spread_buffer_price, atr_buffer)
 
         breakers = getattr(structure, "breakers", []) or []
         ifvgs = getattr(structure, "inversion_fvgs", []) or []
