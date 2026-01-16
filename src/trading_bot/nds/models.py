@@ -157,6 +157,9 @@ class SessionAnalysis:
     is_overlap: bool
     session_activity: str
     optimal_trading: bool
+    ts_broker: Optional[datetime] = None
+    time_mode: Optional[str] = None
+    broker_utc_offset_hours: Optional[float] = None
 
 @dataclass
 class MarketMetrics:
