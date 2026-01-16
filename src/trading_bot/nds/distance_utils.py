@@ -68,52 +68,61 @@ def resolve_pip_size(
     return pt * PIP_POINTS
 
 
-def normalize_spread(
-    raw_spread: Optional[float],
-    point_size: Optional[float] = None,
-    pip_size: Optional[float] = None,
-    raw_unit: str = "price",
-) -> Dict[str, Optional[float]]:
-    """Normalize spread values into price/points/pips with explicit units."""
-    normalized: Dict[str, Optional[float]] = {
-        "raw_spread": None,
-        "raw_unit": raw_unit,
-        "spread_price": None,
-        "spread_points": None,
-        "spread_pips": None,
-        "point_size": None,
-        "pip_size": None,
-    }
-
-    try:
-        raw_value = float(raw_spread)
-    except (TypeError, ValueError):
+    def normalize_spread(
+        raw_spread: Optional[float],
+        point_size: Optional[float] = None,
+        pip_size: Optional[float] = None,
+        raw_unit: str = "price",  # "price" | "points" | "pips"
+    ) -> Dict[str, Optional[float]]:
+        """Normalize spread into price/points/pips with explicit units."""
+        normalized: Dict[str, Optional[float]] = {
+            "raw_spread": None,
+            "raw_unit": raw_unit,
+            "spread_price": None,
+            "spread_points": None,
+            "spread_pips": None,
+            "point_size": None,
+            "pip_size": None,
+        }
+    
+        try:
+            raw_value = float(raw_spread)
+        except (TypeError, ValueError):
+            return normalized
+    
+        pt = _safe_point_size(point_size)             # e.g., 0.01 for XAUUSD
+        pip_value = resolve_pip_size(pt, pip_size)    # e.g., 0.1 if you choose pip=0.1
+    
+        raw_value_abs = abs(raw_value)
+    
+        # Convert raw -> price distance
+        if raw_unit == "price":
+            spread_price = raw_value_abs
+        elif raw_unit == "points":
+            spread_price = raw_value_abs * pt
+        elif raw_unit == "pips":
+            spread_price = raw_value_abs * pip_value
+        else:
+            # Unknown unit: treat as price to be safe
+            spread_price = raw_value_abs
+    
+        # Derive points and pips from price
+        spread_points = spread_price / pt if pt else None
+        spread_pips = spread_price / pip_value if pip_value else None
+    
+        normalized.update(
+            {
+                "raw_spread": raw_value,
+                "raw_unit": raw_unit,
+                "spread_price": spread_price,
+                "spread_points": spread_points,
+                "spread_pips": spread_pips,
+                "point_size": pt,
+                "pip_size": pip_value,
+            }
+        )
         return normalized
 
-    pt = _safe_point_size(point_size)
-    pip_value = resolve_pip_size(pt, pip_size)
-
-    spread_price = abs(raw_value)
-    if raw_unit == "points":
-        spread_price = abs(raw_value) * pt
-    elif raw_unit == "pips":
-        spread_price = pips_to_price(raw_value, pt)
-
-    spread_points = price_to_points(spread_price, pt)
-    spread_pips = points_to_pips(spread_points)
-
-    normalized.update(
-        {
-            "raw_spread": raw_value,
-            "raw_unit": raw_unit,
-            "spread_price": spread_price,
-            "spread_points": spread_points,
-            "spread_pips": spread_pips,
-            "point_size": pt,
-            "pip_size": pip_value,
-        }
-    )
-    return normalized
 
 
 def calculate_distance_metrics(
