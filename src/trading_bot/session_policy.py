@@ -77,6 +77,43 @@ class SessionDecision:
         )
 
 
+def build_session_payload(decision: SessionDecision) -> Dict[str, Any]:
+    """Build canonical session payload for cross-module consistency."""
+    if not isinstance(decision, SessionDecision):
+        raise TypeError("decision must be a SessionDecision")
+    payload = decision.to_payload()
+    payload.setdefault("session_name", decision.session_name)
+    payload.setdefault("time_mode", decision.time_mode)
+    payload.setdefault("broker_utc_offset_hours", decision.broker_utc_offset_hours)
+    payload.setdefault("ts_broker", payload.get("ts_broker"))
+    return payload
+
+
+def normalize_session_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize session payload to canonical schema."""
+    if not isinstance(payload, dict):
+        return {}
+    if "session_name" in payload:
+        normalized = dict(payload)
+        normalized["session_name"] = str(payload.get("session_name", "UNKNOWN")).upper()
+        return normalized
+    if "current_session" in payload:
+        normalized = {
+            "session_name": str(payload.get("current_session", "UNKNOWN")).upper(),
+            "weight": payload.get("weight", payload.get("session_weight", 0.0)),
+            "activity": payload.get("session_activity", "NORMAL"),
+            "policy_mode": payload.get("policy_mode"),
+            "is_tradable": payload.get("is_tradable"),
+            "block_reason": payload.get("block_reason"),
+            "is_overlap": payload.get("is_overlap", False),
+            "time_mode": payload.get("time_mode"),
+            "broker_utc_offset_hours": payload.get("broker_utc_offset_hours"),
+            "ts_broker": payload.get("ts_broker"),
+        }
+        return normalized
+    return dict(payload)
+
+
 def _normalize_list(values: Any) -> Iterable[str]:
     if not values:
         return []

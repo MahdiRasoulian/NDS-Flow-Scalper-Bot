@@ -223,3 +223,32 @@ class FinalizedOrderParams:
     reject_reason: Optional[str] = None
     take_profit2: Optional[float] = None
     tp2: Optional[float] = None
+    final_entry: Optional[float] = None
+    final_stop_loss: Optional[float] = None
+    final_take_profit: Optional[float] = None
+    final_sl: Optional[float] = None
+    final_tp: Optional[float] = None
+    lot: Optional[float] = None
+
+    def to_standard_payload(self) -> Dict[str, Any]:
+        return {
+            "signal": self.signal,
+            "is_trade_allowed": self.is_trade_allowed,
+            "reject_reason": self.reject_reason,
+            "order_type": self.order_type,
+            "final_entry": self.final_entry if self.final_entry is not None else self.entry_price,
+            "final_sl": (
+                self.final_sl
+                if self.final_sl is not None
+                else (self.final_stop_loss if self.final_stop_loss is not None else self.stop_loss)
+            ),
+            "final_tp": (
+                self.final_tp
+                if self.final_tp is not None
+                else (self.final_take_profit if self.final_take_profit is not None else self.take_profit)
+            ),
+            "lot": self.lot if self.lot is not None else self.lot_size,
+            "rr_ratio": self.rr_ratio,
+            "deviation_pips": self.deviation_pips,
+            "decision_notes": list(self.decision_notes or []),
+        }

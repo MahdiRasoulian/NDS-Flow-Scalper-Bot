@@ -55,6 +55,7 @@ from src.trading_bot.nds.distance_utils import (
 from src.trading_bot.config_utils import log_active_settings
 from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
+from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 from src.trading_bot.trade_tracker import TradeTracker
 from src.trading_bot.user_controls import UserControls
 from src.ui.cli import print_banner, print_help, update_config_interactive
@@ -243,16 +244,15 @@ class NDSBot:
         if not d.get("session_analysis") and isinstance(ctx.get("session_analysis"), dict):
             d["session_analysis"] = ctx.get("session_analysis")
         session_analysis = d.get("session_analysis") if isinstance(d.get("session_analysis"), dict) else {}
-        if not d.get("session"):
-            d["session"] = session_analysis.get("current_session")
-        if not d.get("session") and ctx.get("session") is not None:
-            d["session"] = ctx.get("session")
-        if not d.get("session_decision"):
-            d["session_decision"] = session_analysis.get("session_decision")
-        if not d.get("session_activity"):
-            d["session_activity"] = session_analysis.get("session_activity")
-        if not d.get("session_activity") and ctx.get("session_activity") is not None:
-            d["session_activity"] = ctx.get("session_activity")
+        raw_session = d.get("session") or ctx.get("session")
+        session_payload = {}
+        if isinstance(raw_session, dict):
+            session_payload = normalize_session_payload(raw_session)
+        elif isinstance(session_analysis.get("session_decision"), dict):
+            session_payload = normalize_session_payload(session_analysis.get("session_decision"))
+        elif raw_session:
+            session_payload = {"session_name": str(raw_session).upper()}
+
         if not d.get("ts_broker"):
             d["ts_broker"] = session_analysis.get("ts_broker")
         if not d.get("ts_broker") and ctx.get("ts_broker") is not None:
@@ -265,6 +265,31 @@ class NDSBot:
             d["broker_utc_offset_hours"] = session_analysis.get("broker_utc_offset_hours")
         if d.get("broker_utc_offset_hours") is None and ctx.get("broker_utc_offset_hours") is not None:
             d["broker_utc_offset_hours"] = ctx.get("broker_utc_offset_hours")
+
+        if not session_payload and d.get("ts_broker"):
+            session_payload = normalize_session_payload(
+                evaluate_session(d.get("ts_broker"), self.config).to_payload()
+            )
+
+        if session_payload:
+            session_payload.setdefault("time_mode", d.get("time_mode"))
+            session_payload.setdefault("broker_utc_offset_hours", d.get("broker_utc_offset_hours"))
+            session_payload.setdefault("ts_broker", d.get("ts_broker"))
+            session_payload.setdefault(
+                "weight",
+                session_analysis.get("weight", session_analysis.get("session_weight", 0.0)),
+            )
+            session_payload.setdefault("activity", session_analysis.get("session_activity", "NORMAL"))
+            d["session"] = session_payload
+            d.setdefault("session_name", session_payload.get("session_name"))
+            if not d.get("session_decision"):
+                d["session_decision"] = session_payload
+        else:
+            d["session"] = raw_session
+        if not d.get("session_activity"):
+            d["session_activity"] = session_analysis.get("session_activity")
+        if not d.get("session_activity") and ctx.get("session_activity") is not None:
+            d["session_activity"] = ctx.get("session_activity")
 
         # --- canonical indicator keys ---
         if d.get("adx") is None:
@@ -287,14 +312,20 @@ class NDSBot:
         # --- entry idea extraction ---
         entry_idea = ctx.get("entry_idea") if isinstance(ctx.get("entry_idea"), dict) else None
         if entry_idea:
-            if d.get("entry_price") is None and entry_idea.get("entry_price") is not None:
-                d["entry_price"] = entry_idea.get("entry_price")
-            if d.get("stop_loss") is None and entry_idea.get("stop_loss") is not None:
-                d["stop_loss"] = entry_idea.get("stop_loss")
-            if d.get("take_profit") is None and entry_idea.get("take_profit") is not None:
-                d["take_profit"] = entry_idea.get("take_profit")
+            entry_level = entry_idea.get("entry_level") or entry_idea.get("entry_price")
+            if d.get("entry_level") is None and entry_level is not None:
+                d["entry_level"] = entry_level
+            if d.get("entry_price") is None and entry_level is not None:
+                d["entry_price"] = entry_level
+            if d.get("entry_model") is None and entry_idea.get("entry_model") is not None:
+                d["entry_model"] = entry_idea.get("entry_model")
             if entry_idea.get("reason") and not d.get("entry_reason"):
                 d["entry_reason"] = entry_idea.get("reason")
+
+        if d.get("entry_level") is None and d.get("entry_price") is not None:
+            d["entry_level"] = d.get("entry_price")
+        if d.get("entry_price") is None and d.get("entry_level") is not None:
+            d["entry_price"] = d.get("entry_level")
 
         # --- session info ---
         if ctx and isinstance(ctx.get("session"), dict) and "session_analysis" not in d:
@@ -651,9 +682,22 @@ class NDSBot:
             current_spread = float(result.get("spread", 0.0) or 0.0)
 
             sess = result.get("session_analysis") or {}
-            session_name = str(sess.get("current_session", "UNKNOWN"))
-            session_weight = float(sess.get("weight", sess.get("session_weight", 0.0)) or 0.0)
-            session_activity = str(sess.get("session_activity", ""))
+            session_payload = result.get("session") if isinstance(result.get("session"), dict) else {}
+            session_name = str(
+                session_payload.get("session_name")
+                or sess.get("current_session")
+                or result.get("session")
+                or "UNKNOWN"
+            )
+            session_weight = float(
+                session_payload.get("weight")
+                or sess.get("weight", sess.get("session_weight", 0.0))
+                or 0.0
+            )
+            session_activity = str(
+                session_payload.get("activity")
+                or sess.get("session_activity", "")
+            )
             is_active_session = bool(sess.get("is_active_session", True))
             untradable = bool(sess.get("untradable", False))
             untradable_reasons = str(sess.get("untradable_reasons", "-"))
@@ -725,7 +769,7 @@ class NDSBot:
 
                     logger.info(
                         "[BOT][RISK][PAYLOAD] session=%s adx=%.1f ts_broker=%s",
-                        result.get("session"),
+                        session_name,
                         float(adx_value or 0.0),
                         result.get("ts_broker"),
                     )
@@ -960,34 +1004,47 @@ class NDSBot:
     # ----------------------------
     # Trade Geometry Guards
     # ----------------------------
-    def _extract_trade_levels(self, signal_data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        """Extract entry/sl/tp from either root keys or nested analyzer context."""
-        entry = signal_data.get("entry_price")
-        sl = signal_data.get("stop_loss")
-        tp = signal_data.get("take_profit")
-
-        # برخی خروجی‌ها ممکن است از RiskManager نهایی شده باشند
-        if entry is None and signal_data.get("final_entry") is not None:
-            entry = signal_data.get("final_entry")
-        if sl is None and signal_data.get("final_stop_loss") is not None:
-            sl = signal_data.get("final_stop_loss")
-        if tp is None and signal_data.get("final_take_profit") is not None:
-            tp = signal_data.get("final_take_profit")
+    def _resolve_entry_idea(self, signal_data: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
+        """Resolve entry idea fields from analyzer payload (no SL/TP)."""
+        entry_idea = (
+            signal_data.get("entry_idea")
+            if isinstance(signal_data.get("entry_idea"), dict)
+            else None
+        )
+        entry_level = (
+            (entry_idea or {}).get("entry_level")
+            or (entry_idea or {}).get("entry_price")
+            or signal_data.get("entry_level")
+            or signal_data.get("entry_price")
+        )
+        entry_model = (
+            (entry_idea or {}).get("entry_model")
+            or signal_data.get("entry_model")
+        )
 
         try:
-            entry_f = float(entry) if entry is not None else None
+            entry_level = float(entry_level) if entry_level is not None else None
         except Exception:
-            entry_f = None
-        try:
-            sl_f = float(sl) if sl is not None else None
-        except Exception:
-            sl_f = None
-        try:
-            tp_f = float(tp) if tp is not None else None
-        except Exception:
-            tp_f = None
+            entry_level = None
 
-        return entry_f, sl_f, tp_f
+        if entry_model is not None:
+            entry_model = str(entry_model).upper()
+
+        return entry_level, entry_model
+
+    def _validate_entry_idea(self, signal_data: Dict[str, Any]) -> Tuple[bool, str, Optional[float], Optional[str]]:
+        """Validate analyzer entry idea without requiring SL/TP."""
+        side = self._normalize_signal(signal_data.get("signal", "NONE"))
+        if side not in ("BUY", "SELL"):
+            return False, f"Invalid signal={side}", None, None
+
+        entry_level, entry_model = self._resolve_entry_idea(signal_data)
+        if entry_level is None:
+            return False, "Missing entry_level from analyzer", None, entry_model
+        if entry_model in (None, "", "NONE"):
+            return False, "Missing entry_model from analyzer", entry_level, entry_model
+
+        return True, "OK", entry_level, entry_model
 
     def _validate_trade_geometry(self, side: str, entry: Optional[float], sl: Optional[float], tp: Optional[float]) -> Tuple[bool, str]:
         """Hard validation of SL/TP placement relative to entry."""
@@ -1026,19 +1083,21 @@ class NDSBot:
             return False
 
         # ------------------------------------------------------------
-        # Guardrail #1: اعتبارسنجی هندسه معامله (Analyzer output)
+        # Guardrail #1: only validate entry idea (no SL/TP before RiskManager)
         # ------------------------------------------------------------
         try:
-            entry, sl, tp = self._extract_trade_levels(signal_data)
-            # اگر آنالایزر level ارائه داده باشد، باید هندسه صحیح باشد
-            if entry is not None or sl is not None or tp is not None:
-                ok, reason = self._validate_trade_geometry(signal_data.get("signal", "NONE"), entry, sl, tp)
-                if not ok:
-                    logger.error("❌ Invalid trade geometry from Analyzer | %s", reason)
-                    print(f"❌ هندسه معامله نامعتبر است: {reason}")
-                    return False
+            ok, reason, entry_level, entry_model = self._validate_entry_idea(signal_data)
+            if not ok:
+                logger.error("❌ Missing/invalid entry idea from Analyzer | %s", reason)
+                print(f"❌ ایده ورود نامعتبر است: {reason}")
+                return False
+            logger.info(
+                "🧾 Entry idea validated | entry_level=%.2f entry_model=%s",
+                float(entry_level or 0.0),
+                entry_model,
+            )
         except Exception as g_err:
-            logger.warning(f"⚠️ Geometry validation failed unexpectedly: {g_err}", exc_info=True)
+            logger.warning(f"⚠️ Entry idea validation failed unexpectedly: {g_err}", exc_info=True)
 
         try:
             # قیمت Real-Time از PriceMonitor داخلی
@@ -1092,7 +1151,7 @@ class NDSBot:
                 signal_data.get("signal"),
                 signal_data.get("score"),
                 signal_data.get("confidence"),
-                signal_data.get("entry_price"),
+                signal_data.get("entry_level") or signal_data.get("entry_price"),
                 signal_data.get("stop_loss"),
                 signal_data.get("take_profit"),
                 (signal_data.get("context") or {}).get("entry_source"),
@@ -1149,10 +1208,12 @@ class NDSBot:
 
             signal_data.update(
                 {
-                    "final_entry": finalized.entry_price,
-                    "final_stop_loss": finalized.stop_loss,
-                    "final_take_profit": finalized.take_profit,
-                    "final_volume": finalized.lot_size,
+                    "final_entry": finalized.final_entry or finalized.entry_price,
+                    "final_stop_loss": finalized.final_stop_loss or finalized.stop_loss,
+                    "final_take_profit": finalized.final_take_profit or finalized.take_profit,
+                    "final_sl": finalized.final_sl or finalized.stop_loss,
+                    "final_tp": finalized.final_tp or finalized.take_profit,
+                    "final_volume": finalized.lot or finalized.lot_size,
                     "order_type": finalized.order_type,
                     "decision_reasons": finalized.decision_notes,
                 }

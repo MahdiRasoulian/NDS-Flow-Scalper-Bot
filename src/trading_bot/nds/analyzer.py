@@ -55,7 +55,7 @@ from src.trading_bot.time_utils import (
     DEFAULT_SESSION_DEFINITIONS,
     normalize_session_definitions,
 )
-from src.trading_bot.session_policy import evaluate_session
+from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 
 logger = logging.getLogger(__name__)
 
@@ -902,6 +902,8 @@ class GoldNDSAnalyzer:
             signal = entry_idea.get("signal", "NONE") or "NONE"
             result_payload["signal"] = signal
             result_payload["entry_reason"] = entry_reason
+            result_payload["entry_level"] = entry_price
+            result_payload["entry_price"] = entry_price
 
             if signal in {"BUY", "SELL"} and entry_price is not None:
                 tp1_target = self._resolve_opposing_structure_target(
@@ -918,6 +920,7 @@ class GoldNDSAnalyzer:
             entry_signal_context = {
                 "signal": signal,
                 "entry_price": entry_price,
+                "entry_level": entry_price,
                 "stop_loss": None,
                 "take_profit": None,
                 "take_profit2": None,
@@ -3293,12 +3296,32 @@ class GoldNDSAnalyzer:
         if pd.isna(current_rvol):
             current_rvol = 1.0
 
+        session_payload = normalize_session_payload(session_analysis.session_decision)
+        if not session_payload:
+            session_payload = {
+                "session_name": session_analysis.current_session,
+                "weight": session_analysis.session_weight,
+                "activity": session_analysis.session_activity,
+                "policy_mode": session_analysis.policy_mode,
+                "is_tradable": session_analysis.is_tradable,
+                "block_reason": session_analysis.block_reason,
+                "is_overlap": session_analysis.is_overlap,
+                "time_mode": session_analysis.time_mode,
+                "broker_utc_offset_hours": session_analysis.broker_utc_offset_hours,
+                "ts_broker": (
+                    session_analysis.ts_broker.isoformat()
+                    if session_analysis.ts_broker is not None
+                    else None
+                ),
+            }
+
         result = {
             "signal": signal,
             "confidence": confidence,
             "score": round(score, 1),
             "reasons": reasons[:8],
-            "session": getattr(session_analysis, "current_session", None),
+            "session": session_payload,
+            "session_name": session_payload.get("session_name"),
             "session_activity": getattr(session_analysis, "session_activity", None),
             "ts_broker": (
                 session_analysis.ts_broker.isoformat()
