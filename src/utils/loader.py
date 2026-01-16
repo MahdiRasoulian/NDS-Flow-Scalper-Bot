@@ -4,6 +4,7 @@ import sys
 import os
 import importlib.util
 from pathlib import Path
+from dotenv import load_dotenv
 
 def import_module_safely(module_name, from_paths, project_root):
     """ایمپورت امن ماژول از مسیرهای مختلف"""
