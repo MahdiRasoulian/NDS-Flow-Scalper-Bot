@@ -43,6 +43,7 @@ class RealTimePrice:
     time: datetime
     volume: int = 0
     spread: float = 0.0
+    spread_price: float = 0.0
     
     def is_valid(self) -> bool:
         """بررسی اعتبار قیمت"""
@@ -140,7 +141,8 @@ class RealTimeMonitor:
                 last=last_price,
                 time=datetime.now(),
                 volume=tick.volume,
-                spread=spread
+                spread=spread,
+                spread_price=spread,
             )
             
             # 🔥 اعتبارسنجی نهایی
@@ -232,6 +234,7 @@ class RealTimeMonitor:
                 'time': price.time,
                 'volume': price.volume,
                 'spread': price.spread,
+                'spread_price': price.spread,
                 'source': 'real_time_monitor'
             }
         return None
@@ -506,6 +509,7 @@ class MT5Client:
                             'time': price.time,
                             'volume': price.volume,
                             'spread': price.ask - price.bid,
+                            'spread_price': price.ask - price.bid,
                             'source': 'real_time_monitor'
                         }
                     else:
@@ -543,6 +547,7 @@ class MT5Client:
                 'time': datetime.fromtimestamp(tick.time),
                 'volume': tick.volume,
                 'spread': tick.ask - tick.bid,
+                'spread_price': tick.ask - tick.bid,
                 'source': 'direct_fetch'
             }
             

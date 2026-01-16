@@ -51,6 +51,7 @@
       "TICK_VALUE_PER_LOT": 100,
       "POINT_SIZE": 0.01,
       "POINT": 0.01,
+      "PIP_SIZE": 0.1,
       "MIN_LOT": 0.01,
       "MAX_LOT": 2.0,
       "LOT_STEP": 0.01,

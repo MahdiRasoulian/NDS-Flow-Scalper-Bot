@@ -241,8 +241,14 @@ def run(csv_path: str, limit: int | None, window: int, step: int, progress: int)
             reason_key = result.reasons[-1]
             rejection_reasons[reason_key] = rejection_reasons.get(reason_key, 0) + 1
 
-        if "spread" in df.columns and not df["spread"].isna().all():
-            spread_value = float(df["spread"].iloc[i] or 0.0)
+        spread_series = None
+        if "spread_price" in df.columns and not df["spread_price"].isna().all():
+            spread_series = df["spread_price"]
+        elif "spread" in df.columns and not df["spread"].isna().all():
+            spread_series = df["spread"]
+
+        if spread_series is not None:
+            spread_value = float(spread_series.iloc[i] or 0.0)
             spread_pips = _distance_pips(spread_value, resolved_point_size)
             spread_max = float(risk_manager.settings.get("SPREAD_MAX_PIPS", 2.5))
             if spread_pips > spread_max:

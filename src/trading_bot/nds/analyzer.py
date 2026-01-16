@@ -40,7 +40,9 @@ from .indicators import IndicatorCalculator
 from .smc import SMCAnalyzer
 from .distance_utils import (
     calculate_distance_metrics,
+    normalize_spread,
     pips_to_price,
+    resolve_pip_size_from_config,
     resolve_point_size_with_source,
 )
 from src.trading_bot.config_utils import get_setting, resolve_active_settings
@@ -83,6 +85,7 @@ class GoldNDSAnalyzer:
         self.atr: Optional[float] = None
         self._point_size: Optional[float] = None
         self._point_size_source: Optional[str] = None
+        self._pip_size: Optional[float] = None
         self.time_mode = DEFAULT_TIME_MODE
         self.broker_utc_offset = DEFAULT_BROKER_OFFSET_HOURS
         self.session_definitions: Dict[str, Dict[str, Any]] = dict(DEFAULT_SESSION_DEFINITIONS)
@@ -399,8 +402,8 @@ class GoldNDSAnalyzer:
         market_status = str(volume_analysis.get("market_status", "") or "").upper()  # e.g. OPEN/CLOSED/HALTED
         data_ok = volume_analysis.get("data_ok", None)  # True/False if available
 
-        spread = volume_analysis.get("spread", None)       # numeric if available
-        max_spread = volume_analysis.get("max_spread", None)  # numeric if available
+        spread_pips = volume_analysis.get("spread_pips", volume_analysis.get("spread", None))
+        max_spread_pips = volume_analysis.get("max_spread_pips", volume_analysis.get("max_spread", None))
 
         untradable_reasons = []
         untradable = False
@@ -421,11 +424,13 @@ class GoldNDSAnalyzer:
             untradable_reasons.append("data_ok=False")
 
         # 4) spread sanity (optional)
-        if spread is not None and max_spread is not None:
+        if spread_pips is not None and max_spread_pips is not None:
             try:
-                if float(spread) > float(max_spread):
+                if float(spread_pips) > float(max_spread_pips):
                     untradable = True
-                    untradable_reasons.append(f"spread={float(spread):.4f}>max={float(max_spread):.4f}")
+                    untradable_reasons.append(
+                        f"spread_pips={float(spread_pips):.4f}>max={float(max_spread_pips):.4f}"
+                    )
             except Exception:
                 # اگر قابل تبدیل نبود، تصمیم‌گیری را به این معیار وابسته نکن
                 pass
@@ -529,6 +534,7 @@ class GoldNDSAnalyzer:
         mode = "Scalping" if scalping_mode else "Regular"
         self._log_info("[NDS][INIT] start analysis mode=%s analysis_only=true", mode)
         point_size, source = self._resolve_point_size()
+        pip_size = self._resolve_pip_size(point_size)
         self._log_info(
             "[NDS][POINT_SIZE] point_size=%.4f source=%s",
             point_size,
@@ -563,16 +569,12 @@ class GoldNDSAnalyzer:
             atr_for_scoring = atr_short_value if (scalping_mode and atr_short_value) else atr_v
 
             volume_analysis = IndicatorCalculator.analyze_volume(self.df, 5 if scalping_mode else 20)
-            if "spread" in self.df.columns:
-                try:
-                    volume_analysis["spread"] = float(self.df["spread"].iloc[-1])
-                except Exception:
-                    pass
-            if "max_spread" not in volume_analysis:
-                try:
-                    volume_analysis["max_spread"] = float(self.GOLD_SETTINGS.get("SPREAD_MAX_PIPS", 2.5))
-                except Exception:
-                    volume_analysis["max_spread"] = None
+            spread_payload = self._normalize_spread_from_df(point_size, pip_size)
+            if spread_payload:
+                volume_analysis.update(spread_payload)
+            max_spread_pips = float(self.GOLD_SETTINGS.get("SPREAD_MAX_PIPS", 2.5))
+            volume_analysis.setdefault("max_spread_pips", max_spread_pips)
+            volume_analysis.setdefault("max_spread", max_spread_pips)
             volatility_state = self._normalize_volatility_state(self._determine_volatility(atr_v, atr_for_scoring))
             session_analysis = self._analyze_trading_sessions(volume_analysis)
 
@@ -970,6 +972,53 @@ class GoldNDSAnalyzer:
         self._point_size_source = source
         return point_size, source
 
+    def _resolve_pip_size(self, point_size: float) -> float:
+        pip_size = resolve_pip_size_from_config(self.config, point_size, default=None)
+        self._pip_size = pip_size
+        return pip_size
+
+    def _normalize_spread_from_df(self, point_size: float, pip_size: float) -> Dict[str, Optional[float]]:
+        raw_spread = None
+        raw_unit = None
+        if "spread_price" in self.df.columns:
+            raw_spread = self.df["spread_price"].iloc[-1]
+            raw_unit = "price"
+        elif "spread" in self.df.columns:
+            raw_spread = self.df["spread"].iloc[-1]
+            raw_unit = "price"
+        elif "spread_points" in self.df.columns:
+            raw_spread = self.df["spread_points"].iloc[-1]
+            raw_unit = "points"
+        elif "spread_pips" in self.df.columns:
+            raw_spread = self.df["spread_pips"].iloc[-1]
+            raw_unit = "pips"
+
+        normalized = normalize_spread(raw_spread, point_size, pip_size, raw_unit or "price")
+        if normalized.get("spread_price") is None:
+            return {}
+
+        max_spread_pips = float(self.GOLD_SETTINGS.get("SPREAD_MAX_PIPS", 2.5))
+        self._log_info(
+            "[NDS][SPREAD][NORMALIZE] raw_spread=%s spread_price=%.4f spread_points=%.2f spread_pips=%.2f "
+            "point_size=%.4f pip_size=%.4f max_spread_pips=%.2f",
+            normalized.get("raw_spread"),
+            float(normalized.get("spread_price") or 0.0),
+            float(normalized.get("spread_points") or 0.0),
+            float(normalized.get("spread_pips") or 0.0),
+            float(normalized.get("point_size") or 0.0),
+            float(normalized.get("pip_size") or 0.0),
+            max_spread_pips,
+        )
+
+        return {
+            "spread_price": normalized.get("spread_price"),
+            "spread_points": normalized.get("spread_points"),
+            "spread_pips": normalized.get("spread_pips"),
+            "spread": normalized.get("spread_pips"),
+            "spread_raw": normalized.get("raw_spread"),
+            "spread_raw_unit": normalized.get("raw_unit"),
+        }
+
     def _get_point_size(self) -> float:
         """Return configured point size with default."""
         if self._point_size is not None:
@@ -1263,11 +1312,11 @@ class GoldNDSAnalyzer:
         recent_low = float(recent_slice["low"].min()) if not recent_slice.empty else None
         recent_high = float(recent_slice["high"].max()) if not recent_slice.empty else None
 
-        spread = volume_analysis.get("spread")
+        spread_price = volume_analysis.get("spread_price")
         spread_buffer = 0.0
-        if spread is not None:
+        if spread_price is not None:
             try:
-                spread_buffer = float(spread) * 1.2
+                spread_buffer = float(spread_price) * 1.2
             except Exception:
                 spread_buffer = 0.0
         buffer_atr = float(settings.get("FLOW_STOP_BUFFER_ATR", 0.05))
@@ -2202,8 +2251,8 @@ class GoldNDSAnalyzer:
         # ------------------------------
         market_status = str(volume_analysis.get("market_status", "") or "").upper()
         data_ok = volume_analysis.get("data_ok", None)
-        spread = volume_analysis.get("spread", None)
-        max_spread = volume_analysis.get("max_spread", None)
+        spread_pips = volume_analysis.get("spread_pips", volume_analysis.get("spread", None))
+        max_spread_pips = volume_analysis.get("max_spread_pips", volume_analysis.get("max_spread", None))
 
         untradable = False
         untradable_reasons = []
@@ -2216,11 +2265,13 @@ class GoldNDSAnalyzer:
             untradable = True
             untradable_reasons.append("data_ok=False")
 
-        if spread is not None and max_spread is not None:
+        if spread_pips is not None and max_spread_pips is not None:
             try:
-                if float(spread) > float(max_spread):
+                if float(spread_pips) > float(max_spread_pips):
                     untradable = True
-                    untradable_reasons.append(f"spread={float(spread):.4f}>max={float(max_spread):.4f}")
+                    untradable_reasons.append(
+                        f"spread_pips={float(spread_pips):.4f}>max={float(max_spread_pips):.4f}"
+                    )
             except Exception:
                 pass
 

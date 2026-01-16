@@ -1,4 +1,8 @@
 * سپس، محیط مجازی را مجدداً ایجاد کنید:
+# تنظیمات واحدها (XAUUSD):
+# - POINT_SIZE = 0.01 (هر point برابر 0.01 دلار)
+# - PIP_SIZE = 0.1 (هر pip برابر 10 پوینت)
+# - SPREAD_MAX_PIPS بر حسب pip است؛ یعنی مقدار واقعی اسپرد مجاز = SPREAD_MAX_PIPS * PIP_SIZE
 # ایجاد محیط مجازی
 python -m venv venv
 
