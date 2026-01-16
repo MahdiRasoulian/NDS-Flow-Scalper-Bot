@@ -269,17 +269,84 @@ class BacktestEngine:
         return str(entry_type), str(entry_model), str(tier), str(entry_source), entry_context
 
     def _extract_session_info(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        session = payload.get("session_analysis") or {}
-        if not isinstance(session, dict):
-            session = {}
+        """
+        Robust session extractor.
+        Live analyzer logs show fields like: sess=ASIA w=0.80 ...
+        Backtest must support multiple payload layouts.
+        """
+        def _as_dict(x: Any) -> Dict[str, Any]:
+            return x if isinstance(x, dict) else {}
+
+        # 1) Preferred: explicit session_analysis dict
+        session = _as_dict(payload.get("session_analysis"))
+
+        # 2) Common fallbacks: top-level keys or nested meta/context/details
+        if not session:
+            # try top-level session-like keys
+            session = {
+                "current_session": payload.get("current_session") or payload.get("session") or payload.get("sess"),
+                "weight": payload.get("session_weight") or payload.get("weight"),
+                "session_activity": payload.get("session_activity") or payload.get("activity"),
+                "is_active_session": payload.get("is_active_session"),
+                "untradable": payload.get("untradable"),
+                "untradable_reasons": payload.get("untradable_reasons"),
+            }
+
+        # 3) Try nested containers often used by analyzers
+        if not session.get("current_session") and not session.get("weight"):
+            for container_key in ("meta", "context", "details", "diagnostics", "indicators", "confidence_breakdown"):
+                container = _as_dict(payload.get(container_key))
+                if not container:
+                    continue
+                # look for session-like subdict
+                cand = _as_dict(container.get("session_analysis") or container.get("session"))
+                if cand:
+                    session = {**session, **cand}
+                    break
+                # or keys directly inside container
+                if any(k in container for k in ("current_session", "session", "sess", "session_weight", "weight")):
+                    session = {
+                        "current_session": container.get("current_session") or container.get("session") or container.get("sess"),
+                        "weight": container.get("session_weight") or container.get("weight"),
+                        "session_activity": container.get("session_activity") or container.get("activity"),
+                        "is_active_session": container.get("is_active_session"),
+                        "untradable": container.get("untradable"),
+                        "untradable_reasons": container.get("untradable_reasons"),
+                    }
+                    break
+
+        # Normalize outputs
+        current_session = str(session.get("current_session") or "UNKNOWN")
+        weight = session.get("weight", session.get("session_weight", None))
+
+        try:
+            weight_f = float(weight) if weight is not None else None
+        except Exception:
+            weight_f = None
+
+        # IMPORTANT: do not allow UNKNOWN to zero-out confidence/tier in backtest
+        if current_session in ("UNKNOWN", "NONE", ""):
+            current_session = "UNKNOWN"
+            if weight_f is None or weight_f <= 0:
+                weight_f = 1.0  # safe neutral multiplier
+
+        if weight_f is None:
+            weight_f = 1.0
+
+        session_activity = str(session.get("session_activity") or "")
+        is_active = bool(session.get("is_active_session", True))
+        untradable = bool(session.get("untradable", False))
+        untradable_reasons = str(session.get("untradable_reasons", "-"))
+
         return {
-            "session": str(session.get("current_session", "UNKNOWN")),
-            "session_weight": float(session.get("weight", session.get("session_weight", 0.0)) or 0.0),
-            "session_activity": str(session.get("session_activity", "")),
-            "is_active_session": bool(session.get("is_active_session", True)),
-            "untradable": bool(session.get("untradable", False)),
-            "untradable_reasons": str(session.get("untradable_reasons", "-")),
+            "session": current_session,
+            "session_weight": float(weight_f),
+            "session_activity": session_activity,
+            "is_active_session": is_active,
+            "untradable": untradable,
+            "untradable_reasons": untradable_reasons,
         }
+
 
     def _entry_distance_pips(self, entry_price: Optional[float], reference_price: Optional[float]) -> float:
         if entry_price is None or reference_price is None:
