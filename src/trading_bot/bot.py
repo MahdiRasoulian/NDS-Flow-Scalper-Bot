@@ -247,6 +247,8 @@ class NDSBot:
             d["session"] = session_analysis.get("current_session")
         if not d.get("session") and ctx.get("session") is not None:
             d["session"] = ctx.get("session")
+        if not d.get("session_decision"):
+            d["session_decision"] = session_analysis.get("session_decision")
         if not d.get("session_activity"):
             d["session_activity"] = session_analysis.get("session_activity")
         if not d.get("session_activity") and ctx.get("session_activity") is not None:

@@ -47,7 +47,6 @@ from .distance_utils import (
 )
 from src.trading_bot.config_utils import get_setting, resolve_active_settings
 from src.trading_bot.time_utils import (
-    classify_session,
     in_time_window,
     parse_timestamp,
     to_broker_time,
@@ -56,6 +55,7 @@ from src.trading_bot.time_utils import (
     DEFAULT_SESSION_DEFINITIONS,
     normalize_session_definitions,
 )
+from src.trading_bot.session_policy import evaluate_session
 
 logger = logging.getLogger(__name__)
 
@@ -412,15 +412,25 @@ class GoldNDSAnalyzer:
         parsed_time = parse_timestamp(last_time)
         broker_time = to_broker_time(parsed_time, self.broker_utc_offset, self.time_mode) if parsed_time else None
 
-        session_info = self._is_valid_trading_session(broker_time or last_time)
+        session_decision = evaluate_session(broker_time or last_time, self.config)
         logger.info(
             "[NDS][TIME] mode=%s broker_offset=%s ts_raw=%s ts_broker=%s session=%s overlap=%s",
             self.time_mode,
             self.broker_utc_offset,
             last_time,
             broker_time,
-            session_info.get("session", "UNKNOWN"),
-            session_info.get("is_overlap", False),
+            session_decision.session_name,
+            session_decision.is_overlap,
+        )
+        self._log_info(
+            "[NDS][SESSION_POLICY] session=%s tradable=%s weight=%.2f mode=%s reason=%s time_mode=%s offset=%.2f",
+            session_decision.session_name,
+            bool(session_decision.is_tradable),
+            float(session_decision.weight),
+            session_decision.policy_mode,
+            session_decision.block_reason or "-",
+            session_decision.time_mode,
+            float(session_decision.broker_utc_offset_hours or 0.0),
         )
 
         # ---- RVOL (NaN-safe) ----
@@ -453,10 +463,10 @@ class GoldNDSAnalyzer:
         untradable_reasons = []
         untradable = False
 
-        # 1) invalid/parse failure from session_info (خیلی مهم)
-        if not bool(session_info.get('is_valid', True)):
+        # 1) invalid/parse failure from session decision (خیلی مهم)
+        if not bool(session_decision.is_tradable):
             untradable = True
-            untradable_reasons.append("invalid_time")
+            untradable_reasons.append(session_decision.block_reason or "session_untradable")
 
         # 2) market status (optional)
         if market_status in ("CLOSED", "HALTED"):
@@ -483,21 +493,24 @@ class GoldNDSAnalyzer:
         is_active_session = (not untradable)
 
         analysis = SessionAnalysis(
-            current_session=session_info.get('session', 'OTHER'),
-            session_weight=session_info.get('weight', 0.5),
-            weight=session_info.get('weight', 0.5),
+            current_session=session_decision.session_name,
+            session_weight=session_decision.weight,
+            weight=session_decision.weight,
             gmt_hour=broker_time.hour if isinstance(broker_time, datetime) else 0,
             # سیاست جدید: active فقط برای untradable false می‌شود
             is_active_session=is_active_session,
-            is_overlap=session_info.get('is_overlap', False),
+            is_overlap=session_decision.is_overlap,
             session_activity=session_activity,
-            optimal_trading=session_info.get(
-                'optimal_trading',
-                session_info.get('weight', 0.5) >= 1.2
-            ),
+            optimal_trading=session_decision.weight >= 1.2,
             ts_broker=broker_time if isinstance(broker_time, datetime) else None,
             time_mode=self.time_mode,
             broker_utc_offset_hours=self.broker_utc_offset,
+            policy_mode=session_decision.policy_mode,
+            is_tradable=session_decision.is_tradable,
+            block_reason=session_decision.block_reason,
+            untradable=untradable,
+            untradable_reasons=",".join(untradable_reasons) if untradable_reasons else None,
+            session_decision=session_decision.to_payload(),
         )
 
         # لاگ ارتقا یافته: active و دلیل untradable هم چاپ می‌شود
@@ -539,33 +552,14 @@ class GoldNDSAnalyzer:
         - is_valid فقط یعنی timestamp معتبر/قابل‌تحلیل است (نه تعطیلی بازار).
         - تشخیص untradable در _analyze_trading_sessions انجام می‌شود (با data_ok/spread/market_status).
         """
-        raw_time = check_time
-        if not isinstance(check_time, datetime):
-            check_time = parse_timestamp(check_time)
-        if not isinstance(check_time, datetime):
-            self._log_info(
-                "[NDS][TIME] parse_failed ts_raw=%s mode=%s broker_offset=%s",
-                raw_time,
-                self.time_mode,
-                self.broker_utc_offset,
-            )
-            return {
-                'is_valid': False, 'is_overlap': False, 'session': 'INVALID',
-                'weight': 0.0, 'optimal_trading': False
-            }
-
-        session_info = classify_session(check_time, self.session_definitions)
-        session_weight = float(session_info.get("weight", 0.5))
-        optimal_trading = session_weight >= 1.0
-
+        decision = evaluate_session(check_time, self.config)
         return {
-            # سیاست جدید: معتبر بودن timestamp
-            'is_valid': True,
-            'is_overlap': bool(session_info.get("is_overlap", False)),
-            'session': session_info.get("session", "UNKNOWN"),
-            'weight': session_weight,
-            'hour': check_time.hour,
-            'optimal_trading': optimal_trading
+            'is_valid': bool(decision.is_tradable),
+            'is_overlap': bool(decision.is_overlap),
+            'session': decision.session_name,
+            'weight': decision.weight,
+            'hour': decision.ts_broker.hour if decision.ts_broker else 0,
+            'optimal_trading': decision.weight >= 1.0,
         }
 
 
@@ -3347,6 +3341,12 @@ class GoldNDSAnalyzer:
                 "optimal_trading": session_analysis.optimal_trading,
                 "weight": session_analysis.weight,
                 "session_activity": session_analysis.session_activity,
+                "policy_mode": session_analysis.policy_mode,
+                "is_tradable": session_analysis.is_tradable,
+                "block_reason": session_analysis.block_reason,
+                "untradable": session_analysis.untradable,
+                "untradable_reasons": session_analysis.untradable_reasons,
+                "session_decision": session_analysis.session_decision,
                 "ts_broker": (
                     session_analysis.ts_broker.isoformat()
                     if session_analysis.ts_broker is not None

@@ -5,7 +5,6 @@
 """
 
 import logging
-import numpy as np
 from typing import Dict, Optional, Any, Tuple, List, TYPE_CHECKING, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -23,12 +22,11 @@ from src.trading_bot.nds.distance_utils import (
 )
 from src.trading_bot.config_utils import get_setting
 from src.trading_bot.time_utils import (
-    classify_session,
     get_broker_now,
-    normalize_session_definitions,
     parse_timestamp,
     to_broker_time,
 )
+from src.trading_bot.session_policy import SessionDecision, evaluate_session, session_weight_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -346,41 +344,19 @@ class ScalpingRiskManager:
             parsed = parse_timestamp(dt) or dt
             dt = to_broker_time(parsed, resolved_offset, resolved_mode)
 
-        sessions = get_setting(config, "sessions_config.SCALPING_SESSIONS", {})
-        definitions = normalize_session_definitions(sessions)
-        session_info = classify_session(dt, definitions)
-        session = session_info.get("session", "UNKNOWN")
+        decision = evaluate_session(dt, self.config)
+        session = decision.session_name
         if session == "UNKNOWN" and not self._unknown_session_logged:
             self._unknown_session_logged = True
             self._logger.warning(
-                "[RISK][SESSION][UNKNOWN] dt_raw=%s dt_broker=%s mode=%s offset=%.2f definitions=%s result=%s",
+                "[RISK][SESSION][UNKNOWN] dt_raw=%s dt_broker=%s mode=%s offset=%.2f decision=%s",
                 raw_dt,
                 dt,
                 resolved_mode,
                 resolved_offset,
-                list(definitions.keys()),
-                session_info,
+                decision.to_payload(),
             )
-        return "DEAD_ZONE" if session == "UNKNOWN" else session
-
-    @staticmethod
-    def is_scalping_friendly_session(session: str) -> bool:
-        """
-        بررسی مناسب بودن سشن برای اسکلپینگ.
-
-        - این متد فقط «سازگاری پایه» سشن را بررسی می‌کند
-        - تصمیم‌گیری نهایی (مانند DEAD_ZONE override) در can_scalp انجام می‌شود
-        """
-
-        # DEAD_ZONE به صورت پیش‌فرض مسدود نمی‌شود
-        # منطق اجازه/عدم اجازه آن در can_scalp و بر اساس کیفیت سیگنال است
-        if session == 'DEAD_ZONE':
-            return True
-
-        session_multiplier = config.get('sessions_config.SCALPING_SESSION_ADJUSTMENT', {}).get(session, 0)
-
-        # سشن‌هایی با ضریب مناسب برای اسکلپینگ
-        return session_multiplier >= 0.5
+        return session
 
     def get_scalping_multiplier(self, session: str) -> float:
         """
@@ -392,13 +368,50 @@ class ScalpingRiskManager:
         # مقادیر از 0.1 (Dead Zone) تا 1.0 (Overlap) متغیر هستند
         if session in multipliers:
             multiplier = multipliers.get(session)
-        elif session == "DEAD_ZONE":
-            multiplier = multipliers.get("DEAD_ZONE", 0.1)
         else:
-            multiplier = 0.1
+            fallback = session_weight_from_config(str(session).upper(), self.config)
+            multiplier = float(fallback) if fallback is not None else 0.1
 
         self._logger.debug(f"🔍 Scalping Session Multiplier for {session}: {multiplier}")
         return multiplier
+
+    def _resolve_session_decision(
+        self,
+        signal_data: Optional[Dict[str, Any]],
+    ) -> Tuple[SessionDecision, str]:
+        if isinstance(signal_data, dict):
+            payload_decision = signal_data.get("session_decision")
+            session_analysis = (
+                signal_data.get("session_analysis")
+                if isinstance(signal_data.get("session_analysis"), dict)
+                else {}
+            )
+            if not payload_decision and isinstance(session_analysis.get("session_decision"), dict):
+                payload_decision = session_analysis.get("session_decision")
+            if isinstance(payload_decision, dict):
+                return SessionDecision.from_payload(payload_decision), "payload"
+
+        ts_broker = None
+        time_mode = None
+        offset = None
+        if isinstance(signal_data, dict):
+            ts_broker = signal_data.get("ts_broker")
+            time_mode = signal_data.get("time_mode")
+            offset = signal_data.get("broker_utc_offset_hours")
+            session_analysis = (
+                signal_data.get("session_analysis")
+                if isinstance(signal_data.get("session_analysis"), dict)
+                else {}
+            )
+            if not ts_broker:
+                ts_broker = session_analysis.get("ts_broker")
+            if not time_mode:
+                time_mode = session_analysis.get("time_mode")
+            if offset is None:
+                offset = session_analysis.get("broker_utc_offset_hours")
+
+        resolved_ts = ts_broker or get_broker_now()
+        return evaluate_session(resolved_ts, self.config), "computed"
 
     def _resolve_session_from_signal(
         self,
@@ -406,6 +419,14 @@ class ScalpingRiskManager:
     ) -> Tuple[str, str]:
         if not isinstance(signal_data, dict):
             return self.get_current_scalping_session(), "fallback"
+
+        decision_payload = signal_data.get("session_decision")
+        if isinstance(decision_payload, dict):
+            try:
+                decision = SessionDecision.from_payload(decision_payload)
+                return decision.session_name, "payload"
+            except Exception:
+                pass
 
         session = signal_data.get("session")
         session_analysis = (
@@ -1531,7 +1552,7 @@ class ScalpingRiskManager:
         """
         بررسی امکان اسکلپینگ جدید با تنظیمات مپ شده
         - بدون حذف منطق‌های قبلی
-        - با DEAD_ZONE override واقعی و enforce شده
+        - با سیاست سشن واحد و بدون قوانین پراکنده
 
         canonical payload keys (preferred in signal_data):
         - session, session_activity, ts_broker, time_mode, broker_utc_offset_hours
@@ -1575,13 +1596,8 @@ class ScalpingRiskManager:
         # ===============================
         # 5. Scalping Session Handling (FIXED / ENFORCED)
         # ===============================
-        current_session, session_source = self._resolve_session_from_signal(signal_data)
-
-        # --- LOG: وضعیت سشن و ورودی‌های تصمیم ---
-        try:
-            friendly = bool(self.is_scalping_friendly_session(current_session))
-        except Exception:
-            friendly = False
+        session_decision, session_source = self._resolve_session_decision(signal_data)
+        current_session = session_decision.session_name
 
         confidence = self._resolve_confidence_from_signal(signal_data)
         adx, adx_source = self._resolve_adx_from_signal(signal_data)
@@ -1594,73 +1610,44 @@ class ScalpingRiskManager:
             self._logger.warning("[RISK][ADX] missing in payload; defaulting to 0.0")
 
         self._logger.info(
-            "[RISK][SESSION] current_session=%s(source=%s) friendly=%s last_conf=%.1f adx=%.1f(source=%s)",
+            "[RISK][SESSION_POLICY] session=%s(source=%s) tradable=%s mode=%s reason=%s weight=%.2f conf=%.1f adx=%.1f(source=%s)",
             current_session,
             session_source,
-            friendly,
+            bool(session_decision.is_tradable),
+            session_decision.policy_mode,
+            session_decision.block_reason or "-",
+            float(session_decision.weight),
             confidence,
             adx,
             adx_source,
         )
 
-        # ✅ CRITICAL FIX:
-        # چون is_scalping_friendly_session('DEAD_ZONE') == True است،
-        # باید منطق DEAD_ZONE را جداگانه و صریح enforce کنیم؛ وگرنه override هیچوقت اجرا نمی‌شود.
-        if current_session == 'DEAD_ZONE':
-            # --- LOG: ورود به مسیر DEAD_ZONE ---
-            conf_th = 65.0
-            adx_th = 20.0
+        strict_match = bool(
+            get_setting(self.config, "trading_settings.SESSION_STRICT_ASSERT_MATCH", False)
+        )
+        if strict_match and session_source == "payload":
+            compare_ts = session_decision.ts_broker
+            if compare_ts is None and isinstance(signal_data, dict):
+                compare_ts = signal_data.get("ts_broker")
+            computed = evaluate_session(compare_ts, self.config)
+            if (
+                computed.session_name != session_decision.session_name
+                or computed.is_tradable != session_decision.is_tradable
+                or abs(float(computed.weight) - float(session_decision.weight)) > 1e-6
+            ):
+                self._logger.error(
+                    "[RISK][SESSION_POLICY][MISMATCH] payload=%s computed=%s",
+                    session_decision.to_payload(),
+                    computed.to_payload(),
+                )
+                raise ValueError("Session policy mismatch between payload and computed decision")
+
+        if not session_decision.is_tradable:
             self._logger.info(
-                "[RISK][DEAD_ZONE] evaluating override | conf=%.1f(th=%.1f) adx=%.1f(th=%.1f)",
-                confidence, conf_th, adx, adx_th
+                "[RISK][SESSION] blocked | reason=%s",
+                session_decision.block_reason or f"Non-optimal session: {current_session}",
             )
-
-            if confidence >= conf_th and adx >= adx_th:
-                # ✅ اجازه معامله در DEAD_ZONE
-                self.session_risk_multiplier = 0.4
-
-                # --- LOG: پذیرش override ---
-                self._logger.info(
-                    "[RISK][DEAD_ZONE] override ACCEPTED | session_risk_multiplier=%.2f | conf=%.1f adx=%.1f",
-                    float(getattr(self, "session_risk_multiplier", 1.0) or 1.0),
-                    confidence,
-                    adx,
-                )
-
-                # ✅ FIX: self.logger وجود ندارد، باید self._logger استفاده شود
-                self._logger.info(
-                    f"🔥 DEAD_ZONE override accepted | "
-                    f"Confidence={confidence:.1f}% | ADX={adx:.1f}"
-                )
-            else:
-                # --- LOG: رد override با دلیل دقیق ---
-                fail_reasons = []
-                if confidence < conf_th:
-                    fail_reasons.append(f"conf {confidence:.1f} < {conf_th:.1f}")
-                if adx < adx_th:
-                    fail_reasons.append(f"adx {adx:.1f} < {adx_th:.1f}")
-                self._logger.info(
-                    "[RISK][DEAD_ZONE] override REJECTED | %s",
-                    " & ".join(fail_reasons) if fail_reasons else "unknown"
-                )
-
-                reasons.append(f"Non-optimal session: {current_session}")
-        else:
-            # سایر سشن‌ها طبق منطق قبلی
-            # --- LOG: مسیر non-DEAD_ZONE ---
-            self._logger.info(
-                "[RISK][SESSION] non-deadzone path | session=%s friendly=%s",
-                current_session,
-                friendly
-            )
-
-            if not friendly:
-                # --- LOG: رد به دلیل unfriendly بودن سشن ---
-                self._logger.info(
-                    "[RISK][SESSION] blocked | reason=Non-optimal session: %s",
-                    current_session
-                )
-                reasons.append(f"Non-optimal session: {current_session}")
+            reasons.append(session_decision.block_reason or f"Non-optimal session: {current_session}")
 
 
         # ===============================
@@ -1674,6 +1661,7 @@ class ScalpingRiskManager:
     def get_scalping_summary(self) -> Dict[str, Any]:
         """دریافت خلاصه وضعیت اسکلپینگ"""
         current_session = self.get_current_scalping_session()
+        decision = evaluate_session(get_broker_now(), self.config)
         return {
             'daily_risk_used': self.daily_risk_used,
             'daily_profit_loss': self.daily_profit_loss,
@@ -1684,7 +1672,7 @@ class ScalpingRiskManager:
             'last_update': self.last_update.isoformat(),
             'can_scalp': self.can_scalp(1000)[0],
             'current_session': current_session,
-            'session_friendly': self.is_scalping_friendly_session(current_session),
+            'session_tradable': decision.is_tradable,
             'session_multiplier': self.get_scalping_multiplier(current_session),
             'max_holding_minutes': self.get_max_holding_time(current_session)
         }
