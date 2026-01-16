@@ -283,6 +283,8 @@ class SMCAnalyzer:
         outside_count = 0
         exit_threshold = self._touch_exit_threshold_price(atr_value)
         min_separation = int(self.settings.get("FLOW_TOUCH_MIN_SEPARATION_BARS", 6))
+        cooldown_bars = int(self.settings.get("FLOW_TOUCH_COOLDOWN_BARS", 3))
+        min_separation = max(min_separation, cooldown_bars)
         exit_confirm_bars = max(1, int(self.settings.get("FLOW_TOUCH_EXIT_CONFIRM_BARS", 2)))
         window_limit = self.settings.get("FLOW_TOUCH_COUNT_WINDOW_BARS")
         end_idx = len(df)
@@ -330,6 +332,142 @@ class SMCAnalyzer:
             return bottom - price
         return 0.0
 
+    def _zone_distance_atr(self, price: float, top: float, bottom: float) -> float:
+        atr_value = float(self.atr) if self.atr else 0.0
+        dist = self._distance_from_zone(price, top, bottom)
+        return dist / atr_value if atr_value > 0 else 999.0
+
+    def _apply_fvg_filters(self, fvgs: List[FVG]) -> List[FVG]:
+        if not fvgs:
+            return []
+        atr_value = float(self.atr) if self.atr else 0.0
+        current_price = float(self.df["close"].iloc[-1])
+        max_count = int(self.settings.get("SMC_MAX_FVG_COUNT", 60))
+        max_age = int(self.settings.get("SMC_MAX_FVG_AGE_BARS", 240))
+        min_size_atr = float(self.settings.get("SMC_MIN_FVG_SIZE_ATR", 0.15))
+        max_dist_atr = float(self.settings.get("SMC_ZONE_MAX_DIST_ATR", 3.0))
+        tighten_mult = float(self.settings.get("SMC_ZONE_TIGHTEN_MULT", 1.2))
+
+        fvg_weights = self.settings.get("SMC_FVG_RANK_WEIGHTS") or {
+            "size": 0.35,
+            "strength": 0.35,
+            "recency": 0.2,
+            "proximity": 0.1,
+        }
+
+        total_raw = len(fvgs)
+        if total_raw > max_count:
+            min_size_atr *= tighten_mult
+            max_age = max(30, int(max_age / tighten_mult))
+            self._log_info(
+                "[NDS][SMC][FVG] tighten filters raw=%s max=%s min_size_atr=%.3f max_age=%s",
+                total_raw,
+                max_count,
+                min_size_atr,
+                max_age,
+            )
+
+        filtered: List[Tuple[FVG, float, int]] = []
+        for fvg in fvgs:
+            age = max(0, len(self.df) - 1 - int(getattr(fvg, "index", 0)))
+            size_atr = float(getattr(fvg, "size", 0.0)) / atr_value if atr_value > 0 else 0.0
+            if age > max_age:
+                continue
+            if size_atr < min_size_atr:
+                continue
+            dist_atr = self._zone_distance_atr(current_price, float(fvg.top), float(fvg.bottom))
+            if dist_atr > max_dist_atr:
+                continue
+            recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
+            strength_score = min(1.0, float(getattr(fvg, "strength", 1.0)) / 2.0)
+            size_score = min(1.0, size_atr / max(min_size_atr, 0.01))
+            proximity = max(0.0, 1.0 - (dist_atr / max_dist_atr if max_dist_atr > 0 else 1.0))
+            score = (
+                fvg_weights.get("size", 0.35) * size_score
+                + fvg_weights.get("strength", 0.35) * strength_score
+                + fvg_weights.get("recency", 0.2) * recency
+                + fvg_weights.get("proximity", 0.1) * proximity
+            )
+            filtered.append((fvg, score, age))
+
+        filtered.sort(key=lambda item: (-item[1], item[2], item[0].index))
+        trimmed = [item[0] for item in filtered[:max_count]]
+        self._log_info(
+            "[NDS][SMC][FVG] filtered raw=%s kept=%s max=%s min_size_atr=%.3f max_age=%s",
+            total_raw,
+            len(trimmed),
+            max_count,
+            min_size_atr,
+            max_age,
+        )
+        return trimmed
+
+    def _apply_ob_filters(self, order_blocks: List[OrderBlock]) -> List[OrderBlock]:
+        if not order_blocks:
+            return []
+        atr_value = float(self.atr) if self.atr else 0.0
+        current_price = float(self.df["close"].iloc[-1])
+        max_count = int(self.settings.get("SMC_MAX_OB_COUNT", 30))
+        max_age = int(self.settings.get("SMC_MAX_OB_AGE_BARS", 240))
+        min_size_atr = float(self.settings.get("SMC_MIN_OB_SIZE_ATR", 0.2))
+        max_dist_atr = float(self.settings.get("SMC_ZONE_MAX_DIST_ATR", 3.0))
+        tighten_mult = float(self.settings.get("SMC_ZONE_TIGHTEN_MULT", 1.2))
+
+        ob_weights = self.settings.get("SMC_OB_RANK_WEIGHTS") or {
+            "strength": 0.45,
+            "recency": 0.25,
+            "proximity": 0.2,
+            "size": 0.1,
+        }
+
+        total_raw = len(order_blocks)
+        if total_raw > max_count:
+            min_size_atr *= tighten_mult
+            max_age = max(30, int(max_age / tighten_mult))
+            self._log_info(
+                "[NDS][SMC][OB] tighten filters raw=%s max=%s min_size_atr=%.3f max_age=%s",
+                total_raw,
+                max_count,
+                min_size_atr,
+                max_age,
+            )
+
+        filtered: List[Tuple[OrderBlock, float, int]] = []
+        for ob in order_blocks:
+            age = max(0, len(self.df) - 1 - int(getattr(ob, "index", 0)))
+            size = abs(float(getattr(ob, "high", 0.0)) - float(getattr(ob, "low", 0.0)))
+            size_atr = size / atr_value if atr_value > 0 else 0.0
+            if age > max_age:
+                continue
+            if size_atr < min_size_atr:
+                continue
+            dist_atr = self._zone_distance_atr(current_price, float(ob.high), float(ob.low))
+            if dist_atr > max_dist_atr:
+                continue
+            recency = max(0.0, 1.0 - (age / max_age if max_age > 0 else 1.0))
+            strength_score = min(1.0, float(getattr(ob, "strength", 1.0)) / 2.0)
+            size_score = min(1.0, size_atr / max(min_size_atr, 0.01))
+            proximity = max(0.0, 1.0 - (dist_atr / max_dist_atr if max_dist_atr > 0 else 1.0))
+            score = (
+                ob_weights.get("strength", 0.45) * strength_score
+                + ob_weights.get("recency", 0.25) * recency
+                + ob_weights.get("proximity", 0.2) * proximity
+                + ob_weights.get("size", 0.1) * size_score
+            )
+            filtered.append((ob, score, age))
+
+        filtered.sort(key=lambda item: (-item[1], item[2], item[0].index))
+        trimmed = [item[0] for item in filtered[:max_count]]
+        self._log_info(
+            "[NDS][SMC][OB] filtered raw=%s kept=%s max=%s min_size_atr=%.3f max_age=%s",
+            total_raw,
+            len(trimmed),
+            max_count,
+            min_size_atr,
+            max_age,
+        )
+        return trimmed
+
     def _scan_zone_touches(
         self,
         df: pd.DataFrame,
@@ -356,6 +494,8 @@ class SMCAnalyzer:
         current_touch_idx: Optional[int] = None
         exit_threshold = self._touch_exit_threshold_price(atr_value)
         min_separation = int(self.settings.get("FLOW_TOUCH_MIN_SEPARATION_BARS", 6))
+        cooldown_bars = int(self.settings.get("FLOW_TOUCH_COOLDOWN_BARS", 3))
+        min_separation = max(min_separation, cooldown_bars)
         exit_confirm_bars = max(1, int(self.settings.get("FLOW_TOUCH_EXIT_CONFIRM_BARS", 2)))
         outside_count = 0
         consume_on_first = bool(self.settings.get("FLOW_CONSUME_ON_FIRST_VALID_TOUCH", True))
@@ -1765,7 +1905,7 @@ class SMCAnalyzer:
                     bool(getattr(f, "stale", False)),
                 )
 
-        return fvg_list
+        return self._apply_fvg_filters(fvg_list)
 
 
     def detect_order_blocks(self, lookback: int = 50) -> List[OrderBlock]:
@@ -1972,7 +2112,7 @@ class SMCAnalyzer:
                     bool(getattr(ob, "stale", False)),
                 )
 
-        return selected
+        return self._apply_ob_filters(selected)
 
 
     def detect_liquidity_sweeps(self, swings: List[SwingPoint], lookback_swings: int = 5) -> List[LiquiditySweep]:
