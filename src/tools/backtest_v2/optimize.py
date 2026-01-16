@@ -125,6 +125,116 @@ def _passes_failsafe(metrics: Dict[str, Any], diagnostics, failsafe: Dict[str, A
     return True, "OK"
 
 
+# -----------------------------
+# NEW: diagnostics helpers
+# -----------------------------
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def _summarize_cycle_log_for_debug(logger: logging.Logger, cycle_log: pd.DataFrame) -> None:
+    if cycle_log is None or cycle_log.empty:
+        logger.warning("⚠️ cycle_log is empty -> strategy produced no cycles or cycles were not recorded.")
+        return
+
+    logger.info("🧾 cycle_log present | rows=%d cols=%d", len(cycle_log), len(cycle_log.columns))
+    logger.debug("cycle_log columns=%s", list(cycle_log.columns))
+
+    # Heuristic columns
+    cols = set([c.lower() for c in cycle_log.columns])
+    tier_col = None
+    for cand in ("tier", "signal_tier", "grade"):
+        if cand in cols:
+            # map back to original case
+            tier_col = next(c for c in cycle_log.columns if c.lower() == cand)
+            break
+
+    signal_col = None
+    for cand in ("signal", "final_signal", "trade_signal"):
+        if cand in cols:
+            signal_col = next(c for c in cycle_log.columns if c.lower() == cand)
+            break
+
+    reject_col = None
+    for cand in ("reject_reason", "rejection_reason", "reject", "reason"):
+        if cand in cols:
+            reject_col = next(c for c in cycle_log.columns if c.lower() == cand)
+            break
+
+    # Tier distribution
+    if tier_col:
+        vc = cycle_log[tier_col].astype(str).value_counts().head(10)
+        logger.info("📌 Tier distribution (top10): %s", vc.to_dict())
+    else:
+        logger.warning("⚠️ No tier column found in cycle_log (expected one of tier/signal_tier/grade). AB_RATIO may be invalid.")
+
+    # Signal distribution
+    if signal_col:
+        vc = cycle_log[signal_col].astype(str).value_counts().head(10)
+        logger.info("📌 Signal distribution (top10): %s", vc.to_dict())
+    else:
+        logger.warning("⚠️ No signal column found in cycle_log (expected one of signal/final_signal/trade_signal).")
+
+    # Rejection reasons
+    if reject_col:
+        vc = cycle_log[reject_col].astype(str).value_counts().head(15)
+        logger.info("📌 Reject reasons (top15): %s", vc.to_dict())
+    else:
+        logger.info("ℹ️ No reject-reason column detected in cycle_log.")
+
+
+def _export_debug_artifacts(
+    logger: logging.Logger,
+    out_dir: Path,
+    tag: str,
+    override: Dict[str, Any],
+    result,
+) -> None:
+    """
+    Export artifacts even when failsafe fails, so we can diagnose why trades are low/zero.
+    """
+    try:
+        (out_dir / f"{tag}_overrides.json").write_text(
+            json.dumps(override, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.error("Failed to write %s_overrides.json: %s", tag, e)
+
+    try:
+        (out_dir / f"{tag}_metrics.json").write_text(
+            json.dumps(result.metrics, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.error("Failed to write %s_metrics.json: %s", tag, e)
+
+    try:
+        if hasattr(result, "trades") and result.trades is not None:
+            result.trades.to_csv(out_dir / f"{tag}_trades.csv", index=False, encoding="utf-8-sig")
+    except Exception as e:
+        logger.error("Failed to write %s_trades.csv: %s", tag, e)
+
+    try:
+        if hasattr(result, "equity_curve") and result.equity_curve is not None:
+            result.equity_curve.to_csv(out_dir / f"{tag}_equity_curve.csv", encoding="utf-8-sig")
+    except Exception as e:
+        logger.error("Failed to write %s_equity_curve.csv: %s", tag, e)
+
+    try:
+        if hasattr(result, "cycle_log") and result.cycle_log is not None and not result.cycle_log.empty:
+            result.cycle_log.to_csv(out_dir / f"{tag}_cycle_log.csv", encoding="utf-8-sig")
+    except Exception as e:
+        logger.error("Failed to write %s_cycle_log.csv: %s", tag, e)
+
+    logger.info("✅ Debug artifacts saved with tag=%s (files: %s_*.csv/json)", tag, tag)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="CSV/XLSX with OHLCV")
@@ -138,6 +248,8 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=None)
     ap.add_argument("--objective", type=str, default="net_pnl")
     ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG/INFO/WARNING/ERROR")
+    # NEW: always export debug artifacts for each combo (recommended for diagnosis)
+    ap.add_argument("--export-debug", action="store_true", help="Export debug_* artifacts for each combo")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -150,8 +262,8 @@ def main() -> None:
     logger.info("config=%s", args.config)
     logger.info("grid=%s", args.grid)
     logger.info("out=%s", str(out_dir))
-    logger.info("warmup=%s spread=%s slippage=%s rows=%s days=%s objective=%s",
-                args.warmup, args.spread, args.slippage, args.rows, args.days, args.objective)
+    logger.info("warmup=%s spread=%s slippage=%s rows=%s days=%s objective=%s export_debug=%s",
+                args.warmup, args.spread, args.slippage, args.rows, args.days, args.objective, args.export_debug)
     logger.info("==================================================")
 
     # Load data
@@ -165,6 +277,22 @@ def main() -> None:
     logger.info("✅ Slice complete | rows=%d | from=%s | to=%s",
                 len(df), str(df["time"].iloc[0]), str(df["time"].iloc[-1]))
 
+    # Warmup sanity
+    if args.warmup >= len(df):
+        logger.warning("⚠️ warmup=%d >= df_rows=%d -> engine may never trade. Consider lowering warmup.",
+                       args.warmup, len(df))
+    else:
+        effective = len(df) - args.warmup
+        logger.info("🧪 Warmup sanity | warmup=%d -> effective bars after warmup=%d", args.warmup, effective)
+
+    # Data sanity
+    try:
+        if "close" in df.columns:
+            logger.info("📈 Price snapshot | close[min]=%.2f close[max]=%.2f close[last]=%.2f",
+                        float(df["close"].min()), float(df["close"].max()), float(df["close"].iloc[-1]))
+    except Exception:
+        pass
+
     # Load configs
     logger.info("📦 Loading config: %s", args.config)
     config = load_config(args.config)
@@ -175,9 +303,9 @@ def main() -> None:
     grid = grid_payload.get("grid", {})
     objective_payload = grid_payload.get("objective")
     failsafe = grid_payload.get("failsafe", {})
-    logger.info("✅ Grid loaded | grid_keys=%s | failsafe_keys=%s",
+    logger.info("✅ Grid loaded | grid_keys=%s | failsafe=%s",
                 list(grid.keys()) if isinstance(grid, dict) else type(grid),
-                list(failsafe.keys()) if isinstance(failsafe, dict) else type(failsafe))
+                failsafe if isinstance(failsafe, dict) else type(failsafe))
 
     # Objective
     if objective_payload:
@@ -186,11 +314,7 @@ def main() -> None:
     else:
         objective = get_objective_config(args.objective)
         logger.info("🎯 Objective: %s", args.objective)
-
-    try:
-        logger.info("🎯 Objective config: %s", objective)
-    except Exception:
-        pass
+    logger.info("🎯 Objective config: %s", objective)
 
     # Build combos
     logger.info("🧮 Building grid combinations ...")
@@ -225,12 +349,37 @@ def main() -> None:
             except Exception:
                 logger.debug("BacktestConfig: %s", bt_config)
 
+            # Key config sanity (log the critical knobs that often block trading)
+            try:
+                ts = merged_config.get("technical_settings", {}) or {}
+                rs = merged_config.get("risk_settings", {}) or {}
+                fr = merged_config.get("flow_settings", {}) or {}
+                tr = merged_config.get("trading_rules", {}) or {}
+
+                logger.info(
+                    "🔧 Critical knobs | MIN_CONF=%s ENTRY_FACTOR=%s MAX_DEV_PIPS=%s FLOW_MAX_TOUCHES=%s FLOW_MIN_SEP=%s MIN_CANDLES_BETWEEN=%s MAX_POS=%s",
+                    ts.get("SCALPING_MIN_CONFIDENCE"),
+                    ts.get("ENTRY_FACTOR"),
+                    rs.get("MAX_PRICE_DEVIATION_PIPS"),
+                    fr.get("FLOW_MAX_TOUCHES"),
+                    fr.get("FLOW_TOUCH_MIN_SEPARATION_BARS"),
+                    tr.get("MIN_CANDLES_BETWEEN_TRADES"),
+                    tr.get("MAX_POSITIONS"),
+                )
+            except Exception:
+                pass
+
             engine = BacktestEngine(config=merged_config, bt_config=bt_config, overrides=override)
 
             logger.info("▶️ engine.run started | df_rows=%d", len(df))
             result = engine.run(df)
             logger.info("✅ engine.run finished")
 
+            # Export debug artifacts (optional, but recommended while diagnosing)
+            if args.export_debug:
+                _export_debug_artifacts(logger, out_dir, tag=f"debug_combo_{idx:03d}", override=override, result=result)
+
+            # Summaries
             diagnostics = summarize_cycle_log(result.cycle_log)
             score = score_objective(result.metrics, diagnostics, objective)
             passed, reason = _passes_failsafe(result.metrics, diagnostics, failsafe)
@@ -246,6 +395,9 @@ def main() -> None:
                 passed, reason, score if passed else float("-inf"),
                 net_pnl, pf, mdd, trades, ab_ratio
             )
+
+            # NEW: deep cycle_log diagnostic summary (key for “no trades” cases)
+            _summarize_cycle_log_for_debug(logger, result.cycle_log)
 
             results.append(
                 {
@@ -305,6 +457,7 @@ def main() -> None:
     best_row = results_df[results_df["passed"] == True].head(1)  # noqa: E712
     if best_row.empty:
         logger.warning("⚠️ No configuration passed failsafe filters.")
+        logger.warning("➡️ Tip: rerun with --export-debug to generate debug_combo_*.csv for diagnosis.")
         print("No configuration passed failsafe filters.")
         logger.info("Total elapsed: %s", _fmt_sec(time.perf_counter() - t0))
         return
