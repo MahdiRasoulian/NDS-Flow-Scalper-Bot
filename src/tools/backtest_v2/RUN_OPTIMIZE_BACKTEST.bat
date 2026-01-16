@@ -1,21 +1,37 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-:: پیدا کردن مسیر دقیق پوشه اصلی پروژه (NDS-Flow-Scalper-Bot)
-:: فرض بر این است که این فایل در src\tools\backtest_v2 قرار دارد
+:: -----------------------------
+:: Locate project root
+:: -----------------------------
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%..\..\.."
 set "ROOT=%cd%"
 
-:: تنظیم مسیرهای حیاتی
+:: -----------------------------
+:: Critical paths
+:: -----------------------------
 set "CFG=%ROOT%\config\bot_config.json"
 set "GRID=%ROOT%\src\tools\backtest_v2\grid.example.json"
 set "OUT=%ROOT%\out_opt_v2"
 set "DATA_DIR=%ROOT%\scripts"
 
+:: -----------------------------
+:: Tunables (EDIT HERE)
+:: -----------------------------
+set "DAYS=25"
+set "ROWS="
+set "WARMUP=450"
+set "LOG_LEVEL=INFO"
+set "EXPORT_DEBUG=1"
+
+:: Spread/slippage (optional)
+set "SPREAD="
+set "SLIPPAGE="
+
 echo Searching for data files in: "%DATA_DIR%"
 
-:: جستجو برای فایل اکسل
+:: Find newest .xlsx
 if exist "%DATA_DIR%\*.xlsx" (
     for /f "delims=" %%F in ('dir /b /o:-d "%DATA_DIR%\*.xlsx"') do (
         set "DATA=%DATA_DIR%\%%F"
@@ -23,7 +39,7 @@ if exist "%DATA_DIR%\*.xlsx" (
     )
 )
 
-:: جستجو برای فایل CSV (اگر اکسل پیدا نشد)
+:: Find newest .csv
 if exist "%DATA_DIR%\*.csv" (
     for /f "delims=" %%F in ('dir /b /o:-d "%DATA_DIR%\*.csv"') do (
         set "DATA=%DATA_DIR%\%%F"
@@ -39,18 +55,37 @@ exit /b 1
 echo --------------------------------------------------
 echo [OK] Using data file: "%DATA%"
 echo [OK] Config file:    "%CFG%"
+echo [OK] Grid file:      "%GRID%"
+echo [OK] Output dir:     "%OUT%"
 echo --------------------------------------------------
 
-:: رفتن به پوشه اصلی پروژه برای اجرای صحیح ماژول پایتون
 cd /d "%ROOT%"
 
-:: اجرای بهینه‌ساز با ماژولار پایتون
-python -m src.tools.backtest_v2.optimize ^
-  --data "%DATA%" ^
-  --config "%CFG%" ^
-  --grid "%GRID%" ^
-  --out "%OUT%" ^
-  --days 10
+:: -----------------------------
+:: Build args
+:: -----------------------------
+set "ARGS=--data "%DATA%" --config "%CFG%" --grid "%GRID%" --out "%OUT%" --days %DAYS% --warmup %WARMUP% --log-level %LOG_LEVEL%"
+
+if not "%ROWS%"=="" (
+  set "ARGS=%ARGS% --rows %ROWS%"
+)
+
+if not "%SPREAD%"=="" (
+  set "ARGS=%ARGS% --spread %SPREAD%"
+)
+
+if not "%SLIPPAGE%"=="" (
+  set "ARGS=%ARGS% --slippage %SLIPPAGE%"
+)
+
+if "%EXPORT_DEBUG%"=="1" (
+  set "ARGS=%ARGS% --export-debug"
+)
+
+echo [RUN] python -m src.tools.backtest_v2.optimize %ARGS%
+echo --------------------------------------------------
+
+python -m src.tools.backtest_v2.optimize %ARGS%
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
@@ -59,7 +94,6 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b %ERRORLEVEL%
 )
 
-:: باز کردن پوشه نتایج
 if exist "%OUT%" start "" "%OUT%"
 
 echo.
