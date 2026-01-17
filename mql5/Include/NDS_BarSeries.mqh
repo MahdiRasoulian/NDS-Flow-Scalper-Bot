@@ -23,8 +23,11 @@ public:
       return m_copied;
    }
 
-   const MqlRates &Get(const int index) const
+   bool GetBar(const int index, MqlRates &out_bar) const
    {
-      return m_rates[index];
+      if(index < 0 || index >= m_copied)
+         return false;
+      out_bar = m_rates[index];
+      return true;
    }
 };

@@ -1,5 +1,4 @@
 #pragma once
-#include <Arrays/ArrayString.mqh>
 
 enum ENUM_SIGNAL
 {
@@ -57,16 +56,14 @@ public:
 class CSMC_Analyzer
 {
 private:
-   CLogger *m_logger;
-
-   bool DetectBreaker(const MqlRates &bar, const double recent_high, const double recent_low, const double sweep_buffer)
+   bool DetectBreaker(MqlRates &bar, const double recent_high, const double recent_low, const double sweep_buffer)
    {
       bool swept_high = bar.high > recent_high + sweep_buffer;
       bool swept_low  = bar.low < recent_low - sweep_buffer;
       return (swept_high || swept_low);
    }
 
-   bool DetectIFVG(const MqlRates &bar, const MqlRates &prev_bar, double &gap_low, double &gap_high)
+   bool DetectIFVG(MqlRates &bar, MqlRates &prev_bar, double &gap_low, double &gap_high)
    {
       if(bar.low > prev_bar.high)
       {
@@ -84,17 +81,11 @@ private:
    }
 
 public:
-   CSMC_Analyzer() : m_logger(NULL) {}
+   CSMC_Analyzer() {}
 
-   void SetLogger(CLogger *logger)
+   void Analyze(MqlRates &bar, MqlRates &prev_bar, const double recent_high,
+                const double recent_low, const double sweep_buffer, SignalResult &result, CLogger &logger)
    {
-      m_logger = logger;
-   }
-
-   SignalResult Analyze(const MqlRates &bar, const MqlRates &prev_bar, const double recent_high,
-                        const double recent_low, const double sweep_buffer)
-   {
-      SignalResult result;
       result.signal = SIGNAL_NONE;
       result.confidence = 0.0;
       result.reason_count = 0;
@@ -111,11 +102,9 @@ public:
       bool breaker_found = DetectBreaker(bar, recent_high, recent_low, sweep_buffer);
       bool ifvg_found = DetectIFVG(bar, prev_bar, gap_low, gap_high);
 
-      if(m_logger != NULL)
-      {
-         m_logger.Log("[SMC]", StringFormat("breaker_found=%s ifvg_found=%s", breaker_found ? "true" : "false",
-                                            ifvg_found ? "true" : "false"));
-      }
+      logger.Log("[SMC]", StringFormat("breaker_found=%s ifvg_found=%s",
+                                       breaker_found ? "true" : "false",
+                                       ifvg_found ? "true" : "false"));
 
       if(breaker_found && ifvg_found)
       {
@@ -130,79 +119,33 @@ public:
          result.zone_type = "IFVG";
          result.zone_id = StringFormat("ifvg_%I64d", (long)bar.time);
       }
-
-      return result;
-   }
-};
-
-class CMomentum
-{
-private:
-   int m_adx_handle;
-   double m_adx_buffer[];
-
-public:
-   CMomentum() : m_adx_handle(INVALID_HANDLE) {}
-
-   bool Init(const string symbol, ENUM_TIMEFRAMES tf, const int period)
-   {
-      m_adx_handle = iADX(symbol, tf, period);
-      ArraySetAsSeries(m_adx_buffer, true);
-      return (m_adx_handle != INVALID_HANDLE);
-   }
-
-   bool Update()
-   {
-      if(m_adx_handle == INVALID_HANDLE)
-         return false;
-      int copied = CopyBuffer(m_adx_handle, 0, 0, 2, m_adx_buffer);
-      return (copied > 0);
-   }
-
-   double Value() const
-   {
-      if(ArraySize(m_adx_buffer) == 0)
-         return 0.0;
-      return m_adx_buffer[0];
    }
 };
 
 class CFilters
 {
-private:
-   CLogger *m_logger;
-
 public:
-   CFilters() : m_logger(NULL) {}
+   CFilters() {}
 
-   void SetLogger(CLogger *logger)
-   {
-      m_logger = logger;
-   }
-
-   bool SpreadOk(const double spread_points, const double max_spread_points)
+   bool SpreadOk(const double spread_points, const double max_spread_points, CLogger &logger)
    {
       bool ok = (spread_points <= max_spread_points);
-      if(m_logger != NULL)
-      {
-         m_logger->Log("[FILTER]", StringFormat("spread_ok=%s spread=%.1f max=%.1f", ok ? "true" : "false",
-                                                spread_points, max_spread_points));
-      }
+      logger.Log("[FILTER]", StringFormat("spread_ok=%s spread=%.1f max=%.1f",
+                                          ok ? "true" : "false",
+                                          spread_points, max_spread_points));
       return ok;
    }
 
-   bool SessionOk(const datetime bar_time, const int cooldown_minutes)
+   bool SessionOk(const datetime bar_time, const int cooldown_minutes, CLogger &logger)
    {
       MqlDateTime dt;
       TimeToStruct(bar_time, dt);
       int minutes = dt.hour * 60 + dt.min;
-      int ny_open = 13 * 60 + 30; // placeholder for NY open 13:30 UTC
+      int ny_open = 13 * 60 + 30;
       bool ok = (MathAbs(minutes - ny_open) > cooldown_minutes);
-      if(m_logger != NULL)
-      {
-         m_logger->Log("[FILTER]", StringFormat("session_ok=%s cooldown_minutes=%d", ok ? "true" : "false",
-                                                cooldown_minutes));
-      }
+      logger.Log("[FILTER]", StringFormat("session_ok=%s cooldown_minutes=%d",
+                                          ok ? "true" : "false",
+                                          cooldown_minutes));
       return ok;
    }
 };
