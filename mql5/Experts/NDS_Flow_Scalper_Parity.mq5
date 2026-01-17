@@ -683,12 +683,21 @@ int CountOpenPositions()
 {
    int count = 0;
    int total = PositionsTotal();
+   
    for(int i = 0; i < total; i++)
    {
-      if(!PositionSelectByIndex(i))
-         continue;
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol)
-         count++;
+      ulong ticket = PositionGetTicket(i);
+      
+      if(ticket > 0)
+      {
+         if(PositionSelectByTicket(ticket))
+         {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               count++;
+            }
+         }
+      }
    }
    return count;
 }
@@ -696,27 +705,40 @@ int CountOpenPositions()
 double CalcOpenRiskPercent()
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(balance <= 0.0)
-      return 0.0;
-   double total_risk = 0.0;
+   if(balance <= 0.0) return 0.0;
+   
+   double total_risk_usd = 0.0;
    int total = PositionsTotal();
+   
    for(int i = 0; i < total; i++)
    {
-      if(!PositionSelectByIndex(i))
-         continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl = PositionGetDouble(POSITION_SL);
-      double volume = PositionGetDouble(POSITION_VOLUME);
-      if(sl <= 0.0)
-         continue;
-      double pip_value = (SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) /
-                          SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE)) * g_risk.PipSize();
-      double risk_pips = MathAbs(entry - sl) / g_risk.PipSize();
-      total_risk += risk_pips * pip_value * volume;
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+            double sl     = PositionGetDouble(POSITION_SL);
+            double volume = PositionGetDouble(POSITION_VOLUME);
+            
+            if(sl > 0.0)
+            {
+               double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+               double tick_size  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+               
+               // محاسبه ریسک دلاری پوزیشن بر اساس فاصله قیمت ورود تا استاپ لاس
+               double risk_dist = MathAbs(entry - sl);
+               double position_risk_usd = (risk_dist / tick_size) * tick_value * volume;
+               
+               total_risk_usd += position_risk_usd;
+            }
+         }
+      }
    }
-   return (total_risk / balance) * 100.0;
+   
+   return (total_risk_usd / balance) * 100.0;
 }
 
 int OnInit()
@@ -821,4 +843,35 @@ void OnTick()
       g_last_trade_bar_time = g_last_bar_time;
    if(g_trader.HasPosition())
       g_signal.DrawSignal(signal);
+}
+
+
+// محاسبه لات سایز با چک کردن مارجین (جلوگیری از خطای 10019)
+double CalculateSmartLot(double sl_dist_price)
+{
+   double risk_usd = AccountInfoDouble(ACCOUNT_BALANCE) * (InpRiskPercent / 100.0);
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   if(sl_dist_price <= 0) return 0.01;
+   
+   double lot = risk_usd / (sl_dist_price / tick_size * tick_value);
+   
+   // محدود کردن بر اساس حداکثر لات فایل کانفیگ (2.0)
+   lot = MathMin(lot, 2.0); 
+   
+   // چک کردن Margin
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(lot * 100000 / 100 > free_margin * 0.7) // فرض بر اهرم 1:100
+      lot = free_margin * 0.7 / (100000 / 100);
+      
+   return NormalizeDouble(MathMax(lot, 0.01), 2);
+}
+
+// تبدیل پیپ به قیمت مخصوص طلا
+double PipsToPrice(double pips)
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(digits == 2) return pips * 0.1; // طلا: هر 10 پوینت یک پیپ است
+   return pips * _Point;
 }
