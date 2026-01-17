@@ -198,8 +198,8 @@ private:
       if(ArraySize(rates) < 4)
          return false;
 
-      const MqlRates &r1 = rates[1];
-      const MqlRates &r3 = rates[3];
+      MqlRates r1 = rates[1];
+      MqlRates r3 = rates[3];
 
       if(direction == DIR_BULLISH)
       {
@@ -267,6 +267,7 @@ public:
       if(copied < 10)
          return;
 
+      m_zone_count = 0;
       UpdateIndicators();
 
       SZone zone;
@@ -305,21 +306,20 @@ public:
       double price = rates[1].close;
       for(int i = 0; i < m_zone_count; i++)
       {
-         SZone &zone = m_zones[i];
-         if(!zone.fresh && !InpAllowRetest)
+         if(!m_zones[i].fresh && !InpAllowRetest)
             continue;
-         if(zone.type == ZONE_IFVG && zone.bars_alive > InpIFVGMaxBars)
+         if(m_zones[i].type == ZONE_IFVG && m_zones[i].bars_alive > InpIFVGMaxBars)
             continue;
-         if(price >= zone.low && price <= zone.high)
+         if(price >= m_zones[i].low && price <= m_zones[i].high)
          {
             signal.valid = true;
-            signal.direction = zone.direction;
+            signal.direction = m_zones[i].direction;
             signal.entry_price = price;
-            signal.reason = zone.type == ZONE_BREAKER ? "BREAKER" : "IFVG";
-            signal.zone = zone;
-            zone.touched = true;
+            signal.reason = m_zones[i].type == ZONE_BREAKER ? "BREAKER" : "IFVG";
+            signal.zone = m_zones[i];
+            m_zones[i].touched = true;
             if(!InpAllowRetest)
-               zone.fresh = false;
+               m_zones[i].fresh = false;
             return signal;
          }
       }
@@ -443,6 +443,13 @@ public:
          m_state.ticket = (ulong)m_trade.ResultOrder();
          m_state.tp1_hit = false;
          m_state.tp1_price = tp1;
+         Print("TRADE_OPENED: ", signal.reason, " ticket=", (string)m_state.ticket, " volume=", DoubleToString(volume, 2));
+      }
+      else
+      {
+         Print("TRADE_REJECTED: ", signal.reason,
+               " retcode=", (string)m_trade.ResultRetcode(),
+               " desc=", m_trade.ResultRetcodeDescription());
       }
       return result;
    }
@@ -478,10 +485,15 @@ public:
             double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
             if(close_volume < min_lot)
                close_volume = volume;
-            m_trade.PositionClosePartial(_Symbol, close_volume);
+            if(!m_trade.PositionClosePartial(_Symbol, close_volume))
+               Print("TP1_CLOSE_FAILED: retcode=", (string)m_trade.ResultRetcode(),
+                     " desc=", m_trade.ResultRetcodeDescription());
             double breakeven = price_open;
-            m_trade.PositionModify(_Symbol, breakeven, 0.0);
+            if(!m_trade.PositionModify(_Symbol, breakeven, 0.0))
+               Print("BREAKEVEN_FAILED: retcode=", (string)m_trade.ResultRetcode(),
+                     " desc=", m_trade.ResultRetcodeDescription());
             m_state.tp1_hit = true;
+            Print("TP1_HIT: ticket=", (string)ticket, " close_volume=", DoubleToString(close_volume, 2));
          }
       }
 
@@ -495,13 +507,21 @@ public:
          {
             double new_sl = current_price - trailing;
             if(new_sl > sl)
-               m_trade.PositionModify(_Symbol, new_sl, 0.0);
+            {
+               if(!m_trade.PositionModify(_Symbol, new_sl, 0.0))
+                  Print("TRAIL_MODIFY_FAILED: retcode=", (string)m_trade.ResultRetcode(),
+                        " desc=", m_trade.ResultRetcodeDescription());
+            }
          }
          else
          {
             double new_sl = current_price + trailing;
             if(new_sl < sl || sl == 0.0)
-               m_trade.PositionModify(_Symbol, new_sl, 0.0);
+            {
+               if(!m_trade.PositionModify(_Symbol, new_sl, 0.0))
+                  Print("TRAIL_MODIFY_FAILED: retcode=", (string)m_trade.ResultRetcode(),
+                        " desc=", m_trade.ResultRetcodeDescription());
+            }
          }
       }
    }
@@ -551,7 +571,11 @@ bool PassFilters()
    double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double spread_pips = spread / g_risk.PipSize();
    if(spread_pips > InpMaxSpreadPips)
+   {
+      Print("FILTER_REJECT: SPREAD too high spread_pips=", DoubleToString(spread_pips, 2),
+            " max=", DoubleToString(InpMaxSpreadPips, 2));
       return false;
+   }
 
    datetime now = TimeCurrent();
    MqlDateTime tm;
@@ -559,7 +583,11 @@ bool PassFilters()
    int ny_minutes = tm.hour * 60 + tm.min;
    int open_minutes = InpNYOpenHour * 60 + InpNYOpenMinute;
    if(MathAbs(ny_minutes - open_minutes) <= InpNYOpenCooldownMinutes)
+   {
+      Print("FILTER_REJECT: NY_COOLDOWN now=", (string)ny_minutes,
+            " open=", (string)open_minutes, " window=", (string)InpNYOpenCooldownMinutes);
       return false;
+   }
 
    double atr = GetATR(1);
    double atr_avg = 0.0;
@@ -567,7 +595,11 @@ bool PassFilters()
       atr_avg += GetATR(i);
    atr_avg /= 20.0;
    if(atr_avg > 0.0 && atr > atr_avg * InpATRSpikeMult)
+   {
+      Print("FILTER_REJECT: ATR_SPIKE atr=", DoubleToString(atr, 2),
+            " avg=", DoubleToString(atr_avg, 2), " mult=", DoubleToString(InpATRSpikeMult, 2));
       return false;
+   }
 
    return true;
 }
@@ -603,11 +635,17 @@ void OnTick()
    g_signal.Analyze();
 
    if(g_trader.HasPosition())
+   {
+      Print("SKIP: existing position");
       return;
+   }
 
    SSignal signal = g_signal.GenerateSignal();
    if(!signal.valid)
+   {
+      Print("NO_SIGNAL: no valid breaker/ifvg/momentum");
       return;
+   }
 
    double sl = 0.0;
    double tp1 = 0.0;
@@ -615,7 +653,10 @@ void OnTick()
 
    double volume = g_risk.CalcVolume(InpSLPips);
    if(volume <= 0.0)
+   {
+      Print("ORDER_REJECT: volume=0, check risk/contract settings");
       return;
+   }
 
    if(g_trader.OpenPosition(signal, sl, tp1, volume))
       g_signal.DrawSignal(signal);
