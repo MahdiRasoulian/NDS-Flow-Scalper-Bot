@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import struct
-from typing import Dict, List
+from typing import Dict, List, Union
 
 MAGIC = 0x4E445342  # 'NDSB'
 VERSION = 1
@@ -102,7 +102,7 @@ class MarketSnapshot:
 
 @dataclass
 class ExecutionCommand:
-    action: str
+    action: Union[int, str]
     entry: float
     sl: float
     tp: float
@@ -126,7 +126,10 @@ class ExecutionCommand:
         ).encode("utf-8")
         payload = payload[:255]
         payload = payload + b"\x00" * (256 - len(payload))
-        action_code = ACTION_TO_CODE.get(self.action.upper(), 0)
+        if isinstance(self.action, str):
+            action_code = ACTION_TO_CODE.get(self.action.upper(), 0)
+        else:
+            action_code = int(self.action)
         return RESPONSE_STRUCT.pack(
             MAGIC,
             VERSION,
@@ -158,7 +161,7 @@ class ExecutionCommand:
         ) = RESPONSE_STRUCT.unpack(payload[:RESPONSE_SIZE])
         if magic != MAGIC or version != VERSION:
             raise ValueError("Invalid bridge response header")
-        action = CODE_TO_ACTION.get(action_code, "NONE")
+        action = int(action_code)
         reason_codes: List[str] = []
         if json_payload:
             raw = json_payload.split(b"\x00", 1)[0]
@@ -178,8 +181,12 @@ class ExecutionCommand:
         )
 
     def to_payload(self) -> Dict[str, object]:
+        if isinstance(self.action, str):
+            signal = self.action.upper()
+        else:
+            signal = CODE_TO_ACTION.get(self.action, "NONE")
         return {
-            "signal": self.action,
+            "signal": signal,
             "entry": self.entry,
             "sl": self.sl,
             "tp": self.tp,
