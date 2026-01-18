@@ -86,6 +86,7 @@ double GetATR(int shift);
 double GetADX(int shift);
 int CountOpenPositions();
 double CalcOpenRiskPercent();
+double PipsToPrice(double pips);
 
 class CSignalEngine
 {
@@ -97,10 +98,7 @@ private:
 
    double PipSize()
    {
-      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-      if(digits == 2 || digits == 3 || digits == 5)
-         return _Point * 10.0;
-      return _Point;
+      return PipsToPrice(1.0);
    }
 
    void DrawZone(const SZone &zone)
@@ -378,10 +376,7 @@ class CRiskManager
 public:
    double PipSize()
    {
-      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-      if(digits == 2 || digits == 3 || digits == 5)
-         return _Point * 10.0;
-      return _Point;
+      return PipsToPrice(1.0);
    }
 
    double NormalizePips(double pips)
@@ -394,11 +389,13 @@ public:
    void BuildLevels(ENDSDirection direction, double entry, double sl_pips, double tp1_pips, double tp2_pips,
                     double &sl, double &tp1, double &tp2)
    {
-      double pip = PipSize();
-      double sl_dist = NormalizePips(sl_pips) * pip;
-      double tp1_dist = NormalizePips(tp1_pips) * pip;
-      double tp2_dist = NormalizePips(tp2_pips) * pip;
+      double sl_dist = PipsToPrice(NormalizePips(sl_pips));
+      double tp1_dist = PipsToPrice(NormalizePips(tp1_pips));
+      double tp2_dist = PipsToPrice(NormalizePips(tp2_pips));
       double stop_level = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double spread = ask - bid;
 
       if(direction == DIR_BULLISH)
       {
@@ -411,6 +408,14 @@ public:
          sl = entry + sl_dist;
          tp1 = entry - tp1_dist;
          tp2 = entry - tp2_dist;
+      }
+
+      if(spread > 0.0)
+      {
+         if(direction == DIR_BULLISH && (entry - sl) < spread)
+            sl = entry - spread;
+         if(direction == DIR_BEARISH && (sl - entry) < spread)
+            sl = entry + spread;
       }
 
       if(stop_level > 0.0)
@@ -489,11 +494,12 @@ public:
    bool OpenPosition(const SSignal &signal, double sl, double tp1, double tp2, double volume)
    {
       bool result = false;
+      double normalized_sl = NormalizeDouble(sl, _Digits);
       m_trade.SetDeviationInPoints(10);
       if(signal.direction == DIR_BULLISH)
-         result = m_trade.Buy(volume, _Symbol, 0.0, sl, 0.0, signal.reason);
+         result = m_trade.Buy(volume, _Symbol, 0.0, normalized_sl, 0.0, signal.reason);
       else
-         result = m_trade.Sell(volume, _Symbol, 0.0, sl, 0.0, signal.reason);
+         result = m_trade.Sell(volume, _Symbol, 0.0, normalized_sl, 0.0, signal.reason);
 
       if(result)
       {
@@ -546,7 +552,7 @@ public:
             if(!m_trade.PositionClosePartial(_Symbol, close_volume))
                Print("TP1_CLOSE_FAILED: retcode=", (string)m_trade.ResultRetcode(),
                      " desc=", m_trade.ResultRetcodeDescription());
-            double breakeven = price_open;
+            double breakeven = NormalizeDouble(price_open, _Digits);
             if(InpFlowTp1MoveSLtoBE)
             {
                if(!m_trade.PositionModify(_Symbol, breakeven, 0.0))
@@ -580,7 +586,7 @@ public:
          double trailing = atr * InpTrailingATRMult;
          if(type == POSITION_TYPE_BUY)
          {
-            double new_sl = current_price - trailing;
+            double new_sl = NormalizeDouble(current_price - trailing, _Digits);
             if(new_sl > sl)
             {
                if(!m_trade.PositionModify(_Symbol, new_sl, 0.0))
@@ -590,7 +596,7 @@ public:
          }
          else
          {
-            double new_sl = current_price + trailing;
+            double new_sl = NormalizeDouble(current_price + trailing, _Digits);
             if(new_sl < sl || sl == 0.0)
             {
                if(!m_trade.PositionModify(_Symbol, new_sl, 0.0))
@@ -645,10 +651,11 @@ bool IsNewCandle()
 bool PassFilters()
 {
    double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(spread > InpMaxSpreadPips * 10.0 * _Point)
+   double max_spread = PipsToPrice(InpMaxSpreadPips);
+   if(spread > max_spread)
    {
       Print("FILTER_REJECT: SPREAD too high spread_price=", DoubleToString(spread, _Digits),
-            " max_price=", DoubleToString(InpMaxSpreadPips * 10.0 * _Point, _Digits));
+            " max_price=", DoubleToString(max_spread, _Digits));
       return false;
    }
 
@@ -807,14 +814,19 @@ void OnTick()
       return;
    }
 
+   ENUM_ORDER_TYPE order_type = signal.direction == DIR_BULLISH ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   double entry_price = order_type == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                                     : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   entry_price = NormalizeDouble(entry_price, _Digits);
+
    double sl = 0.0;
    double tp1 = 0.0;
    double tp2 = 0.0;
-   g_risk.BuildLevels(signal.direction, signal.entry_price, InpSLPips, InpTP1Pips, InpTP2Pips, sl, tp1, tp2);
+   g_risk.BuildLevels(signal.direction, entry_price, InpSLPips, InpTP1Pips, InpTP2Pips, sl, tp1, tp2);
    if(!InpTP2Enabled)
       tp2 = 0.0;
 
-   double rr = MathAbs(tp1 - signal.entry_price) / MathAbs(signal.entry_price - sl);
+   double rr = MathAbs(tp1 - entry_price) / MathAbs(entry_price - sl);
    if(rr < InpMinRiskReward)
    {
       Print("ORDER_REJECT: risk reward below min rr=", DoubleToString(rr, 2),
@@ -822,9 +834,6 @@ void OnTick()
       return;
    }
 
-   ENUM_ORDER_TYPE order_type = signal.direction == DIR_BULLISH ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   double entry_price = order_type == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                                                     : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double volume = g_risk.CalcVolume(InpSLPips, InpRiskPercent, order_type, entry_price);
    if(volume <= 0.0)
    {
@@ -852,6 +861,7 @@ double CalculateSmartLot(double sl_dist_price)
    double risk_usd = AccountInfoDouble(ACCOUNT_BALANCE) * (InpRiskPercent / 100.0);
    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double entry_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
    if(sl_dist_price <= 0) return 0.01;
    
@@ -859,19 +869,29 @@ double CalculateSmartLot(double sl_dist_price)
    
    // محدود کردن بر اساس حداکثر لات فایل کانفیگ (2.0)
    lot = MathMin(lot, 2.0); 
-   
-   // چک کردن Margin
-   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-   if(lot * 100000 / 100 > free_margin * 0.7) // فرض بر اهرم 1:100
-      lot = free_margin * 0.7 / (100000 / 100);
-      
-   return NormalizeDouble(MathMax(lot, 0.01), 2);
+
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   lot = MathMax(min_lot, MathMin(max_lot, lot));
+   lot = MathFloor(lot / step) * step;
+
+   double free_margin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double required_margin = 0.0;
+   if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lot, entry_price, required_margin))
+   {
+      if(required_margin > free_margin * 0.8)
+      {
+         double scale = (free_margin * 0.8) / required_margin;
+         lot = MathFloor((lot * scale) / step) * step;
+      }
+   }
+
+   return NormalizeDouble(MathMax(lot, min_lot), 2);
 }
 
 // تبدیل پیپ به قیمت مخصوص طلا
 double PipsToPrice(double pips)
 {
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   if(digits == 2) return pips * 0.1; // طلا: هر 10 پوینت یک پیپ است
-   return pips * _Point;
+   return pips * 0.1;
 }
