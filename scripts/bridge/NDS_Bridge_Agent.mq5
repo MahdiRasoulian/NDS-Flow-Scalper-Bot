@@ -7,7 +7,7 @@
 input string BridgeMappingName = "NDS_FLOW_BRIDGE";
 input string BridgeRequestEvent = "NDS_FLOW_BRIDGE_REQ";
 input string BridgeResponseEvent = "NDS_FLOW_BRIDGE_RESP";
-input string TradingSymbol = "XAUUSD";
+input string TradingSymbol = "XAUUSD!";
 input ENUM_TIMEFRAMES BarTimeframe = PERIOD_M5;
 input bool UseBarSync = false;
 input int DecisionTimeoutMs = 500;
