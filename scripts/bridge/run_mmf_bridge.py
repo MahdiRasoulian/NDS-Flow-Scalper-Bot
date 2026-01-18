@@ -3,17 +3,32 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List
 
 import pandas as pd
 
-from src.bridge.mmf_bridge import BridgeConfig, JsonLoggingDecisionWrapper, MMFBridgeServer
-from src.bridge.mmf_protocol import ACTION_TO_CODE, ExecutionCommand, MarketSnapshot
-from src.trading_bot.nds.analyzer import analyze_gold_market
+# --- اصلاح مسیر پروژه (فقط این بخش اضافه شد) ---
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+# ----------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+try:
+    from src.bridge.mmf_bridge import BridgeConfig, JsonLoggingDecisionWrapper, MMFBridgeServer
+    from src.bridge.mmf_protocol import ACTION_TO_CODE, ExecutionCommand, MarketSnapshot
+    from src.trading_bot.nds.analyzer import analyze_gold_market
+except ImportError as e:
+    print(f"❌ Error importing modules: {e}")
+    sys.exit(1)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 
 @dataclass
