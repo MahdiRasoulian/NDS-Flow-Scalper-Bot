@@ -83,12 +83,50 @@ int request_event = 0;
 int response_event = 0;
 ulong sequence_id = 0;
 int csv_handle = INVALID_HANDLE;
+string resolved_symbol = "";
+
+string ResolveTradingSymbol(const string desired)
+{
+   string candidate = desired;
+   if(candidate == "")
+      candidate = _Symbol;
+
+   if(SymbolSelect(candidate, true))
+      return candidate;
+
+   if(StringFind(_Symbol, candidate) == 0)
+   {
+      SymbolSelect(_Symbol, true);
+      return _Symbol;
+   }
+
+   if(StringFind(candidate, _Symbol) == 0)
+   {
+      SymbolSelect(_Symbol, true);
+      return _Symbol;
+   }
+
+   int total = SymbolsTotal(true);
+   for(int i = 0; i < total; i++)
+   {
+      string name = SymbolName(i, true);
+      if(StringFind(name, candidate) == 0)
+      {
+         SymbolSelect(name, true);
+         return name;
+      }
+   }
+
+   return candidate;
+}
 
 int OnInit()
 {
-   if(!SymbolInfoInteger(TradingSymbol, SYMBOL_SELECT))
+   resolved_symbol = ResolveTradingSymbol(TradingSymbol);
+   if(!SymbolSelect(resolved_symbol, true))
    {
-      SymbolSelect(TradingSymbol, true);
+      Print("❌ Failed to select trading symbol: ", resolved_symbol);
+      return INIT_FAILED;
    }
 
    mapping_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, 0, PAGE_READWRITE, 0, 2048, BridgeMappingName);
@@ -166,8 +204,8 @@ void OnTimer()
 
 void ProcessBridge()
 {
-   if(_Symbol != TradingSymbol)
-      return;
+   if(resolved_symbol == "")
+      resolved_symbol = ResolveTradingSymbol(TradingSymbol);
 
    BridgeRequest request;
    ZeroMemory(request);
@@ -178,26 +216,26 @@ void ProcessBridge()
    request.sequence = (longlong)sequence_id++;
    request.timestamp_ms = (longlong)(TimeCurrent() * 1000);
 
-   StringToCharArray(TradingSymbol, request.symbol, 0, 11);
+   StringToCharArray(resolved_symbol, request.symbol, 0, 11);
 
-   double bid = SymbolInfoDouble(TradingSymbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(TradingSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(resolved_symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(resolved_symbol, SYMBOL_ASK);
    request.bid = bid;
    request.ask = ask;
    request.spread = MathAbs(ask - bid);
 
-   request.o_cur = iOpen(TradingSymbol, BarTimeframe, 0);
-   request.h_cur = iHigh(TradingSymbol, BarTimeframe, 0);
-   request.l_cur = iLow(TradingSymbol, BarTimeframe, 0);
-   request.c_cur = iClose(TradingSymbol, BarTimeframe, 0);
+   request.o_cur = iOpen(resolved_symbol, BarTimeframe, 0);
+   request.h_cur = iHigh(resolved_symbol, BarTimeframe, 0);
+   request.l_cur = iLow(resolved_symbol, BarTimeframe, 0);
+   request.c_cur = iClose(resolved_symbol, BarTimeframe, 0);
 
-   request.o_prev = iOpen(TradingSymbol, BarTimeframe, 1);
-   request.h_prev = iHigh(TradingSymbol, BarTimeframe, 1);
-   request.l_prev = iLow(TradingSymbol, BarTimeframe, 1);
-   request.c_prev = iClose(TradingSymbol, BarTimeframe, 1);
+   request.o_prev = iOpen(resolved_symbol, BarTimeframe, 1);
+   request.h_prev = iHigh(resolved_symbol, BarTimeframe, 1);
+   request.l_prev = iLow(resolved_symbol, BarTimeframe, 1);
+   request.c_prev = iClose(resolved_symbol, BarTimeframe, 1);
 
-   request.bar_time_current = (longlong)iTime(TradingSymbol, BarTimeframe, 0);
-   request.bar_time_previous = (longlong)iTime(TradingSymbol, BarTimeframe, 1);
+   request.bar_time_current = (longlong)iTime(resolved_symbol, BarTimeframe, 0);
+   request.bar_time_previous = (longlong)iTime(resolved_symbol, BarTimeframe, 1);
 
    request.market_state = (uint)(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? 1 : 0);
 
@@ -241,32 +279,32 @@ void ExecuteCommand(BridgeResponse response)
    if(response.action == 1)
    {
       action_name = "BUY";
-      result = trade.Buy(response.volume, TradingSymbol, response.entry, response.sl, response.tp, "NDS_Bridge");
+      result = trade.Buy(response.volume, resolved_symbol, response.entry, response.sl, response.tp, "NDS_Bridge");
    }
    else if(response.action == 2)
    {
       action_name = "SELL";
-      result = trade.Sell(response.volume, TradingSymbol, response.entry, response.sl, response.tp, "NDS_Bridge");
+      result = trade.Sell(response.volume, resolved_symbol, response.entry, response.sl, response.tp, "NDS_Bridge");
    }
    else if(response.action == 3)
    {
       action_name = "BUY_LIMIT";
-      result = trade.BuyLimit(response.volume, response.entry, TradingSymbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
+      result = trade.BuyLimit(response.volume, response.entry, resolved_symbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
    }
    else if(response.action == 4)
    {
       action_name = "SELL_LIMIT";
-      result = trade.SellLimit(response.volume, response.entry, TradingSymbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
+      result = trade.SellLimit(response.volume, response.entry, resolved_symbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
    }
    else if(response.action == 5)
    {
       action_name = "BUY_STOP";
-      result = trade.BuyStop(response.volume, response.entry, TradingSymbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
+      result = trade.BuyStop(response.volume, response.entry, resolved_symbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
    }
    else if(response.action == 6)
    {
       action_name = "SELL_STOP";
-      result = trade.SellStop(response.volume, response.entry, TradingSymbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
+      result = trade.SellStop(response.volume, response.entry, resolved_symbol, response.sl, response.tp, ORDER_TIME_GTC, 0, "NDS_Bridge");
    }
 
    ulong retcode = trade.ResultRetcode();
