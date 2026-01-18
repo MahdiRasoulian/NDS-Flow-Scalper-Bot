@@ -20,14 +20,13 @@ input ulong MagicNumber = 909090;
 #define WAIT_OBJECT_0 0x00000000
 #define WAIT_TIMEOUT 0x00000102
 
-#pragma pack(push,1)
 struct BridgeRequest
 {
    uint magic;
    ushort version;
    ushort flags;
-   longlong sequence;
-   longlong timestamp_ms;
+   long sequence;
+   long timestamp_ms;
    char symbol[12];
    double bid;
    double ask;
@@ -40,8 +39,8 @@ struct BridgeRequest
    double h_prev;
    double l_prev;
    double c_prev;
-   longlong bar_time_current;
-   longlong bar_time_previous;
+   long bar_time_current;
+   long bar_time_previous;
    uint market_state;
 };
 
@@ -50,7 +49,7 @@ struct BridgeResponse
    uint magic;
    ushort version;
    ushort action;
-   longlong sequence;
+   long sequence;
    double entry;
    double sl;
    double tp;
@@ -59,31 +58,164 @@ struct BridgeResponse
    uint flags;
    char json_payload[256];
 };
-#pragma pack(pop)
 
 #import "kernel32.dll"
-int CreateFileMappingW(int hFile,int lpAttributes,int flProtect,int dwMaximumSizeHigh,int dwMaximumSizeLow,string lpName);
-int OpenFileMappingW(int dwDesiredAccess,bool bInheritHandle,string lpName);
-int MapViewOfFile(int hFileMappingObject,int dwDesiredAccess,int dwFileOffsetHigh,int dwFileOffsetLow,int dwNumberOfBytesToMap);
-bool UnmapViewOfFile(int lpBaseAddress);
-bool CloseHandle(int hObject);
-int CreateEventW(int lpEventAttributes,bool bManualReset,bool bInitialState,string lpName);
-bool SetEvent(int hEvent);
-bool ResetEvent(int hEvent);
-int WaitForSingleObject(int hHandle,int dwMilliseconds);
-void RtlMoveMemory(int dst, uchar &src[], int size);
-void RtlMoveMemory(uchar &dst[], int src, int size);
+long CreateFileMappingW(int hFile,int lpAttributes,int flProtect,int dwMaximumSizeHigh,int dwMaximumSizeLow,string lpName);
+long OpenFileMappingW(int dwDesiredAccess,bool bInheritHandle,string lpName);
+long MapViewOfFile(long hFileMappingObject,int dwDesiredAccess,int dwFileOffsetHigh,int dwFileOffsetLow,int dwNumberOfBytesToMap);
+bool UnmapViewOfFile(long lpBaseAddress);
+bool CloseHandle(long hObject);
+long CreateEventW(int lpEventAttributes,bool bManualReset,bool bInitialState,string lpName);
+bool SetEvent(long hEvent);
+bool ResetEvent(long hEvent);
+int WaitForSingleObject(long hHandle,int dwMilliseconds);
+void RtlMoveMemory(long dst, uchar &src[], int size);
+void RtlMoveMemory(uchar &dst[], long src, int size);
 #import
 
 CTrade trade;
 
-int mapping_handle = 0;
-int map_view = 0;
-int request_event = 0;
-int response_event = 0;
-ulong sequence_id = 0;
+const int SYMBOL_SIZE = 12;
+const int JSON_SIZE = 256;
+const int REQUEST_SIZE = 120;
+const int RESPONSE_SIZE = 316;
+
+long mapping_handle = 0;
+long map_view = 0;
+long request_event = 0;
+long response_event = 0;
+long sequence_id = 0;
 int csv_handle = INVALID_HANDLE;
 string resolved_symbol = "";
+
+void WriteUShort(uchar &buffer[], int offset, ushort value)
+{
+   ShortToCharArray((short)value, buffer, offset);
+}
+
+void WriteUInt(uchar &buffer[], int offset, uint value)
+{
+   IntToCharArray((int)value, buffer, offset);
+}
+
+void WriteLong(uchar &buffer[], int offset, long value)
+{
+   LongToCharArray(value, buffer, offset);
+}
+
+void WriteDouble(uchar &buffer[], int offset, double value)
+{
+   DoubleToCharArray(value, buffer, offset);
+}
+
+ushort ReadUShort(const uchar &buffer[], int offset)
+{
+   return (ushort)CharArrayToShort(buffer, offset);
+}
+
+uint ReadUInt(const uchar &buffer[], int offset)
+{
+   return (uint)CharArrayToInteger(buffer, offset);
+}
+
+long ReadLong(const uchar &buffer[], int offset)
+{
+   return CharArrayToLong(buffer, offset);
+}
+
+double ReadDouble(const uchar &buffer[], int offset)
+{
+   return CharArrayToDouble(buffer, offset);
+}
+
+void CopyCharsToBuffer(uchar &buffer[], int offset, const char &source[], int length)
+{
+   for(int i = 0; i < length; i++)
+      buffer[offset + i] = (uchar)source[i];
+}
+
+void CopyBufferToChars(const uchar &buffer[], int offset, char &target[], int length)
+{
+   for(int i = 0; i < length; i++)
+      target[i] = (char)buffer[offset + i];
+}
+
+void PackRequest(const BridgeRequest &request, uchar &buffer[])
+{
+   ArrayResize(buffer, REQUEST_SIZE);
+   ArrayInitialize(buffer, 0);
+
+   int offset = 0;
+   WriteUInt(buffer, offset, request.magic);
+   offset += 4;
+   WriteUShort(buffer, offset, request.version);
+   offset += 2;
+   WriteUShort(buffer, offset, request.flags);
+   offset += 2;
+   WriteLong(buffer, offset, request.sequence);
+   offset += 8;
+   WriteLong(buffer, offset, request.timestamp_ms);
+   offset += 8;
+   CopyCharsToBuffer(buffer, offset, request.symbol, SYMBOL_SIZE);
+   offset += SYMBOL_SIZE;
+   WriteDouble(buffer, offset, request.bid);
+   offset += 8;
+   WriteDouble(buffer, offset, request.ask);
+   offset += 8;
+   WriteDouble(buffer, offset, request.spread);
+   offset += 8;
+   WriteDouble(buffer, offset, request.o_cur);
+   offset += 8;
+   WriteDouble(buffer, offset, request.h_cur);
+   offset += 8;
+   WriteDouble(buffer, offset, request.l_cur);
+   offset += 8;
+   WriteDouble(buffer, offset, request.c_cur);
+   offset += 8;
+   WriteDouble(buffer, offset, request.o_prev);
+   offset += 8;
+   WriteDouble(buffer, offset, request.h_prev);
+   offset += 8;
+   WriteDouble(buffer, offset, request.l_prev);
+   offset += 8;
+   WriteDouble(buffer, offset, request.c_prev);
+   offset += 8;
+   WriteLong(buffer, offset, request.bar_time_current);
+   offset += 8;
+   WriteLong(buffer, offset, request.bar_time_previous);
+   offset += 8;
+   WriteUInt(buffer, offset, request.market_state);
+}
+
+bool UnpackResponse(const uchar &buffer[], BridgeResponse &response)
+{
+   if(ArraySize(buffer) < RESPONSE_SIZE)
+      return false;
+
+   int offset = 0;
+   response.magic = ReadUInt(buffer, offset);
+   offset += 4;
+   response.version = ReadUShort(buffer, offset);
+   offset += 2;
+   response.action = ReadUShort(buffer, offset);
+   offset += 2;
+   response.sequence = ReadLong(buffer, offset);
+   offset += 8;
+   response.entry = ReadDouble(buffer, offset);
+   offset += 8;
+   response.sl = ReadDouble(buffer, offset);
+   offset += 8;
+   response.tp = ReadDouble(buffer, offset);
+   offset += 8;
+   response.volume = ReadDouble(buffer, offset);
+   offset += 8;
+   response.confidence = ReadDouble(buffer, offset);
+   offset += 8;
+   response.flags = ReadUInt(buffer, offset);
+   offset += 4;
+   CopyBufferToChars(buffer, offset, response.json_payload, JSON_SIZE);
+   return true;
+}
 
 string ResolveTradingSymbol(const string desired)
 {
@@ -213,10 +345,10 @@ void ProcessBridge()
    request.magic = 0x4E445342;
    request.version = 1;
    request.flags = 0;
-   request.sequence = (longlong)sequence_id++;
-   request.timestamp_ms = (longlong)(TimeCurrent() * 1000);
+   request.sequence = sequence_id++;
+   request.timestamp_ms = (long)(TimeCurrent() * 1000);
 
-   StringToCharArray(resolved_symbol, request.symbol, 0, 11);
+   StringToCharArray(resolved_symbol, request.symbol, 0, SYMBOL_SIZE - 1);
 
    double bid = SymbolInfoDouble(resolved_symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(resolved_symbol, SYMBOL_ASK);
@@ -234,15 +366,14 @@ void ProcessBridge()
    request.l_prev = iLow(resolved_symbol, BarTimeframe, 1);
    request.c_prev = iClose(resolved_symbol, BarTimeframe, 1);
 
-   request.bar_time_current = (longlong)iTime(resolved_symbol, BarTimeframe, 0);
-   request.bar_time_previous = (longlong)iTime(resolved_symbol, BarTimeframe, 1);
+   request.bar_time_current = (long)iTime(resolved_symbol, BarTimeframe, 0);
+   request.bar_time_previous = (long)iTime(resolved_symbol, BarTimeframe, 1);
 
    request.market_state = (uint)(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? 1 : 0);
 
    uchar buffer[];
-   ArrayResize(buffer, sizeof(request));
-   StructToCharArray(request, buffer, 0, sizeof(request));
-   RtlMoveMemory(map_view, buffer, sizeof(request));
+   PackRequest(request, buffer);
+   RtlMoveMemory(map_view, buffer, REQUEST_SIZE);
    SetEvent(request_event);
 
    int wait_result = WaitForSingleObject(response_event, DecisionTimeoutMs);
@@ -253,11 +384,22 @@ void ProcessBridge()
    }
 
    uchar response_buffer[];
-   ArrayResize(response_buffer, sizeof(BridgeResponse));
-   RtlMoveMemory(response_buffer, map_view + sizeof(request), sizeof(BridgeResponse));
+   ArrayResize(response_buffer, RESPONSE_SIZE);
+   RtlMoveMemory(response_buffer, map_view + (long)REQUEST_SIZE, RESPONSE_SIZE);
 
    BridgeResponse response;
-   CharArrayToStruct(response_buffer, response, 0, sizeof(response));
+   ZeroMemory(response);
+   if(!UnpackResponse(response_buffer, response))
+   {
+      Print("⚠️ Invalid response payload size.");
+      return;
+   }
+
+   if(response.magic != request.magic || response.version != request.version)
+   {
+      Print("⚠️ Response header mismatch.");
+      return;
+   }
 
    if(response.sequence != request.sequence)
    {
@@ -268,7 +410,7 @@ void ProcessBridge()
    ExecuteCommand(response);
 }
 
-void ExecuteCommand(BridgeResponse response)
+void ExecuteCommand(const BridgeResponse &response)
 {
    if(response.action == 0)
       return;
