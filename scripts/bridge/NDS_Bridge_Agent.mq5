@@ -60,12 +60,12 @@ struct BridgeResponse
 };
 
 #import "kernel32.dll"
-long CreateFileMappingW(int hFile,int lpAttributes,int flProtect,int dwMaximumSizeHigh,int dwMaximumSizeLow,string lpName);
+long CreateFileMappingW(long hFile,long lpAttributes,int flProtect,int dwMaximumSizeHigh,int dwMaximumSizeLow,string lpName);
 long OpenFileMappingW(int dwDesiredAccess,bool bInheritHandle,string lpName);
 long MapViewOfFile(long hFileMappingObject,int dwDesiredAccess,int dwFileOffsetHigh,int dwFileOffsetLow,int dwNumberOfBytesToMap);
 bool UnmapViewOfFile(long lpBaseAddress);
 bool CloseHandle(long hObject);
-long CreateEventW(int lpEventAttributes,bool bManualReset,bool bInitialState,string lpName);
+long CreateEventW(long lpEventAttributes,bool bManualReset,bool bInitialState,string lpName);
 bool SetEvent(long hEvent);
 bool ResetEvent(long hEvent);
 int WaitForSingleObject(long hHandle,int dwMilliseconds);
@@ -77,7 +77,7 @@ CTrade trade;
 
 const int SYMBOL_SIZE = 12;
 const int JSON_SIZE = 256;
-const int REQUEST_SIZE = 120;
+const int REQUEST_SIZE = 144;
 const int RESPONSE_SIZE = 316;
 
 long mapping_handle = 0;
@@ -88,44 +88,100 @@ long sequence_id = 0;
 int csv_handle = INVALID_HANDLE;
 string resolved_symbol = "";
 
+// -------------------------
+// Low-level little-endian writers/readers
+// -------------------------
 void WriteUShort(uchar &buffer[], int offset, ushort value)
 {
-   ShortToCharArray((short)value, buffer, offset);
+   buffer[offset + 0] = (uchar)(value & 0xFF);
+   buffer[offset + 1] = (uchar)((value >> 8) & 0xFF);
 }
 
 void WriteUInt(uchar &buffer[], int offset, uint value)
 {
-   IntToCharArray((int)value, buffer, offset);
+   buffer[offset + 0] = (uchar)(value & 0xFF);
+   buffer[offset + 1] = (uchar)((value >> 8) & 0xFF);
+   buffer[offset + 2] = (uchar)((value >> 16) & 0xFF);
+   buffer[offset + 3] = (uchar)((value >> 24) & 0xFF);
 }
 
 void WriteLong(uchar &buffer[], int offset, long value)
 {
-   LongToCharArray(value, buffer, offset);
+   ulong u = (ulong)value;
+   buffer[offset + 0] = (uchar)(u & 0xFF);
+   buffer[offset + 1] = (uchar)((u >> 8) & 0xFF);
+   buffer[offset + 2] = (uchar)((u >> 16) & 0xFF);
+   buffer[offset + 3] = (uchar)((u >> 24) & 0xFF);
+   buffer[offset + 4] = (uchar)((u >> 32) & 0xFF);
+   buffer[offset + 5] = (uchar)((u >> 40) & 0xFF);
+   buffer[offset + 6] = (uchar)((u >> 48) & 0xFF);
+   buffer[offset + 7] = (uchar)((u >> 56) & 0xFF);
 }
 
 void WriteDouble(uchar &buffer[], int offset, double value)
 {
-   DoubleToCharArray(value, buffer, offset);
+   struct _D { double v; };
+   _D d;
+   d.v = value;
+
+   uchar arr[];
+   ArrayResize(arr, 8);
+   ArrayInitialize(arr, 0);
+
+   // Your build expects: StructToCharArray(const T&, uchar&[], uint)
+   StructToCharArray(d, arr, 0);
+
+   for(int i = 0; i < 8; i++)
+      buffer[offset + i] = arr[i];
 }
 
 ushort ReadUShort(const uchar &buffer[], int offset)
 {
-   return (ushort)CharArrayToShort(buffer, offset);
+   ushort v = 0;
+   v |= (ushort)buffer[offset + 0];
+   v |= (ushort)((ushort)buffer[offset + 1] << 8);
+   return v;
 }
 
 uint ReadUInt(const uchar &buffer[], int offset)
 {
-   return (uint)CharArrayToInteger(buffer, offset);
+   uint v = 0;
+   v |= (uint)buffer[offset + 0];
+   v |= (uint)buffer[offset + 1] << 8;
+   v |= (uint)buffer[offset + 2] << 16;
+   v |= (uint)buffer[offset + 3] << 24;
+   return v;
 }
 
 long ReadLong(const uchar &buffer[], int offset)
 {
-   return CharArrayToLong(buffer, offset);
+   ulong u = 0;
+   u |= (ulong)buffer[offset + 0];
+   u |= (ulong)buffer[offset + 1] << 8;
+   u |= (ulong)buffer[offset + 2] << 16;
+   u |= (ulong)buffer[offset + 3] << 24;
+   u |= (ulong)buffer[offset + 4] << 32;
+   u |= (ulong)buffer[offset + 5] << 40;
+   u |= (ulong)buffer[offset + 6] << 48;
+   u |= (ulong)buffer[offset + 7] << 56;
+   return (long)u;
 }
 
 double ReadDouble(const uchar &buffer[], int offset)
 {
-   return CharArrayToDouble(buffer, offset);
+   uchar arr[];
+   ArrayResize(arr, 8);
+   for(int i = 0; i < 8; i++)
+      arr[i] = buffer[offset + i];
+
+   struct _D { double v; };
+   _D d;
+   ZeroMemory(d);
+
+   // Your build expects: CharArrayToStruct(T&, const uchar&[], uint)
+   CharArrayToStruct(d, arr, 0);
+
+   return d.v;
 }
 
 void CopyCharsToBuffer(uchar &buffer[], int offset, const char &source[], int length)
@@ -185,6 +241,10 @@ void PackRequest(const BridgeRequest &request, uchar &buffer[])
    WriteLong(buffer, offset, request.bar_time_previous);
    offset += 8;
    WriteUInt(buffer, offset, request.market_state);
+
+   int expected_end = offset + 4;
+   if(expected_end != REQUEST_SIZE)
+      PrintFormat("⚠️ PackRequest size mismatch: expected_end=%d REQUEST_SIZE=%d", expected_end, REQUEST_SIZE);
 }
 
 bool UnpackResponse(const uchar &buffer[], BridgeResponse &response)
@@ -261,7 +321,7 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   mapping_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, 0, PAGE_READWRITE, 0, 2048, BridgeMappingName);
+   mapping_handle = CreateFileMappingW((long)INVALID_HANDLE_VALUE, 0, PAGE_READWRITE, 0, 2048, BridgeMappingName);
    if(mapping_handle == 0)
    {
       Print("❌ Failed to create file mapping.");
