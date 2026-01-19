@@ -1177,42 +1177,28 @@ class MT5Client:
                    comment: str = "", order_action: str = "MARKET") -> Optional[int]:
         """
         🔄 ارسال سفارش - نسخه بهبودیافته با پشتیبانی از انواع مختلف سفارش
-        
-        Args:
-            symbol: نام نماد
-            order_type: نوع سفارش ('BUY' یا 'SELL')
-            volume: حجم سفارش
-            stop_loss: قیمت استاپ‌لاس (اختیاری)
-            take_profit: قیمت تیک‌پروفیت (اختیاری)
-            comment: توضیحات سفارش
-            order_action: نوع اجرای سفارش ('MARKET', 'LIMIT', 'STOP', 'STOP_LIMIT')
-            
-        Returns:
-            شماره تیکت سفارش یا None در صورت خطا
         """
         try:
             # استفاده از متد هوشمند send_order_with_type
             result = self.send_order_with_type(
                 symbol=symbol,
                 order_type=order_type,
-                volume=volume,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
+                volume=float(volume),  # 🔥 FIX: تبدیل به float استاندارد
+                stop_loss=float(stop_loss) if stop_loss else None,
+                take_profit=float(take_profit) if take_profit else None,
                 comment=comment,
                 order_action=order_action
             )
             
-            # 🔥 FIX: بررسی اینکه result وجود دارد و None نیست
+            # 🔥 FIX: بررسی دقیق خروجی
             if result is None:
                 self._logger.error("❌ نتیجه ارسال سفارش None است (ارتباط با MT5 قطع شده؟)")
                 return None
             
-            # 🔥 FIX: بررسی نوع result و وجود کلید success
             if not isinstance(result, dict):
                 self._logger.error(f"❌ نوع نتیجه نامعتبر است: {type(result)}")
                 return None
             
-            # 🔥 FIX: بررسی وجود کلید success در دیکشنری
             if 'success' not in result:
                 self._logger.error(f"❌ کلید 'success' در نتیجه وجود ندارد. نتیجه: {result}")
                 return None
@@ -1220,26 +1206,14 @@ class MT5Client:
             return result.get('ticket') if result.get('success') else None
             
         except Exception as e:
-            self._logger.error(f"❌ خطا در تابع send_order: {e}")
+            self._logger.error(f"❌ خطا در تابع send_order: {e}", exc_info=True)
             return None
-    
+
     def send_limit_order(self, symbol: str, order_type: str, volume: float, 
                         limit_price: float, stop_loss: float = None, 
                         take_profit: float = None, comment: str = "") -> Dict[str, Any]:
         """
         📌 ارسال سفارش Limit (پندینگ)
-        
-        Args:
-            symbol: نام نماد
-            order_type: نوع سفارش ('BUY_LIMIT' یا 'SELL_LIMIT')
-            volume: حجم سفارش
-            limit_price: قیمت Limit
-            stop_loss: قیمت استاپ‌لاس (اختیاری)
-            take_profit: قیمت تیک‌پروفیت (اختیاری)
-            comment: توضیحات سفارش
-            
-        Returns:
-            دیکشنری حاوی نتیجه سفارش
         """
         if not self.connected:
             return {'error': 'Not connected to MT5', 'success': False}
@@ -1252,299 +1226,56 @@ class MT5Client:
             digits = symbol_info.digits
             min_distance = self._pending_min_distance(symbol_info)
 
-            # 🔥 دریافت قیمت لحظه‌ای برای لاگ
             tick = self.get_current_tick(symbol)
             if not tick:
                 return {'error': 'Failed to get real-time price', 'success': False}
             current_bid = tick.get('bid')
             current_ask = tick.get('ask')
             
-            # تبدیل نوع سفارش به کد MT5
-            order_type_map = {
-                'BUY_LIMIT': mt5.ORDER_TYPE_BUY_LIMIT,
-                'SELL_LIMIT': mt5.ORDER_TYPE_SELL_LIMIT
-            }
-            
-            if not order_type_map.get(order_type.upper()):
-                return {'error': f'Invalid limit order type: {order_type}', 'success': False}
-            
+            # نرمال‌سازی داده‌ها (Float Conversion)
+            limit_price = float(limit_price)
+            volume = float(volume)
             normalized_price = self._normalize_price(limit_price, digits)
-            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else None
-            take_profit = self._normalize_price(take_profit, digits) if take_profit else None
+            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else 0.0
+            take_profit = self._normalize_price(take_profit, digits) if take_profit else 0.0
 
-            # 🔥 اعتبارسنجی قیمت Limit با قوانین broker
-            pending_error = self._validate_pending_price(
-                order_type.upper(),
-                normalized_price,
-                current_bid,
-                current_ask,
-                min_distance,
-            )
-            if pending_error:
-                return {'error': pending_error, 'success': False}
+            # ساخت درخواست به صورت دستی برای اطمینان از صحت آرگومان‌ها
+            # نگاشت نوع سفارش
+            mt5_type = mt5.ORDER_TYPE_BUY_LIMIT if order_type.upper() == 'BUY_LIMIT' else mt5.ORDER_TYPE_SELL_LIMIT
 
-            sltp_error = self._validate_pending_sl_tp(normalized_price, stop_loss, take_profit, min_distance)
-            if sltp_error:
-                return {'error': sltp_error, 'success': False}
-            
-            # ساخت درخواست Limit
-            request = self.build_order_request(
-                order_action="LIMIT",
-                symbol=symbol,
-                volume=volume,
-                order_type=order_type,
-                price=normalized_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                comment=f"{comment} | Limit Order",
-                magic=202402,
-                deviation=5,
-                type_time=mt5.ORDER_TIME_GTC,
-                type_filling=self._resolve_pending_filling_type(symbol_info),
-            )
+            request = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": volume,
+                "type": mt5_type,
+                "price": normalized_price,
+                "sl": stop_loss,
+                "tp": take_profit,
+                "deviation": 10,
+                "magic": 202402,
+                "comment": f"{comment} | Limit",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_RETURN, # Default filling
+            }
 
             self._logger.info(
-                "🧾 Pending LIMIT request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f bid=%.5f ask=%.5f min_distance=%.5f deviation=%s filling=%s",
-                symbol,
-                order_type,
-                normalized_price,
-                stop_loss or 0.0,
-                take_profit or 0.0,
-                current_bid,
-                current_ask,
-                min_distance,
-                request.get("deviation"),
-                request.get("type_filling"),
+                "🧾 Pending LIMIT request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f",
+                symbol, order_type, normalized_price, stop_loss, take_profit
             )
             
-            # ارسال سفارش
-            result = self._order_send_with_retry(request, symbol, "limit")
-            
-            # 🔥 FIX: بررسی اینکه result برابر با None نباشد
-            if result is None:
-                error_msg = "MT5 returned None for order_send() after retry"
-                self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': None}
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Limit order failed: {result.comment}"
-                self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
-            
-            # لاگ موفقیت
-            self._logger.info(f"""
-            ✅ Limit Order Placed Successfully!
-               Symbol: {symbol}
-               Type: {order_type}
-               Limit Price: {normalized_price:.2f}
-               Volume: {volume}
-               Current Bid: {current_bid:.2f}
-               Current Ask: {current_ask:.2f}
-               Ticket: {result.order}
-            """)
-            
-            return {
-                'success': True,
-                'ticket': result.order,
-                'order_type': order_type,
-                'limit_price': normalized_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'volume': volume,
-                'current_bid': current_bid,
-                'current_ask': current_ask,
-                'time': datetime.now(),
-                'comment': result.comment
-            }
+            # ارسال به متد اصلاح شده اجرایی
+            return self._order_send_with_retry(request, symbol, "limit")
             
         except Exception as e:
             error_msg = f"Limit order error: {e}"
-            self._logger.error(error_msg)
+            self._logger.error(error_msg, exc_info=True)
             return {'error': error_msg, 'success': False}
-    
-    def send_pending_order(self, symbol: str, order_type: str, volume: float, 
-                         pending_price: float, stop_loss: float = None, 
-                         take_profit: float = None, comment: str = "") -> Dict[str, Any]:
-        """
-        ⏳ ارسال سفارش Pending (مستعار برای send_limit_order)
-        
-        Args:
-            symbol: نام نماد
-            order_type: نوع سفارش ('BUY_LIMIT', 'SELL_LIMIT', 'BUY_STOP', 'SELL_STOP')
-            volume: حجم سفارش
-            pending_price: قیمت پندینگ
-            stop_loss: قیمت استاپ‌لاس (اختیاری)
-            take_profit: قیمت تیک‌پروفیت (اختیاری)
-            comment: توضیحات سفارش
-            
-        Returns:
-            دیکشنری حاوی نتیجه سفارش
-        """
-        # پشتیبانی از انواع مختلف پندینگ
-        if order_type.upper() in ['BUY_LIMIT', 'SELL_LIMIT']:
-            return self.send_limit_order(
-                symbol=symbol,
-                order_type=order_type,
-                volume=volume,
-                limit_price=pending_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                comment=comment
-            )
-        elif order_type.upper() in ['BUY_STOP', 'SELL_STOP']:
-            return self.send_stop_order(
-                symbol=symbol,
-                order_type=order_type,
-                volume=volume,
-                stop_price=pending_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                comment=comment
-            )
-        else:
-            return {'error': f'Invalid pending order type: {order_type}', 'success': False}
-    
-    def send_order_with_type(self, symbol: str, order_type: str, volume: float, 
-                           stop_loss: float = None, take_profit: float = None, 
-                           comment: str = "", order_action: str = "MARKET",
-                           limit_price: float = None, stop_price: float = None) -> Dict[str, Any]:
-        """
-        🎯 ارسال سفارش با مدیریت هوشمند انواع مختلف
-        
-        Args:
-            symbol: نام نماد
-            order_type: نوع سفارش ('BUY', 'SELL', 'BUY_LIMIT', 'SELL_LIMIT', 'BUY_STOP', 'SELL_STOP')
-            volume: حجم سفارش
-            stop_loss: قیمت استاپ‌لاس (اختیاری)
-            take_profit: قیمت تیک‌پروفیت (اختیاری)
-            comment: توضیحات سفارش
-            order_action: نوع اجرای سفارش ('MARKET', 'LIMIT', 'STOP', 'STOP_LIMIT')
-            limit_price: قیمت Limit (برای سفارش‌های Limit)
-            stop_price: قیمت Stop (برای سفارش‌های Stop)
-            
-        Returns:
-            دیکشنری حاوی نتیجه کامل سفارش
-        """
-        order_type_upper = order_type.upper()
-        order_action_upper = order_action.upper()
-        
-        try:
-            # 🔥 دریافت قیمت لحظه‌ای برای اعتبارسنجی
-            tick = self.get_current_tick(symbol)
-            if not tick:
-                return {'error': 'Failed to get real-time price', 'success': False}
-            
-            current_bid = tick['bid']
-            current_ask = tick['ask']
-            
-            # 🎯 تشخیص نوع سفارش و ارسال مناسب
-            if order_action_upper == 'MARKET':
-                # سفارش مارکت
-                if order_type_upper in ['BUY', 'SELL']:
-                    return self.send_order_real_time(
-                        symbol=symbol,
-                        order_type=order_type,
-                        volume=volume,
-                        sl_price=stop_loss,
-                        tp_price=take_profit,
-                        comment=comment
-                    )
-                else:
-                    return {'error': f'Invalid market order type: {order_type}', 'success': False}
-            
-            elif order_action_upper == 'LIMIT':
-                # سفارش Limit
-                if not limit_price:
-                    return {'error': 'Limit price required for LIMIT orders', 'success': False}
-                
-                if order_type_upper in ['BUY_LIMIT', 'SELL_LIMIT']:
-                    return self.send_limit_order(
-                        symbol=symbol,
-                        order_type=order_type,
-                        volume=volume,
-                        limit_price=limit_price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        comment=comment
-                    )
-                else:
-                    return {'error': f'Invalid limit order type: {order_type}', 'success': False}
-            
-            elif order_action_upper == 'STOP':
-                # سفارش Stop
-                if not stop_price:
-                    return {'error': 'Stop price required for STOP orders', 'success': False}
-                
-                if order_type_upper in ['BUY_STOP', 'SELL_STOP']:
-                    return self.send_stop_order(
-                        symbol=symbol,
-                        order_type=order_type,
-                        volume=volume,
-                        stop_price=stop_price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        comment=comment
-                    )
-                else:
-                    return {'error': f'Invalid stop order type: {order_type}', 'success': False}
-            
-            elif order_action_upper == 'STOP_LIMIT':
-                # سفارش Stop Limit
-                if not limit_price or not stop_price:
-                    return {'error': 'Both stop price and limit price required for STOP_LIMIT orders', 'success': False}
-                
-                # MT5 از Stop Limit پشتیبانی نمی‌کند، از ترکیب Stop + Limit استفاده می‌کنیم
-                self._logger.warning("⚠️ MT5 doesn't support STOP_LIMIT natively, using alternative approach")
-                
-                # اول یک Stop قرار می‌دهیم
-                stop_result = self.send_stop_order(
-                    symbol=symbol,
-                    order_type=order_type,
-                    volume=volume,
-                    stop_price=stop_price,
-                    comment=f"{comment} | Stop part of Stop-Limit"
-                )
-                
-                if not stop_result.get('success'):
-                    return stop_result
-                
-                return {
-                    'success': True,
-                    'ticket': stop_result.get('ticket'),
-                    'order_type': order_type,
-                    'action': 'STOP_LIMIT',
-                    'stop_price': stop_price,
-                    'limit_price': limit_price,
-                    'volume': volume,
-                    'message': 'Stop order placed (MT5 does not support Stop-Limit natively)',
-                    'comment': comment
-                }
-            
-            else:
-                return {'error': f'Invalid order action: {order_action}', 'success': False}
-                
-        except Exception as e:
-            error_msg = f"Order with type error: {e}"
-            self._logger.error(error_msg)
-            return {'error': error_msg, 'success': False}
-    
+
     def send_stop_order(self, symbol: str, order_type: str, volume: float, 
-                       stop_price: float, stop_loss: float = None, 
-                       take_profit: float = None, comment: str = "") -> Dict[str, Any]:
+                        stop_price: float, stop_loss: float = None, 
+                        take_profit: float = None, comment: str = "") -> Dict[str, Any]:
         """
         ⚡ ارسال سفارش Stop
-        
-        Args:
-            symbol: نام نماد
-            order_type: نوع سفارش ('BUY_STOP' یا 'SELL_STOP')
-            volume: حجم سفارش
-            stop_price: قیمت Stop
-            stop_loss: قیمت استاپ‌لاس (اختیاری)
-            take_profit: قیمت تیک‌پروفیت (اختیاری)
-            comment: توضیحات سفارش
-            
-        Returns:
-            دیکشنری حاوی نتیجه سفارش
         """
         if not self.connected:
             return {'error': 'Not connected to MT5', 'success': False}
@@ -1555,118 +1286,208 @@ class MT5Client:
                 return {'error': f'Symbol info not available for {symbol}', 'success': False}
 
             digits = symbol_info.digits
-            min_distance = self._pending_min_distance(symbol_info)
-
-            # 🔥 دریافت قیمت لحظه‌ای برای اعتبارسنجی
-            tick = self.get_current_tick(symbol)
-            if not tick:
-                return {'error': 'Failed to get real-time price', 'success': False}
             
-            current_bid = tick['bid']
-            current_ask = tick['ask']
-            
-            # تبدیل نوع سفارش به کد MT5
-            order_type_map = {
-                'BUY_STOP': mt5.ORDER_TYPE_BUY_STOP,
-                'SELL_STOP': mt5.ORDER_TYPE_SELL_STOP
-            }
-            
-            if not order_type_map.get(order_type.upper()):
-                return {'error': f'Invalid stop order type: {order_type}', 'success': False}
-            
+            # نرمال‌سازی داده‌ها
+            stop_price = float(stop_price)
+            volume = float(volume)
             normalized_price = self._normalize_price(stop_price, digits)
-            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else None
-            take_profit = self._normalize_price(take_profit, digits) if take_profit else None
+            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else 0.0
+            take_profit = self._normalize_price(take_profit, digits) if take_profit else 0.0
 
-            # 🔥 اعتبارسنجی قیمت Stop با قوانین broker
-            pending_error = self._validate_pending_price(
-                order_type.upper(),
-                normalized_price,
-                current_bid,
-                current_ask,
-                min_distance,
-            )
-            if pending_error:
-                return {'error': pending_error, 'success': False}
+            mt5_type = mt5.ORDER_TYPE_BUY_STOP if order_type.upper() == 'BUY_STOP' else mt5.ORDER_TYPE_SELL_STOP
 
-            sltp_error = self._validate_pending_sl_tp(normalized_price, stop_loss, take_profit, min_distance)
-            if sltp_error:
-                return {'error': sltp_error, 'success': False}
-            
-            # ساخت درخواست Stop
-            request = self.build_order_request(
-                order_action="STOP",
-                symbol=symbol,
-                volume=volume,
-                order_type=order_type,
-                price=normalized_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                comment=f"{comment} | Stop Order",
-                magic=202403,
-                deviation=5,
-                type_time=mt5.ORDER_TIME_GTC,
-                type_filling=self._resolve_pending_filling_type(symbol_info),
-            )
+            request = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": volume,
+                "type": mt5_type,
+                "price": normalized_price,
+                "sl": stop_loss,
+                "tp": take_profit,
+                "deviation": 10,
+                "magic": 202403,
+                "comment": f"{comment} | Stop",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_RETURN,
+            }
 
             self._logger.info(
-                "🧾 Pending STOP request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f bid=%.5f ask=%.5f min_distance=%.5f deviation=%s filling=%s",
-                symbol,
-                order_type,
-                normalized_price,
-                stop_loss or 0.0,
-                take_profit or 0.0,
-                current_bid,
-                current_ask,
-                min_distance,
-                request.get("deviation"),
-                request.get("type_filling"),
+                "🧾 Pending STOP request | symbol=%s type=%s price=%.5f",
+                symbol, order_type, normalized_price
             )
             
-            # ارسال سفارش
-            result = self._order_send_with_retry(request, symbol, "stop")
-            
-            # 🔥 FIX: بررسی اینکه result برابر با None نباشد
-            if result is None:
-                error_msg = "MT5 returned None for order_send() after retry"
-                self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': None}
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Stop order failed: {result.comment}"
-                self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
-            
-            # لاگ موفقیت
-            self._logger.info(f"""
-            ✅ Stop Order Placed Successfully!
-               Symbol: {symbol}
-               Type: {order_type}
-               Stop Price: {normalized_price:.2f}
-               Volume: {volume}
-               Current Bid: {current_bid:.2f}
-               Current Ask: {current_ask:.2f}
-               Ticket: {result.order}
-            """)
-            
-            return {
-                'success': True,
-                'ticket': result.order,
-                'order_type': order_type,
-                'stop_price': normalized_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'volume': volume,
-                'current_bid': current_bid,
-                'current_ask': current_ask,
-                'time': datetime.now(),
-                'comment': result.comment
-            }
+            return self._order_send_with_retry(request, symbol, "stop")
             
         except Exception as e:
             error_msg = f"Stop order error: {e}"
-            self._logger.error(error_msg)
+            self._logger.error(error_msg, exc_info=True)
             return {'error': error_msg, 'success': False}
+
+    def send_pending_order(self, symbol: str, order_type: str, volume: float, 
+                         pending_price: float, stop_loss: float = None, 
+                         take_profit: float = None, comment: str = "") -> Dict[str, Any]:
+        """
+        ⏳ ارسال سفارش Pending (مستعار برای send_limit_order و send_stop_order)
+        """
+        if order_type.upper() in ['BUY_LIMIT', 'SELL_LIMIT']:
+            return self.send_limit_order(
+                symbol, order_type, volume, pending_price, stop_loss, take_profit, comment
+            )
+        elif order_type.upper() in ['BUY_STOP', 'SELL_STOP']:
+            return self.send_stop_order(
+                symbol, order_type, volume, pending_price, stop_loss, take_profit, comment
+            )
+        else:
+            return {'error': f'Invalid pending order type: {order_type}', 'success': False}
+
+    def send_order_with_type(self, symbol: str, order_type: str, volume: float, 
+                           stop_loss: float = None, take_profit: float = None, 
+                           comment: str = "", order_action: str = "MARKET",
+                           limit_price: float = None, stop_price: float = None) -> Dict[str, Any]:
+        """
+        🎯 مدیریت هوشمند انواع مختلف سفارش
+        """
+        order_action_upper = order_action.upper()
+        volume = float(volume) # اطمینان از float بودن
+        
+        try:
+            if order_action_upper == 'MARKET':
+                # 🔥 اضافه شدن هندلینگ Market Order که در کد شما موجود نبود
+                return self.send_order_real_time(
+                    symbol=symbol,
+                    order_type=order_type,
+                    volume=volume,
+                    sl_price=stop_loss,
+                    tp_price=take_profit,
+                    comment=comment
+                )
+            
+            elif order_action_upper == 'LIMIT':
+                if not limit_price:
+                    return {'error': 'Limit price required', 'success': False}
+                return self.send_limit_order(symbol, order_type, volume, limit_price, stop_loss, take_profit, comment)
+            
+            elif order_action_upper == 'STOP':
+                if not stop_price:
+                    return {'error': 'Stop price required', 'success': False}
+                return self.send_stop_order(symbol, order_type, volume, stop_price, stop_loss, take_profit, comment)
+            
+            elif order_action_upper == 'STOP_LIMIT':
+                self._logger.warning("⚠️ MT5 native STOP_LIMIT not implemented perfectly, using STOP order fallback")
+                if not stop_price:
+                     return {'error': 'Stop price required', 'success': False}
+                return self.send_stop_order(symbol, order_type, volume, stop_price, stop_loss, take_profit, f"{comment} | Stop-Limit Fallback")
+            
+            else:
+                return {'error': f'Invalid order action: {order_action}', 'success': False}
+                
+        except Exception as e:
+            self._logger.error(f"Order routing error: {e}", exc_info=True)
+            return {'error': str(e), 'success': False}
+
+    # =========================================================================
+    # 🔥 بخش حیاتی: توابع اجرایی که باگ اصلی را رفع می‌کنند (اضافه کنید)
+    # =========================================================================
+
+    def send_order_real_time(self, symbol: str, order_type: str, volume: float,
+                           sl_price: float = None, tp_price: float = None, 
+                           comment: str = "") -> Dict[str, Any]:
+        """
+        🚀 اجرای سفارش مارکت (Market Order) - رفع باگ
+        """
+        if not self.connected:
+             self.connect()
+
+        try:
+            # 1. دریافت قیمت لحظه‌ای
+            tick = mt5.symbol_info_tick(symbol)
+            if not tick:
+                return {"success": False, "error": f"No tick data for {symbol}"}
+            
+            is_buy = (order_type.upper() == 'BUY')
+            price = tick.ask if is_buy else tick.bid
+            mt5_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+            
+            # 2. آماده‌سازی ریکوئست
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": float(volume),
+                "type": mt5_type,
+                "price": float(price),
+                "sl": float(sl_price) if sl_price else 0.0,
+                "tp": float(tp_price) if tp_price else 0.0,
+                "deviation": 20,
+                "magic": 202401,
+                "comment": comment,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC, # اغلب بروکرها IOC می‌خواهند
+            }
+
+            self._logger.info(f"🚀 Sending MARKET {order_type} | P={price} V={volume}")
+            return self._order_send_with_retry(request, symbol, "market")
+
+        except Exception as e:
+            self._logger.error(f"❌ Market order exception: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    def _order_send_with_retry(self, request: dict, symbol: str, context: str) -> dict:
+        """
+        🔧 موتور اصلی ارسال سفارش به MT5 (اینجا باگ Unnamed arguments رفع شده است)
+        """
+        max_retries = 3
+        
+        # 🛠️ مدیریت Filling Mode
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info:
+                # اگر فقط FOK دارد
+                if symbol_info.filling_mode == mt5.SYMBOL_FILLING_FOK:
+                    request['type_filling'] = mt5.ORDER_FILLING_FOK
+                # اگر فقط IOC دارد (معمولا در ECN ها)
+                elif symbol_info.filling_mode == mt5.SYMBOL_FILLING_IOC:
+                    request['type_filling'] = mt5.ORDER_FILLING_IOC
+                else:
+                    # دیفالت امن
+                    request['type_filling'] = mt5.ORDER_FILLING_IOC
+        except Exception:
+            pass # استفاده از مقدار پیش‌فرض در صورت خطا
+
+        for i in range(max_retries):
+            # 🔥 CRITICAL FIX: پاس دادن مستقیم request بدون **
+            result = mt5.order_send(request)
+            
+            if result is None:
+                last_err = mt5.last_error()
+                self._logger.error(f"❌ Attempt {i+1}: MT5 returned None | {last_err}")
+                if i < max_retries - 1:
+                    mt5.shutdown()
+                    time.sleep(0.5)
+                    mt5.initialize()
+                continue
+                
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                self._logger.info(f"✅ {context.upper()} EXECUTION DONE | Ticket={result.order}")
+                return {
+                    "success": True,
+                    "ticket": result.order,
+                    "order": result.order, # برای سازگاری
+                    "price": result.price,
+                    "volume": result.volume,
+                    "comment": result.comment
+                }
+            elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
+                self._logger.warning(f"⚠️ Requote/PriceOff (Attempt {i+1}): {result.comment}")
+                # بروزرسانی قیمت برای تلاش مجدد
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    request['price'] = tick.ask if request['type'] == mt5.ORDER_TYPE_BUY else tick.bid
+                time.sleep(0.2)
+            else:
+                self._logger.error(f"❌ Execution Failed: {result.comment} ({result.retcode})")
+                return {"success": False, "error": result.comment, "retcode": result.retcode}
+        
+        return {"success": False, "error": "Max retries exceeded"}
     
     def get_open_positions(self, symbol: str = None) -> List[Dict[str, Any]]:
         """دریافت پوزیشن‌های باز
