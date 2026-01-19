@@ -33,6 +33,7 @@ try:
     from src.trading_bot.bot import NDSBot
     from src.trading_bot.mt5_client import MT5Client
     from src.trading_bot.nds.analyzer import analyze_gold_market
+    from src.trading_bot.config_utils import resolve_mt5_credentials
 except ImportError as e:
     print(f"❌ خطای ساختار پروژه: {e}")
     print("نکته: مطمئن شوید فایل‌ها در مسیرهای صحیح قرار دارند.")
@@ -219,11 +220,17 @@ def main() -> None:
             print("⚠️  هشدار: کانفیگ خالی است. bot_config.json را بررسی کنید.")
             logger.warning("Full config is empty.")
 
-        # Minimal MT5 credentials check
-        creds = config_manager.get_mt5_credentials()
-        if not creds or not all(k in creds for k in ("login", "password", "server")):
-            print("⚠️  اطلاعات MT5 کامل نیست. بخش mt5_credentials در bot_config.json را بررسی کنید.")
-            logger.warning("MT5 credentials incomplete or missing in bot_config.json.")
+        # MT5 credentials resolution (single source of truth)
+        credential_paths = [
+            PROJECT_ROOT / "config" / "mt5_credentials.json",
+            PROJECT_ROOT / "mt5_credentials.json",
+        ]
+        resolved = resolve_mt5_credentials(config_manager, credential_paths, log=logger)
+        if not resolved["is_complete"]:
+            print("⚠️  اطلاعات MT5 کامل نیست. منابع MT5 را بررسی کنید (env/config/file).")
+            logger.warning("MT5 credentials incomplete after resolution.")
+        else:
+            logger.info("✅ MT5 credentials resolved from: %s", ", ".join(resolved["sources"]))
 
         # Print active settings snapshot
         _print_active_settings(full_config)
