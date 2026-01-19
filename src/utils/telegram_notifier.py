@@ -6,10 +6,16 @@ import threading
 import queue
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+env_path = BASE_DIR / '.env'
+load_dotenv(dotenv_path=env_path)
 
 
 def _to_float(x: Any) -> Optional[float]:
