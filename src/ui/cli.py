@@ -22,7 +22,7 @@ def print_banner():
     RISK_PERCENT = config.get('risk_settings.RISK_PERCENT', None)
     MIN_CONFIDENCE = config.get('risk_settings.MIN_CONFIDENCE', None)
     MODE = config.get('trading_settings.MODE', None)
-    MIN_TIME = config.get('trading_rules.MIN_TIME_BETWEEN_TRADES_MINUTES', None)
+    MIN_CANDLES = config.get('trading_rules.MIN_CANDLES_BETWEEN_TRADES', None)
     MAX_POS = config.get('trading_rules.MAX_POSITIONS', None)
 
     print("\n" + "="*70)
@@ -36,7 +36,7 @@ def print_banner():
     print(f"💰 ریسک: {RISK_PERCENT}%")
     print(f"🎯 حداقل اعتماد: {MIN_CONFIDENCE}%")
     print(f"🤖 حالت: {MODE}")
-    print(f"⏳ حداقل فاصله بین معاملات: {MIN_TIME} دقیقه")
+    print(f"⏳ حداقل فاصله بین معاملات: {MIN_CANDLES} کندل")
     print(f"📈 حداکثر پوزیشن‌های باز: {MAX_POS}")
     print(f"{'='*70}")
 
@@ -65,7 +65,7 @@ def update_config_interactive():
         '5': ('trading_settings.ENABLE_DRY_RUN', 'فعال کردن حالت آزمایشی', 'bool'),
         '6': ('trading_settings.SYMBOL', 'نماد معاملاتی', 'str'),
         '7': ('trading_settings.TIMEFRAME', 'تایم‌فریم', 'str'),
-        '8': ('trading_rules.MIN_TIME_BETWEEN_TRADES_MINUTES', 'حداقل فاصله بین معاملات (دقیقه)', 'int'),
+        '8': ('trading_rules.MIN_CANDLES_BETWEEN_TRADES', 'حداقل فاصله بین معاملات (کندل)', 'int'),
         '9': ('trading_rules.MAX_POSITIONS', 'حداکثر پوزیشن‌های باز', 'int'),
         '10': ('trading_rules.ALLOW_MULTIPLE_POSITIONS', 'اجازه پوزیشن‌های متعدد', 'bool'),
     }

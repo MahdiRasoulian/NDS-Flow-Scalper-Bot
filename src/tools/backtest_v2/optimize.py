@@ -357,7 +357,7 @@ def main() -> None:
                 tr = merged_config.get("trading_rules", {}) or {}
 
                 logger.info(
-                    "🔧 Critical knobs | MIN_CONF=%s ENTRY_FACTOR=%s MAX_DEV_PIPS=%s FLOW_MAX_TOUCHES=%s FLOW_MIN_SEP=%s MIN_CANDLES_BETWEEN=%s MAX_POS=%s",
+                    "🔧 Critical knobs | MIN_CONF=%s ENTRY_FACTOR=%s MAX_DEV_PIPS=%s FLOW_MAX_TOUCHES=%s FLOW_MIN_SEP=%s MIN_CANDLES_BETWEEN_TRADES=%s MAX_POS=%s",
                     ts.get("SCALPING_MIN_CONFIDENCE"),
                     ts.get("ENTRY_FACTOR"),
                     rs.get("MAX_PRICE_DEVIATION_PIPS"),

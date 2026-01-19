@@ -57,6 +57,14 @@ from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 from src.trading_bot.trade_tracker import TradeTracker
+from src.trading_bot.cooldown import (
+    CooldownDecision,
+    evaluate_cooldown,
+    get_min_candles_between_trades,
+    resolve_exposure_bias,
+    summarize_positions,
+    warn_deprecated_cooldown_settings,
+)
 from src.trading_bot.user_controls import UserControls
 from src.ui.cli import print_banner, print_help, update_config_interactive
 
@@ -116,6 +124,10 @@ class NDSBot:
         # مانیتورینگ معامله
         self._last_trade_monitor_ts = 0.0
         self._trade_monitor_interval_sec = 2.0  # هر 2 ثانیه بررسی تریدها (قابل تغییر)
+        self._logged_deprecated_cooldown = False
+        self._last_open_position_tickets: set[int] = set()
+        self._latest_open_positions: List[PositionContract] = []
+        self._latest_pending_orders: List[Dict[str, Any]] = []
 
     # ----------------------------
     # Helpers
@@ -381,6 +393,69 @@ class NDSBot:
             sig = "NONE"
         return sig
 
+    def _get_bot_magic_numbers(self) -> List[int]:
+        magic_config = self.config.get("trading_settings.MAGIC_NUMBERS", None)
+        if magic_config is None:
+            magic_config = self.config.get("trading_settings.MAGIC_NUMBER", None)
+        if magic_config is None:
+            return [202401, 202402, 202403]
+        if isinstance(magic_config, (list, tuple, set)):
+            return [int(m) for m in magic_config if str(m).strip() != ""]
+        try:
+            return [int(magic_config)]
+        except (TypeError, ValueError):
+            return [202401, 202402, 202403]
+
+    def _filter_positions_by_magic(self, positions: List[PositionContract]) -> List[PositionContract]:
+        allowed_magics = set(self._get_bot_magic_numbers())
+        if not allowed_magics:
+            return positions
+        return [pos for pos in positions if int(pos.get("magic", 0) or 0) in allowed_magics]
+
+    def _filter_orders_by_magic(self, orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        allowed_magics = set(self._get_bot_magic_numbers())
+        if not allowed_magics:
+            return orders
+        return [order for order in orders if int(order.get("magic", 0) or 0) in allowed_magics]
+
+    def _log_positions_summary(self, positions: List[PositionContract]) -> None:
+        total, buy_count, sell_count, tickets = summarize_positions(positions)
+        logger.info(
+            "[POSITIONS] Open positions summary: count=%s | BUY=%s SELL=%s | tickets=%s",
+            total,
+            buy_count,
+            sell_count,
+            tickets,
+        )
+
+    def _log_signal_state(self, *, bias: str, pending_count: int = 0) -> None:
+        logger.info(
+            "[SIGNAL_STATE] current_bias=%s last_trade_bar=%s last_trade_dir=%s pending=%s",
+            bias,
+            self.bot_state.last_trade_candle_time,
+            self.bot_state.last_trade_direction,
+            pending_count,
+        )
+
+    def _log_cooldown_decision(self, decision: CooldownDecision) -> None:
+        details = decision.details or {}
+        if decision.allowed:
+            logger.info(
+                "[COOLDOWN] last_trade_bar=%s current_bar=%s diff=%s min=%s => ALLOWED",
+                details.get("last_trade_bar"),
+                details.get("current_bar"),
+                details.get("diff"),
+                details.get("min_candles"),
+            )
+        else:
+            logger.info(
+                "[COOLDOWN] last_trade_bar=%s current_bar=%s diff=%s min=%s => BLOCKED",
+                details.get("last_trade_bar"),
+                details.get("current_bar"),
+                details.get("diff"),
+                details.get("min_candles"),
+            )
+
     def _maybe_monitor_trades(self, force: bool = False):
         """مانیتورینگ معاملات با throttle برای جلوگیری از فشار"""
         now = time.time()
@@ -397,6 +472,10 @@ class NDSBot:
         print("\n🔧 در حال راه‌اندازی ربات اسکلپینگ Real-Time...")
 
         try:
+            if not self._logged_deprecated_cooldown:
+                warn_deprecated_cooldown_settings(self.config, logger)
+                self._logged_deprecated_cooldown = True
+
             # ------------------------------------------------------------
             # 1) ایجاد MT5 Client
             # ------------------------------------------------------------
@@ -501,7 +580,7 @@ class NDSBot:
                 scalping_config = {
                     "risk_manager_config": self.config.get_risk_manager_config() if hasattr(self.config, "get_risk_manager_config") else {},
                     "trading_rules": {
-                        "MIN_CANDLES_BETWEEN": self.config.get("trading_rules.MIN_CANDLES_BETWEEN", 3),
+                        "MIN_CANDLES_BETWEEN_TRADES": self.config.get("trading_rules.MIN_CANDLES_BETWEEN_TRADES", 3),
                     },
                     "risk_settings": {
                         "MAX_PRICE_DEVIATION_PIPS": self.config.get("risk_settings.MAX_PRICE_DEVIATION_PIPS", 50.0),
@@ -544,7 +623,7 @@ class NDSBot:
             monitor_status = "✅ Active" if getattr(self.mt5_client, "real_time_monitor", None) else "⚠️ Inactive"
 
             max_dev = self.config.get("risk_settings.MAX_PRICE_DEVIATION_PIPS")
-            min_candles = self.config.get("trading_rules.MIN_CANDLES_BETWEEN")
+            min_candles = self.config.get("trading_rules.MIN_CANDLES_BETWEEN_TRADES")
 
             status_report = f"""
         🎯 گزارش وضعیت لحظه‌ای سیستم (Real-Time)
@@ -615,7 +694,7 @@ class NDSBot:
         ENABLE_AUTO_TRADING = self.config.get("trading_settings.ENABLE_AUTO_TRADING")
         ENABLE_DRY_RUN = self.config.get("trading_settings.ENABLE_DRY_RUN")
 
-        MIN_CANDLES_BETWEEN = self.config.get("trading_rules.MIN_CANDLES_BETWEEN")
+        MIN_CANDLES_BETWEEN = get_min_candles_between_trades(self.config, default=0)
         MAX_POS = self.config.get("trading_rules.MAX_POSITIONS")
         WAIT_CLOSE = self.config.get("trading_rules.WAIT_FOR_CLOSE_BEFORE_NEW_TRADE")
 
@@ -631,7 +710,9 @@ class NDSBot:
 
         ACCOUNT_BALANCE = self.config.get("ACCOUNT_BALANCE")
 
-        logger.info(f"⚙️ تنظیمات نهایی بارگذاری شد: Timeframe={TIMEFRAME}, Min_Candles_Between={MIN_CANDLES_BETWEEN}")
+        logger.info(
+            f"⚙️ تنظیمات نهایی بارگذاری شد: Timeframe={TIMEFRAME}, Min_Candles_Between={MIN_CANDLES_BETWEEN}"
+        )
         logger.info(f"\n{'='*60}\n🔄 سیکل تحلیل اسکلپینگ #{cycle_number} | ⏰ {datetime.now().strftime('%H:%M:%S')}\n{'='*60}")
 
         try:
@@ -647,16 +728,6 @@ class NDSBot:
 
             current_price = float(df['close'].iloc[-1])
             logger.info(f"✅ {len(df)} کندل دریافت شد | قیمت جاری: ${current_price:.2f}")
-
-            # --- استراحت کندلی ---
-            if self.bot_state.last_trade_candle_time and not df.empty:
-                last_trade_time = self.bot_state.last_trade_candle_time
-                candles_passed = len(df[df["time"] > last_trade_time])
-                if candles_passed < MIN_CANDLES_BETWEEN:
-                    wait_needed = MIN_CANDLES_BETWEEN - candles_passed
-                    logger.info(f"⏸️ استراحت کندلی: {candles_passed}/{MIN_CANDLES_BETWEEN}")
-                    self._maybe_monitor_trades()
-                    return
 
             logger.info("🧠 اجرای تحلیل NDS اسکلپینگ...")
 
@@ -744,12 +815,36 @@ class NDSBot:
             self.bot_state.analysis_count += 1
             self.bot_state.last_analysis = datetime.now()
 
+            open_positions = self._latest_open_positions or self.get_open_positions_info()
+            pending_orders = self._latest_pending_orders or self.get_pending_orders_info()
+            exposure_bias = resolve_exposure_bias(open_positions)
+            self._log_positions_summary(open_positions)
+            self._log_signal_state(bias=exposure_bias, pending_count=len(pending_orders))
+
             if result.get("error"):
                 logger.warning("⚠️ سیگنال حاوی خطاست")
                 return
 
             # --- اجرای معامله ---
             if final_signal in ("BUY", "SELL"):
+                cooldown_decision = evaluate_cooldown(
+                    signal=final_signal,
+                    min_candles_between=MIN_CANDLES_BETWEEN,
+                    df=df,
+                    open_positions=open_positions,
+                    last_trade_candle_time=self.bot_state.last_trade_candle_time,
+                    last_trade_direction=self.bot_state.last_trade_direction,
+                )
+                if cooldown_decision.reason == "MIXED_EXPOSURE":
+                    logger.info(
+                        "[COOLDOWN] mixed exposure detected (BUY/SELL open) => BLOCKED"
+                    )
+                    return
+                if cooldown_decision.reason in {"COOLDOWN_BLOCKED", "COOLDOWN_OK"}:
+                    self._log_cooldown_decision(cooldown_decision)
+                if not cooldown_decision.allowed:
+                    return
+
                 # محدودیت تعداد پوزیشن
                 open_positions = self.get_open_positions_count()
                 if open_positions >= MAX_POS:
@@ -809,6 +904,7 @@ class NDSBot:
                         self.bot_state.last_trade_candle_time = df["time"].iloc[-1]
                         self.bot_state.last_trade_wall_time = datetime.now()
                         self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
+                        self.bot_state.last_trade_direction = final_signal
                         logger.info(f"✅ معامله ثبت شد")
                         self._maybe_monitor_trades(force=True)
                 else:
@@ -832,6 +928,7 @@ class NDSBot:
         SYMBOL = self.config.get("trading_settings.SYMBOL")
         try:
             positions = self.mt5_client.get_open_positions(symbol=SYMBOL)
+            positions = self._filter_positions_by_magic(positions or [])
             if not positions:
                 logger.debug(f"No open positions found for {SYMBOL}")
                 return 0
@@ -850,6 +947,7 @@ class NDSBot:
         SYMBOL = self.config.get("trading_settings.SYMBOL")
         try:
             positions: List[PositionContract] = self.mt5_client.get_open_positions(symbol=SYMBOL)
+            positions = self._filter_positions_by_magic(positions or [])
             if not positions:
                 logger.debug(f"No open positions information available for {SYMBOL}")
                 return []
@@ -878,7 +976,7 @@ class NDSBot:
         try:
             if hasattr(self.mt5_client, "get_pending_orders"):
                 orders = self.mt5_client.get_pending_orders(symbol=SYMBOL)
-                return orders or []
+                return self._filter_orders_by_magic(orders or [])
             return []
         except Exception as e:
             logger.error(f"⚠️ خطا در دریافت pending orders: {e}", exc_info=True)
@@ -1471,6 +1569,7 @@ class NDSBot:
                 if df is None or df.empty:
                     self.bot_state.last_trade_wall_time = datetime.now()
                     self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
+                    self.bot_state.last_trade_direction = signal_data.get("signal")
 
                 if hasattr(self.risk_manager, "add_position"):
                     self.risk_manager.add_position(lot_size)
@@ -1533,21 +1632,46 @@ class NDSBot:
         try:
             SYMBOL = self.config.get("trading_settings.SYMBOL")
             open_positions = self.get_open_positions_info()
+            pending_orders = self.get_pending_orders_info()
+            self._latest_open_positions = open_positions
+            self._latest_pending_orders = pending_orders
+            self.bot_state.active_positions = open_positions
+
+            self._log_positions_summary(open_positions)
+            exposure_bias = resolve_exposure_bias(open_positions)
+            if open_positions or pending_orders:
+                self.bot_state.active_signal_direction = exposure_bias if exposure_bias != "NONE" else None
+            else:
+                self.bot_state.active_signal_direction = None
+            self._log_signal_state(bias=exposure_bias, pending_count=len(pending_orders))
+
             added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(open_positions)
 
             if added_count or updated_count:
                 logger.debug("🔄 Trade reconciliation: added=%s updated=%s", added_count, updated_count)
 
-            for record in closed_candidates:
-                identity = record.get("trade_identity", {})
-                position_ticket = identity.get("position_ticket")
+            closed_records = {
+                record.get("trade_identity", {}).get("position_ticket"): record
+                for record in closed_candidates
+            }
+            current_tickets = {pos["position_ticket"] for pos in open_positions}
+            closed_tickets = self._last_open_position_tickets - current_tickets
+            self._last_open_position_tickets = current_tickets
+
+            for position_ticket in sorted(set(closed_records.keys()) | closed_tickets):
                 if not position_ticket:
                     continue
+                record = closed_records.get(position_ticket, {})
+                identity = record.get("trade_identity", {})
 
                 history = self.mt5_client.get_position_history(position_ticket)
                 if not history or not history.get("close_time"):
-                    self.trade_tracker.mark_trade_unknown(position_ticket, "history_not_found")
-                    logger.debug("⏳ Close not confirmed for position %s. Will retry.", position_ticket)
+                    if position_ticket in self.trade_tracker.active_trades:
+                        self.trade_tracker.mark_trade_unknown(position_ticket, "history_not_found")
+                    logger.warning(
+                        "[CLOSE] ticket=%s history_not_found - will retry",
+                        position_ticket,
+                    )
                     continue
 
                 symbol = identity.get("symbol") or SYMBOL
@@ -1587,15 +1711,16 @@ class NDSBot:
                     "metadata": {"history": history},
                 }
 
-                self.trade_tracker.close_trade_event(close_event)
+                if position_ticket in self.trade_tracker.active_trades:
+                    self.trade_tracker.close_trade_event(close_event)
                 generate_execution_report(logger=logger, event=close_event)
 
                 logger.info(
-                    "[TRADE][CLOSE] position=%s profit=%.2f pips=%.1f reason=%s",
+                    "[CLOSE] ticket=%s closed_time=%s pnl=%.2f reason=%s",
                     position_ticket,
+                    close_time,
                     float(profit or 0.0),
-                    float(pips_val or 0.0),
-                    reason,
+                    reason or "Manual/Other",
                 )
 
                 if hasattr(self, "notifier") and self.notifier is not None:

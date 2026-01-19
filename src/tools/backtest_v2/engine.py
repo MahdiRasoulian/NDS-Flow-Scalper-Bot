@@ -12,6 +12,7 @@ from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.nds.distance_utils import calculate_distance_metrics, resolve_point_size_from_config
 from src.trading_bot.risk_manager import create_scalping_risk_manager
 from src.trading_bot.config_utils import get_setting
+from src.trading_bot.cooldown import evaluate_cooldown, get_min_candles_between_trades, warn_deprecated_cooldown_settings
 
 from .io import build_analyzer_config
 from .metrics import compute_trade_metrics, summarize_cycle_log, format_summary_text
@@ -104,7 +105,6 @@ class BacktestConfig:
     allow_multiple_positions: bool = True
     max_positions: int = 5
     min_candles_between_trades: int = 10
-    min_time_between_trades_minutes: int = 60
     daily_max_trades: int = 40
 
     enable_limit_orders: bool = True
@@ -144,6 +144,7 @@ class BacktestConfig:
     ) -> "BacktestConfig":
         trading_settings = get_setting(config, "trading_settings", {}) or {}
         trading_rules = get_setting(config, "trading_rules", {}) or {}
+        warn_deprecated_cooldown_settings(config, logger)
         gold_specs = trading_settings.get("GOLD_SPECIFICATIONS", {}) if isinstance(trading_settings, dict) else {}
 
         symbol = trading_settings.get("SYMBOL", "XAUUSD!")
@@ -159,8 +160,7 @@ class BacktestConfig:
             slippage=float(slippage if slippage is not None else typical_slippage),
             allow_multiple_positions=bool(trading_rules.get("ALLOW_MULTIPLE_POSITIONS", True)),
             max_positions=int(trading_rules.get("MAX_POSITIONS", 5)),
-            min_candles_between_trades=int(trading_rules.get("MIN_CANDLES_BETWEEN_TRADES", 10)),
-            min_time_between_trades_minutes=int(trading_rules.get("MIN_TIME_BETWEEN_TRADES_MINUTES", 60)),
+            min_candles_between_trades=get_min_candles_between_trades(config, default=10),
             daily_max_trades=int(trading_rules.get("DAILY_MAX_TRADES", 40)),
             starting_equity=float(starting_equity if starting_equity is not None else config.get("ACCOUNT_BALANCE", 1000.0)),
             max_daily_risk_percent=float(get_setting(config, "risk_settings.MAX_DAILY_RISK_PERCENT", 6.0) or 6.0),
@@ -405,6 +405,7 @@ class BacktestEngine:
 
         last_trade_index = -10_000
         last_trade_time: Optional[pd.Timestamp] = None
+        last_trade_direction: Optional[str] = None
         trades_today = 0
         current_day: Optional[datetime.date] = None
         trade_id_counter = 1
@@ -597,14 +598,26 @@ class BacktestEngine:
                 elif trades_today >= bt_cfg.daily_max_trades:
                     final_signal = "NONE"
                     gate_reason = "DAILY_MAX_TRADES"
-                elif i - last_trade_index < bt_cfg.min_candles_between_trades:
-                    final_signal = "NONE"
-                    gate_reason = "MIN_CANDLES_BETWEEN"
-                elif last_trade_time is not None:
-                    delta_minutes = (current_time - last_trade_time).total_seconds() / 60.0
-                    if delta_minutes < bt_cfg.min_time_between_trades_minutes:
+                else:
+                    open_positions_payload = [
+                        {
+                            "side": pos.side,
+                            "open_time": pos.open_time,
+                            "position_ticket": pos.id,
+                        }
+                        for pos in positions
+                    ]
+                    cooldown_decision = evaluate_cooldown(
+                        signal=final_signal,
+                        min_candles_between=bt_cfg.min_candles_between_trades,
+                        df=df.iloc[: i + 1],
+                        open_positions=open_positions_payload,
+                        last_trade_candle_time=last_trade_time,
+                        last_trade_direction=last_trade_direction,
+                    )
+                    if not cooldown_decision.allowed:
                         final_signal = "NONE"
-                        gate_reason = "MIN_TIME_BETWEEN"
+                        gate_reason = cooldown_decision.reason
 
             cycle_payload["final_signal"] = final_signal
             cycle_payload["gate_reason"] = gate_reason
@@ -716,6 +729,7 @@ class BacktestEngine:
             trades_today += 1
             last_trade_index = i
             last_trade_time = current_time
+            last_trade_direction = final_signal
             cycle_log.append(cycle_payload)
 
         trades_df = pd.DataFrame(trades)
