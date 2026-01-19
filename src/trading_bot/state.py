@@ -21,6 +21,8 @@ class BotState:
         self.last_trade_time = None  # سازگاری با نسخه‌های قدیمی
         self.last_trade_wall_time = None
         self.last_trade_candle_time = None
+        self.last_trade_direction = None
+        self.active_signal_direction = None
         
     def add_trade(self, success: bool, profit: float = 0.0):
         """ثبت معامله"""
@@ -58,5 +60,7 @@ class BotState:
             'last_trade_time': self.last_trade_time.strftime('%H:%M:%S') if self.last_trade_time else 'N/A',
             'last_trade_wall_time': self.last_trade_wall_time.strftime('%H:%M:%S') if self.last_trade_wall_time else 'N/A',
             'last_trade_candle_time': self.last_trade_candle_time.strftime('%H:%M:%S') if self.last_trade_candle_time else 'N/A',
+            'last_trade_direction': self.last_trade_direction or 'N/A',
+            'active_signal_direction': self.active_signal_direction or 'N/A',
         }
         return stats
