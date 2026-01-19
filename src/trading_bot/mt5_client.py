@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import logging
-import json
 import time
 import threading
 from typing import Optional, Dict, Any, List, Union
@@ -20,6 +19,7 @@ from collections import deque
 logger = logging.getLogger(__name__)
 
 from src.trading_bot.contracts import normalize_position
+from src.trading_bot.config_utils import resolve_mt5_credentials
 
 @dataclass
 class ConnectionConfig:
@@ -110,7 +110,7 @@ class RealTimeMonitor:
     def _fetch_and_update_price(self, symbol: str):
         """دریافت و به‌روزرسانی قیمت برای یک نماد"""
         try:
-            tick = mt5.symbol_info_tick(symbol)
+            tick = self.client._mt5_call(mt5.symbol_info_tick, symbol)
             
             if not tick:
                 logger.debug(f"⚠️ No tick data for {symbol}")
@@ -308,6 +308,7 @@ class MT5Client:
         """
         self.connected = False
         self._logger = logger or logging.getLogger(__name__)
+        self._mt5_lock = threading.RLock()
         self.data_cache = {}
         self.symbol_cache = {}
         self.session_start = None
@@ -345,6 +346,126 @@ class MT5Client:
         self.tick_cache: Dict[str, Dict[str, Any]] = {}
         self.last_tick_time: Dict[str, datetime] = {}
 
+    def _mt5_call(self, func, *args, **kwargs):
+        """Execute MT5 API calls under a single global lock."""
+        with self._mt5_lock:
+            return func(*args, **kwargs)
+
+    def _mt5_last_error(self) -> Any:
+        return self._mt5_call(mt5.last_error)
+
+    def _log_symbol_snapshot(self, symbol: str) -> Dict[str, Any]:
+        if not symbol:
+            return {}
+        info = self._mt5_call(mt5.symbol_info, symbol)
+        if not info:
+            return {}
+        return {
+            "digits": info.digits,
+            "point": info.point,
+            "trade_mode": info.trade_mode,
+            "trade_stops_level": info.trade_stops_level,
+            "trade_freeze_level": info.trade_freeze_level,
+            "filling_mode": info.filling_mode,
+        }
+
+    def _reconnect_for_order(self, symbol: Optional[str] = None) -> bool:
+        """Attempt a single reconnect + reselect symbol."""
+        with self._mt5_lock:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+        self.connected = False
+        if not self.connect():
+            return False
+
+        if symbol:
+            return self._select_symbol(symbol)
+        return True
+
+    def _order_send_with_retry(
+        self,
+        request: Dict[str, Any],
+        symbol: str,
+        context: str,
+        retry_on_none: bool = True,
+    ):
+        result = self._mt5_call(mt5.order_send, request)
+        if result is not None:
+            return result
+
+        last_error = self._mt5_last_error()
+        snapshot = self._log_symbol_snapshot(symbol)
+        self._logger.error(
+            "❌ MT5 order_send returned None | context=%s | last_error=%s | request=%s | symbol_snapshot=%s",
+            context,
+            last_error,
+            request,
+            snapshot,
+        )
+
+        if not retry_on_none:
+            return None
+
+        recovered = self._reconnect_for_order(symbol)
+        if not recovered:
+            return None
+
+        self._logger.warning("🔄 Retrying order_send after reconnect | context=%s", context)
+        return self._mt5_call(mt5.order_send, request)
+
+    def _normalize_price(self, price: float, digits: int) -> float:
+        return round(float(price), digits)
+
+    def _get_symbol_info(self, symbol: str) -> Optional[Any]:
+        if not self._select_symbol(symbol):
+            return None
+        return self._mt5_call(mt5.symbol_info, symbol)
+
+    def _resolve_pending_filling_type(self, symbol_info: Any) -> int:
+        if symbol_info and (symbol_info.filling_mode & mt5.ORDER_FILLING_RETURN):
+            return mt5.ORDER_FILLING_RETURN
+        return mt5.ORDER_FILLING_RETURN
+
+    def _pending_min_distance(self, symbol_info: Any) -> float:
+        if not symbol_info:
+            return 0.0
+        point = symbol_info.point or 0.0
+        stops_level = max(symbol_info.trade_stops_level or 0, symbol_info.trade_freeze_level or 0)
+        return stops_level * point
+
+    def _validate_pending_price(
+        self,
+        order_type: str,
+        pending_price: float,
+        bid: float,
+        ask: float,
+        min_distance: float,
+    ) -> Optional[str]:
+        if order_type == "BUY_STOP" and pending_price < ask + min_distance:
+            return f"BUY_STOP must be >= ask + min_distance ({ask:.5f} + {min_distance:.5f})"
+        if order_type == "SELL_STOP" and pending_price > bid - min_distance:
+            return f"SELL_STOP must be <= bid - min_distance ({bid:.5f} - {min_distance:.5f})"
+        if order_type == "BUY_LIMIT" and pending_price > bid - min_distance:
+            return f"BUY_LIMIT must be <= bid - min_distance ({bid:.5f} - {min_distance:.5f})"
+        if order_type == "SELL_LIMIT" and pending_price < ask + min_distance:
+            return f"SELL_LIMIT must be >= ask + min_distance ({ask:.5f} + {min_distance:.5f})"
+        return None
+
+    def _validate_pending_sl_tp(
+        self,
+        entry: float,
+        sl: Optional[float],
+        tp: Optional[float],
+        min_distance: float,
+    ) -> Optional[str]:
+        if sl and abs(entry - sl) < min_distance:
+            return f"SL too close to entry (min {min_distance:.5f})"
+        if tp and abs(entry - tp) < min_distance:
+            return f"TP too close to entry (min {min_distance:.5f})"
+        return None
     def _load_connection_config(self) -> Any: # فرض شده خروجی ConnectionConfig است
         """بارگذاری تنظیمات اتصال با رعایت اولویت‌ها"""
         # اینجا از کلاس داخلی یا ساختار شما استفاده شده است
@@ -359,51 +480,31 @@ class MT5Client:
                     self.real_time_enabled = True; self.tick_update_interval = 1.0
         
         config_obj = ConnectionConfig()
-        sources = []
-        
-        # اولویت 1: config متمرکز (Settings.py)
-        if self.config:
-            try:
-                creds = self.config.get_mt5_credentials()
-                if creds:
-                    config_obj.login = creds.get('login', config_obj.login)
-                    config_obj.password = creds.get('password', config_obj.password)
-                    config_obj.server = creds.get('server', config_obj.server)
-                    config_obj.mt5_path = creds.get('mt5_path', config_obj.mt5_path)
-                    config_obj.real_time_enabled = creds.get('real_time_enabled', True)
-                    config_obj.tick_update_interval = creds.get('tick_update_interval', 1.0)
-                    sources.append("central config")
-            except Exception as e:
-                self._logger.warning(f"Failed to load from central config: {e}")
-        
-        # اولویت 2: بررسی فایل‌های فیزیکی اگر موارد بالا خالی بودند
-        if not all([config_obj.login, config_obj.password, config_obj.server]):
-            possible_paths = [
-                Path.cwd() / "config" / "mt5_credentials.json",
-                Path.cwd() / "mt5_credentials.json",
-                Path(__file__).parent.parent / "config" / "mt5_credentials.json"
-            ]
-            
-            for file_path in possible_paths:
-                if file_path.exists():
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            creds = json.load(f)
-                        if all(k in creds for k in ['login', 'password', 'server']):
-                            config_obj.login = creds.get('login')
-                            config_obj.password = creds.get('password')
-                            config_obj.server = creds.get('server')
-                            config_obj.mt5_path = creds.get('mt5_path', config_obj.mt5_path)
-                            sources.append(f"file: {file_path.name}")
-                            break
-                    except Exception as e:
-                        self._logger.debug(f"Skip {file_path}: {e}")
+        possible_paths = [
+            Path.cwd() / "config" / "mt5_credentials.json",
+            Path.cwd() / "mt5_credentials.json",
+            Path(__file__).parent.parent / "config" / "mt5_credentials.json",
+        ]
+        resolved = resolve_mt5_credentials(self.config, possible_paths, log=self._logger)
+        creds = resolved["credentials"]
 
-        # لاگ نتیجه نهایی بارگذاری
-        if all([config_obj.login, config_obj.password, config_obj.server]):
-            self._logger.info(f"✅ Connection credentials loaded from: {', '.join(sources)}")
+        if creds:
+            config_obj.login = creds.get("login", config_obj.login)
+            config_obj.password = creds.get("password", config_obj.password)
+            config_obj.server = creds.get("server", config_obj.server)
+            config_obj.mt5_path = creds.get("mt5_path", config_obj.mt5_path)
+            if creds.get("real_time_enabled") is not None:
+                config_obj.real_time_enabled = bool(creds.get("real_time_enabled"))
+            if creds.get("tick_update_interval") is not None:
+                config_obj.tick_update_interval = float(creds.get("tick_update_interval"))
+
+        if resolved["is_complete"]:
+            self._logger.info(
+                "✅ Connection credentials loaded from: %s",
+                ", ".join(resolved["sources"]),
+            )
         else:
-            self._logger.warning("⚠️ MT5 credentials are still incomplete.")
+            self._logger.warning("⚠️ MT5 credentials are still incomplete after resolution.")
         
         return config_obj
 
@@ -432,20 +533,20 @@ class MT5Client:
                 if final_path:
                     init_params["path"] = str(final_path)
                 
-                if not mt5.initialize(**init_params):
-                    self._logger.error(f"❌ Initialize failed: {mt5.last_error()}")
+                if not self._mt5_call(mt5.initialize, **init_params):
+                    self._logger.error(f"❌ Initialize failed: {self._mt5_last_error()}")
                     time.sleep(2)
                     continue
 
                 # Login
-                if not mt5.login(login=int(final_login), password=final_password, server=final_server):
-                    self._logger.error(f"❌ Login failed: {mt5.last_error()}")
-                    mt5.shutdown()
+                if not self._mt5_call(mt5.login, login=int(final_login), password=final_password, server=final_server):
+                    self._logger.error(f"❌ Login failed: {self._mt5_last_error()}")
+                    self._mt5_call(mt5.shutdown)
                     time.sleep(2)
                     continue
 
                 # Success
-                account_info = mt5.account_info()
+                account_info = self._mt5_call(mt5.account_info)
                 if account_info:
                     self.connected = True
                     self.session_start = datetime.now()
@@ -475,7 +576,7 @@ class MT5Client:
         if not self.connected:
             return None
         
-        acc = mt5.account_info()
+        acc = self._mt5_call(mt5.account_info)
         if acc is None:
             return None
             
@@ -521,10 +622,10 @@ class MT5Client:
                 return None
             
             self._logger.debug(f"📡 Fetching direct tick for {symbol} from MT5...")
-            tick = mt5.symbol_info_tick(symbol)
+            tick = self._mt5_call(mt5.symbol_info_tick, symbol)
             
             if not tick:
-                error = mt5.last_error()
+                error = self._mt5_last_error()
                 self._logger.error(f"❌ Failed to get tick for {symbol}: {error}")
                 return None
             
@@ -628,7 +729,7 @@ class MT5Client:
             
             # دریافت داده
             self._logger.debug(f"📥 Fetching {bars} bars of {symbol} {timeframe} from MT5...")
-            rates = mt5.copy_rates_from_pos(symbol, tf, 0, bars)
+            rates = self._mt5_call(mt5.copy_rates_from_pos, symbol, tf, 0, bars)
             
             if rates is None or len(rates) == 0:
                 self._logger.error(f"❌ No data returned for {symbol} {timeframe}")
@@ -708,8 +809,8 @@ class MT5Client:
             return True
         
         try:
-            if not mt5.symbol_select(symbol, True):
-                error = mt5.last_error()
+            if not self._mt5_call(mt5.symbol_select, symbol, True):
+                error = self._mt5_last_error()
                 self._logger.error(f"Failed to select {symbol}: {error}")
                 return False
             
@@ -737,10 +838,10 @@ class MT5Client:
 
         try:
             # 🔹 اطمینان از فعال بودن نماد
-            if not mt5.symbol_select(symbol, True):
+            if not self._mt5_call(mt5.symbol_select, symbol, True):
                 return {'error': f'Failed to select symbol {symbol}', 'success': False}
 
-            symbol_info = mt5.symbol_info(symbol)
+            symbol_info = self._mt5_call(mt5.symbol_info, symbol)
             if symbol_info is None:
                 return {'error': f'Symbol info not available for {symbol}', 'success': False}
 
@@ -830,11 +931,10 @@ class MT5Client:
             }
 
             request_time = datetime.now()
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, symbol, "market")
 
             if result is None:
-                last_error = mt5.last_error()
-                error_msg = f"order_send returned None | MT5 error: {last_error}"
+                error_msg = "order_send returned None after retry | check MT5 connection/state"
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False}
 
@@ -889,7 +989,7 @@ class MT5Client:
 
         while time.time() < deadline:
             try:
-                positions = mt5.positions_get(symbol=symbol)
+                positions = self._mt5_call(mt5.positions_get, symbol=symbol)
                 if positions:
                     matched_positions = [
                         pos for pos in positions
@@ -927,9 +1027,9 @@ class MT5Client:
         try:
             now = datetime.now()
             from_time = now - timedelta(days=days_back)
-            deals = mt5.history_deals_get(from_time, now)
+            deals = self._mt5_call(mt5.history_deals_get, from_time, now)
             if deals is None:
-                error = mt5.last_error()
+                error = self._mt5_last_error()
                 self._logger.warning(f"⚠️ Failed to get deals history: {error}")
                 return {}
 
@@ -1048,10 +1148,19 @@ class MT5Client:
             return {'error': 'Not connected to MT5', 'success': False}
         
         try:
+            symbol_info = self._get_symbol_info(symbol)
+            if symbol_info is None:
+                return {'error': f'Symbol info not available for {symbol}', 'success': False}
+
+            digits = symbol_info.digits
+            min_distance = self._pending_min_distance(symbol_info)
+
             # 🔥 دریافت قیمت لحظه‌ای برای لاگ
             tick = self.get_current_tick(symbol)
-            current_bid = tick.get('bid') if tick else 0
-            current_ask = tick.get('ask') if tick else 0
+            if not tick:
+                return {'error': 'Failed to get real-time price', 'success': False}
+            current_bid = tick.get('bid')
+            current_ask = tick.get('ask')
             
             # تبدیل نوع سفارش به کد MT5
             order_type_map = {
@@ -1063,17 +1172,24 @@ class MT5Client:
             if not mt5_order_type:
                 return {'error': f'Invalid limit order type: {order_type}', 'success': False}
             
-            # 🔥 اعتبارسنجی قیمت Limit
-            if order_type.upper() == 'BUY_LIMIT' and limit_price >= current_ask:
-                return {
-                    'error': f'Buy Limit price ({limit_price}) must be below current ask ({current_ask})', 
-                    'success': False
-                }
-            elif order_type.upper() == 'SELL_LIMIT' and limit_price <= current_bid:
-                return {
-                    'error': f'Sell Limit price ({limit_price}) must be above current bid ({current_bid})', 
-                    'success': False
-                }
+            normalized_price = self._normalize_price(limit_price, digits)
+            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else None
+            take_profit = self._normalize_price(take_profit, digits) if take_profit else None
+
+            # 🔥 اعتبارسنجی قیمت Limit با قوانین broker
+            pending_error = self._validate_pending_price(
+                order_type.upper(),
+                normalized_price,
+                current_bid,
+                current_ask,
+                min_distance,
+            )
+            if pending_error:
+                return {'error': pending_error, 'success': False}
+
+            sltp_error = self._validate_pending_sl_tp(normalized_price, stop_loss, take_profit, min_distance)
+            if sltp_error:
+                return {'error': sltp_error, 'success': False}
             
             # ساخت درخواست Limit
             request = {
@@ -1081,22 +1197,36 @@ class MT5Client:
                 "symbol": symbol,
                 "volume": volume,
                 "type": mt5_order_type,
-                "price": limit_price,
+                "price": normalized_price,
                 "sl": stop_loss if stop_loss else 0,
                 "tp": take_profit if take_profit else 0,
                 "deviation": 5,
                 "magic": 202402,  # Magic متفاوت برای پندینگ‌ها
                 "comment": f"{comment} | Limit Order",
                 "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN,
+                "type_filling": self._resolve_pending_filling_type(symbol_info),
             }
+
+            self._logger.info(
+                "🧾 Pending LIMIT request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f bid=%.5f ask=%.5f min_distance=%.5f deviation=%s filling=%s",
+                symbol,
+                order_type,
+                normalized_price,
+                stop_loss or 0.0,
+                take_profit or 0.0,
+                current_bid,
+                current_ask,
+                min_distance,
+                request.get("deviation"),
+                request.get("type_filling"),
+            )
             
             # ارسال سفارش
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, symbol, "limit")
             
             # 🔥 FIX: بررسی اینکه result برابر با None نباشد
             if result is None:
-                error_msg = "MT5 returned None for order_send() - connection may be lost"
+                error_msg = "MT5 returned None for order_send() after retry"
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': None}
             
@@ -1110,7 +1240,7 @@ class MT5Client:
             ✅ Limit Order Placed Successfully!
                Symbol: {symbol}
                Type: {order_type}
-               Limit Price: {limit_price:.2f}
+               Limit Price: {normalized_price:.2f}
                Volume: {volume}
                Current Bid: {current_bid:.2f}
                Current Ask: {current_ask:.2f}
@@ -1121,7 +1251,7 @@ class MT5Client:
                 'success': True,
                 'ticket': result.order,
                 'order_type': order_type,
-                'limit_price': limit_price,
+                'limit_price': normalized_price,
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'volume': volume,
@@ -1324,6 +1454,13 @@ class MT5Client:
             return {'error': 'Not connected to MT5', 'success': False}
         
         try:
+            symbol_info = self._get_symbol_info(symbol)
+            if symbol_info is None:
+                return {'error': f'Symbol info not available for {symbol}', 'success': False}
+
+            digits = symbol_info.digits
+            min_distance = self._pending_min_distance(symbol_info)
+
             # 🔥 دریافت قیمت لحظه‌ای برای اعتبارسنجی
             tick = self.get_current_tick(symbol)
             if not tick:
@@ -1342,17 +1479,24 @@ class MT5Client:
             if not mt5_order_type:
                 return {'error': f'Invalid stop order type: {order_type}', 'success': False}
             
-            # 🔥 اعتبارسنجی قیمت Stop
-            if order_type.upper() == 'BUY_STOP' and stop_price <= current_ask:
-                return {
-                    'error': f'Buy Stop price ({stop_price}) must be above current ask ({current_ask})', 
-                    'success': False
-                }
-            elif order_type.upper() == 'SELL_STOP' and stop_price >= current_bid:
-                return {
-                    'error': f'Sell Stop price ({stop_price}) must be below current bid ({current_bid})', 
-                    'success': False
-                }
+            normalized_price = self._normalize_price(stop_price, digits)
+            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else None
+            take_profit = self._normalize_price(take_profit, digits) if take_profit else None
+
+            # 🔥 اعتبارسنجی قیمت Stop با قوانین broker
+            pending_error = self._validate_pending_price(
+                order_type.upper(),
+                normalized_price,
+                current_bid,
+                current_ask,
+                min_distance,
+            )
+            if pending_error:
+                return {'error': pending_error, 'success': False}
+
+            sltp_error = self._validate_pending_sl_tp(normalized_price, stop_loss, take_profit, min_distance)
+            if sltp_error:
+                return {'error': sltp_error, 'success': False}
             
             # ساخت درخواست Stop
             request = {
@@ -1360,22 +1504,36 @@ class MT5Client:
                 "symbol": symbol,
                 "volume": volume,
                 "type": mt5_order_type,
-                "price": stop_price,
+                "price": normalized_price,
                 "sl": stop_loss if stop_loss else 0,
                 "tp": take_profit if take_profit else 0,
                 "deviation": 5,
                 "magic": 202403,  # Magic متفاوت برای Stopها
                 "comment": f"{comment} | Stop Order",
                 "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN,
+                "type_filling": self._resolve_pending_filling_type(symbol_info),
             }
+
+            self._logger.info(
+                "🧾 Pending STOP request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f bid=%.5f ask=%.5f min_distance=%.5f deviation=%s filling=%s",
+                symbol,
+                order_type,
+                normalized_price,
+                stop_loss or 0.0,
+                take_profit or 0.0,
+                current_bid,
+                current_ask,
+                min_distance,
+                request.get("deviation"),
+                request.get("type_filling"),
+            )
             
             # ارسال سفارش
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, symbol, "stop")
             
             # 🔥 FIX: بررسی اینکه result برابر با None نباشد
             if result is None:
-                error_msg = "MT5 returned None for order_send() - connection may be lost"
+                error_msg = "MT5 returned None for order_send() after retry"
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': None}
             
@@ -1389,7 +1547,7 @@ class MT5Client:
             ✅ Stop Order Placed Successfully!
                Symbol: {symbol}
                Type: {order_type}
-               Stop Price: {stop_price:.2f}
+               Stop Price: {normalized_price:.2f}
                Volume: {volume}
                Current Bid: {current_bid:.2f}
                Current Ask: {current_ask:.2f}
@@ -1400,7 +1558,7 @@ class MT5Client:
                 'success': True,
                 'ticket': result.order,
                 'order_type': order_type,
-                'stop_price': stop_price,
+                'stop_price': normalized_price,
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'volume': volume,
@@ -1429,10 +1587,10 @@ class MT5Client:
             return []
         
         try:
-            positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+            positions = self._mt5_call(mt5.positions_get, symbol=symbol) if symbol else self._mt5_call(mt5.positions_get)
             
             if positions is None:
-                error = mt5.last_error()
+                error = self._mt5_last_error()
                 if error[0] != mt5.TRADE_RETCODE_NO_ERROR:
                     self._logger.warning(f"⚠️ No open positions found for {symbol if symbol else 'all symbols'}: {error}")
                 return []
@@ -1482,10 +1640,10 @@ class MT5Client:
             return []
         
         try:
-            orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+            orders = self._mt5_call(mt5.orders_get, symbol=symbol) if symbol else self._mt5_call(mt5.orders_get)
             
             if orders is None:
-                error = mt5.last_error()
+                error = self._mt5_last_error()
                 if error[0] != mt5.TRADE_RETCODE_NO_ERROR:
                     self._logger.debug(f"⚠️ No pending orders found for {symbol if symbol else 'all symbols'}: {error}")
                 return []
@@ -1550,7 +1708,7 @@ class MT5Client:
                 "comment": "Cancelled by MT5Client",
             }
             
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, "", "cancel", retry_on_none=True)
             
             # 🔥 FIX: بررسی اینکه result برابر با None نباشد
             if result is None:
@@ -1595,7 +1753,7 @@ class MT5Client:
         
         try:
             # دریافت اطلاعات سفارش فعلی
-            orders = mt5.orders_get(ticket=ticket)
+            orders = self._mt5_call(mt5.orders_get, ticket=ticket)
             if not orders or len(orders) == 0:
                 return {'error': f'Order {ticket} not found', 'success': False}
             
@@ -1610,7 +1768,7 @@ class MT5Client:
                 "comment": f"Modified by MT5Client | Original: {order.comment}",
             }
             
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, order.symbol, "modify_order")
             
             # 🔥 FIX: بررسی اینکه result برابر با None نباشد
             if result is None:
@@ -1657,7 +1815,7 @@ class MT5Client:
         
         try:
             # دریافت اطلاعات پوزیشن فعلی
-            positions = mt5.positions_get(ticket=ticket)
+            positions = self._mt5_call(mt5.positions_get, ticket=ticket)
             if not positions or len(positions) == 0:
                 return {'error': f'Position {ticket} not found', 'success': False}
             
@@ -1672,7 +1830,7 @@ class MT5Client:
                 "comment": f"Modified by MT5Client",
             }
             
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, position.symbol, "modify_position")
             
             # 🔥 FIX: بررسی اینکه result برابر با None نباشد
             if result is None:
@@ -1719,7 +1877,7 @@ class MT5Client:
         
         try:
             # دریافت اطلاعات پوزیشن
-            positions = mt5.positions_get(ticket=ticket)
+            positions = self._mt5_call(mt5.positions_get, ticket=ticket)
             if not positions or len(positions) == 0:
                 return {'error': f'Position {ticket} not found', 'success': False}
             
@@ -1731,10 +1889,12 @@ class MT5Client:
             # تعیین نوع معکوس برای بستن
             if position.type == mt5.ORDER_TYPE_BUY:
                 close_type = mt5.ORDER_TYPE_SELL
-                price = mt5.symbol_info_tick(position.symbol).bid
+                tick = self._mt5_call(mt5.symbol_info_tick, position.symbol)
+                price = tick.bid if tick else 0
             else:  # SELL
                 close_type = mt5.ORDER_TYPE_BUY
-                price = mt5.symbol_info_tick(position.symbol).ask
+                tick = self._mt5_call(mt5.symbol_info_tick, position.symbol)
+                price = tick.ask if tick else 0
             
             # 🔥 FIX: بررسی اینکه قیمت معتبر باشد
             if price <= 0:
@@ -1754,7 +1914,7 @@ class MT5Client:
                 "type_filling": mt5.ORDER_FILLING_FOK,
             }
             
-            result = mt5.order_send(request)
+            result = self._order_send_with_retry(request, position.symbol, "close_position")
             
             # 🔥 FIX: بررسی اینکه result برابر با None نباشد
             if result is None:
@@ -1803,7 +1963,7 @@ class MT5Client:
             from_date = datetime.now() - timedelta(days=days_back)
             to_date = datetime.now()
             
-            history = mt5.history_deals_get(from_date, to_date)
+            history = self._mt5_call(mt5.history_deals_get, from_date, to_date)
             if history is None:
                 self._logger.debug(f"No trading history found for last {days_back} days")
                 return []
@@ -1845,7 +2005,7 @@ class MT5Client:
         
         if self.connected:
             try:
-                mt5.shutdown()
+                self._mt5_call(mt5.shutdown)
                 self.connected = False
                 self.session_start = None
                 self._logger.info("Disconnected from MT5 (Real-Time monitor stopped)")
