@@ -1482,7 +1482,7 @@ class NDSBot:
                 )
 
                 try:
-                        tg_payload = {
+                    tg_payload = {
                         "signal": signal_data.get("signal"),
                         "entry_price": float(actual_entry_price),
                         "stop_loss": float(actual_sl),
@@ -1499,10 +1499,12 @@ class NDSBot:
                 self._maybe_monitor_trades(force=True)
                 return True
 
-            logger.error(f"❌ ارسال سفارش اسکلپینگ {order_type} ناموفق بود | result={order_result}")
-            print(f"❌ ارسال سفارش اسکلپینگ {order_type} ناموفق بود")
-            self.bot_state.add_trade(success=False)
-            return False
+            else:
+                # این بخش قبلاً اجرا نمی‌شد، اکنون در بلوک else قرار گرفته است
+                logger.error(f"❌ ارسال سفارش اسکلپینگ {order_type} ناموفق بود | result={order_result}")
+                print(f"❌ ارسال سفارش اسکلپینگ {order_type} ناموفق بود")
+                self.bot_state.add_trade(success=False)
+                return False
 
         except Exception as e:
             logger.error(f"❌ خطا در اجرای معامله اسکلپینگ Real-Time: {e}", exc_info=True)
