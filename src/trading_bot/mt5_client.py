@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import queue
 from collections import deque
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -392,17 +393,22 @@ class MT5Client:
         context: str,
         retry_on_none: bool = True,
     ):
-        result = self._mt5_call(mt5.order_send, request)
+        sanitized_request = self.sanitize_mt5_request(request)
+        req_types = {key: type(value).__name__ for key, value in sanitized_request.items()}
+        self._logger.debug("REQ_TYPES: %s", req_types)
+        self._logger.debug("REQ_DATA: %s", sanitized_request)
+        result = self._mt5_call(mt5.order_send, sanitized_request)
         if result is not None:
             return result
 
         last_error = self._mt5_last_error()
         snapshot = self._log_symbol_snapshot(symbol)
         self._logger.error(
-            "❌ MT5 order_send returned None | context=%s | last_error=%s | request=%s | symbol_snapshot=%s",
+            "❌ MT5 order_send returned None | context=%s | last_error=%s | request=%s | request_types=%s | symbol_snapshot=%s",
             context,
             last_error,
-            request,
+            sanitized_request,
+            req_types,
             snapshot,
         )
 
@@ -414,7 +420,100 @@ class MT5Client:
             return None
 
         self._logger.warning("🔄 Retrying order_send after reconnect | context=%s", context)
-        return self._mt5_call(mt5.order_send, request)
+        return self._mt5_call(mt5.order_send, sanitized_request)
+
+    def _to_native_value(self, value: Any) -> Any:
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime().isoformat()
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if hasattr(value, "item") and callable(value.item):
+            try:
+                return value.item()
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def sanitize_mt5_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized: Dict[str, Any] = {}
+        for key, value in request.items():
+            if value is None:
+                continue
+            sanitized[str(key)] = self._to_native_value(value)
+        return sanitized
+
+    def build_order_request(
+        self,
+        order_action: str,
+        symbol: str,
+        volume: float,
+        order_type: str,
+        price: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        comment: str,
+        magic: int,
+        deviation: int,
+        type_time: int,
+        type_filling: int,
+    ) -> Dict[str, Any]:
+        order_action_upper = order_action.upper()
+        order_type_upper = order_type.upper()
+
+        action_map = {
+            "MARKET": mt5.TRADE_ACTION_DEAL,
+            "LIMIT": mt5.TRADE_ACTION_PENDING,
+            "STOP": mt5.TRADE_ACTION_PENDING,
+        }
+        if order_action_upper not in action_map:
+            raise ValueError(f"Unsupported order_action: {order_action}")
+
+        order_type_map = {
+            "MARKET": {
+                "BUY": mt5.ORDER_TYPE_BUY,
+                "SELL": mt5.ORDER_TYPE_SELL,
+            },
+            "LIMIT": {
+                "BUY_LIMIT": mt5.ORDER_TYPE_BUY_LIMIT,
+                "SELL_LIMIT": mt5.ORDER_TYPE_SELL_LIMIT,
+            },
+            "STOP": {
+                "BUY_STOP": mt5.ORDER_TYPE_BUY_STOP,
+                "SELL_STOP": mt5.ORDER_TYPE_SELL_STOP,
+            },
+        }
+
+        if order_action_upper not in order_type_map or order_type_upper not in order_type_map[order_action_upper]:
+            raise ValueError(f"Unsupported order_type for {order_action_upper}: {order_type}")
+
+        if not symbol:
+            raise ValueError("Symbol is required for order request.")
+        if volume is None or float(volume) <= 0:
+            raise ValueError("Volume must be positive for order request.")
+        if price is None or float(price) <= 0:
+            raise ValueError("Price must be positive for order request.")
+
+        request = {
+            "action": action_map[order_action_upper],
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type_map[order_action_upper][order_type_upper],
+            "price": price,
+            "sl": stop_loss if stop_loss else 0,
+            "tp": take_profit if take_profit else 0,
+            "deviation": deviation,
+            "magic": magic,
+            "comment": comment,
+            "type_time": type_time,
+            "type_filling": type_filling,
+        }
+        return request
 
     def _normalize_price(self, price: float, digits: int) -> float:
         return round(float(price), digits)
@@ -860,7 +959,6 @@ class MT5Client:
             # 🔹 تعیین نوع سفارش
             if order_type.upper() == 'BUY':
                 entry_price = current_ask
-                mt5_type = mt5.ORDER_TYPE_BUY
                 stop_loss = (
                     entry_price - sl_distance if sl_distance else sl_price or 0
                 )
@@ -870,7 +968,6 @@ class MT5Client:
 
             elif order_type.upper() == 'SELL':
                 entry_price = current_bid
-                mt5_type = mt5.ORDER_TYPE_SELL
                 stop_loss = (
                     entry_price + sl_distance if sl_distance else sl_price or 0
                 )
@@ -915,20 +1012,20 @@ class MT5Client:
 
 
             request_comment = comment or "NDS_SCALP_V1"
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": volume,
-                "type": mt5_type,
-                "price": entry_price,
-                "sl": stop_loss,
-                "tp": take_profit,
-                "deviation": 10,
-                "magic": 202401,
-                "comment": request_comment,
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": filling_type,
-            }
+            request = self.build_order_request(
+                order_action="MARKET",
+                symbol=symbol,
+                volume=volume,
+                order_type=order_type,
+                price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                comment=request_comment,
+                magic=202401,
+                deviation=10,
+                type_time=mt5.ORDER_TIME_GTC,
+                type_filling=filling_type,
+            )
 
             request_time = datetime.now()
             result = self._order_send_with_retry(request, symbol, "market")
@@ -1168,8 +1265,7 @@ class MT5Client:
                 'SELL_LIMIT': mt5.ORDER_TYPE_SELL_LIMIT
             }
             
-            mt5_order_type = order_type_map.get(order_type.upper())
-            if not mt5_order_type:
+            if not order_type_map.get(order_type.upper()):
                 return {'error': f'Invalid limit order type: {order_type}', 'success': False}
             
             normalized_price = self._normalize_price(limit_price, digits)
@@ -1192,20 +1288,20 @@ class MT5Client:
                 return {'error': sltp_error, 'success': False}
             
             # ساخت درخواست Limit
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": volume,
-                "type": mt5_order_type,
-                "price": normalized_price,
-                "sl": stop_loss if stop_loss else 0,
-                "tp": take_profit if take_profit else 0,
-                "deviation": 5,
-                "magic": 202402,  # Magic متفاوت برای پندینگ‌ها
-                "comment": f"{comment} | Limit Order",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": self._resolve_pending_filling_type(symbol_info),
-            }
+            request = self.build_order_request(
+                order_action="LIMIT",
+                symbol=symbol,
+                volume=volume,
+                order_type=order_type,
+                price=normalized_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                comment=f"{comment} | Limit Order",
+                magic=202402,
+                deviation=5,
+                type_time=mt5.ORDER_TIME_GTC,
+                type_filling=self._resolve_pending_filling_type(symbol_info),
+            )
 
             self._logger.info(
                 "🧾 Pending LIMIT request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f bid=%.5f ask=%.5f min_distance=%.5f deviation=%s filling=%s",
@@ -1475,8 +1571,7 @@ class MT5Client:
                 'SELL_STOP': mt5.ORDER_TYPE_SELL_STOP
             }
             
-            mt5_order_type = order_type_map.get(order_type.upper())
-            if not mt5_order_type:
+            if not order_type_map.get(order_type.upper()):
                 return {'error': f'Invalid stop order type: {order_type}', 'success': False}
             
             normalized_price = self._normalize_price(stop_price, digits)
@@ -1499,20 +1594,20 @@ class MT5Client:
                 return {'error': sltp_error, 'success': False}
             
             # ساخت درخواست Stop
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": volume,
-                "type": mt5_order_type,
-                "price": normalized_price,
-                "sl": stop_loss if stop_loss else 0,
-                "tp": take_profit if take_profit else 0,
-                "deviation": 5,
-                "magic": 202403,  # Magic متفاوت برای Stopها
-                "comment": f"{comment} | Stop Order",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": self._resolve_pending_filling_type(symbol_info),
-            }
+            request = self.build_order_request(
+                order_action="STOP",
+                symbol=symbol,
+                volume=volume,
+                order_type=order_type,
+                price=normalized_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                comment=f"{comment} | Stop Order",
+                magic=202403,
+                deviation=5,
+                type_time=mt5.ORDER_TIME_GTC,
+                type_filling=self._resolve_pending_filling_type(symbol_info),
+            )
 
             self._logger.info(
                 "🧾 Pending STOP request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f bid=%.5f ask=%.5f min_distance=%.5f deviation=%s filling=%s",
