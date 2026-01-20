@@ -252,6 +252,27 @@ class NDSBot:
                     market_metrics[dst_k] = ctx.get(src_k)
         d["market_metrics"] = market_metrics
 
+        # --- spread normalization (from analyzer volume analysis) ---
+        analysis_data = ctx.get("analysis_data") if isinstance(ctx.get("analysis_data"), dict) else {}
+        volume_analysis = analysis_data.get("volume_analysis") if isinstance(analysis_data.get("volume_analysis"), dict) else {}
+        if not volume_analysis and isinstance(d.get("analysis_data"), dict):
+            maybe_volume = d.get("analysis_data", {}).get("volume_analysis")
+            if isinstance(maybe_volume, dict):
+                volume_analysis = maybe_volume
+
+        spread_pips = volume_analysis.get("spread_pips", volume_analysis.get("spread"))
+        spread_price = volume_analysis.get("spread_price")
+        if d.get("spread_pips") is None and spread_pips is not None:
+            d["spread_pips"] = spread_pips
+        if d.get("spread_price") is None and spread_price is not None:
+            d["spread_price"] = spread_price
+        if d.get("spread_raw") is None and volume_analysis.get("spread_raw") is not None:
+            d["spread_raw"] = volume_analysis.get("spread_raw")
+        if d.get("spread_raw_unit") is None and volume_analysis.get("spread_raw_unit") is not None:
+            d["spread_raw_unit"] = volume_analysis.get("spread_raw_unit")
+        if d.get("spread") is None and spread_pips is not None:
+            d["spread"] = spread_pips
+
         # --- canonical session/time keys ---
         if not d.get("session_analysis") and isinstance(ctx.get("session_analysis"), dict):
             d["session_analysis"] = ctx.get("session_analysis")
@@ -663,6 +684,9 @@ class NDSBot:
         min_confidence: float,
         price: float,
         spread: float,
+        spread_price: float | None = None,
+        spread_raw: float | None = None,
+        spread_raw_unit: str | None = None,
         session: str = "",
         session_weight: float = 0.0,
         session_activity: str = "",
@@ -673,10 +697,16 @@ class NDSBot:
     ) -> None:
         """لاگ متمرکز و یک خطی برای تحلیل دقیق تصمیمات ربات"""
         try:
+            spread_fields = ""
+            if spread_price is not None:
+                spread_fields += f" spread_price={spread_price:.5f}"
+            if spread_raw is not None:
+                unit = spread_raw_unit or ""
+                spread_fields += f" spread_raw={float(spread_raw):.5f}{unit}"
             logger.info(
                 f"[BOT][DECISION] cycle={cycle_number} analyzer={analyzer_signal} final={final_signal} "
                 f"score={score:.1f} conf={confidence:.1f} min_conf={min_confidence:.1f} "
-                f"price={price:.2f} spread={spread:.5f} sess={session} weight={session_weight:.2f} "
+                f"price={price:.2f} spread_pips={spread:.5f}{spread_fields} sess={session} weight={session_weight:.2f} "
                 f"act={is_active_session} untradable={untradable} reason={reject_reason} details={reject_details}"
             )
         except Exception:
@@ -750,7 +780,10 @@ class NDSBot:
             analyzer_signal = self._normalize_signal(result.get("signal", "NONE"))
             score = float(result.get("score", 0.0) or 0.0)
             confidence = float(result.get("confidence", 0.0) or 0.0)
-            current_spread = float(result.get("spread", 0.0) or 0.0)
+            current_spread = float(result.get("spread_pips") or result.get("spread") or 0.0)
+            spread_price = result.get("spread_price")
+            spread_raw = result.get("spread_raw")
+            spread_raw_unit = result.get("spread_raw_unit")
 
             sess = result.get("session_analysis") or {}
             session_payload = result.get("session") if isinstance(result.get("session"), dict) else {}
@@ -802,7 +835,8 @@ class NDSBot:
             self._log_trade_decision(
                 cycle_number=cycle_number, analyzer_signal=analyzer_signal, final_signal=final_signal,
                 score=score, confidence=confidence, min_confidence=MIN_CONFIDENCE,
-                price=current_price, spread=current_spread, session=session_name,
+                price=current_price, spread=current_spread, spread_price=spread_price,
+                spread_raw=spread_raw, spread_raw_unit=spread_raw_unit, session=session_name,
                 session_weight=session_weight, session_activity=session_activity,
                 is_active_session=is_active_session, untradable=untradable,
                 reject_reason=reject_reason, reject_details=reject_details
@@ -1067,15 +1101,25 @@ class NDSBot:
                 print(f"   {i}. {reason}")
 
         # پارامترهای ورود
-        if result.get("entry_price"):
-            ep = float(result.get("entry_price") or 0)
-            sl = float(result.get("stop_loss") or 0)
-            tp = float(result.get("take_profit") or 0)
+        def _format_optional_price(value: Optional[float]) -> str:
+            try:
+                if value is None:
+                    return "N/A"
+                value_f = float(value)
+            except Exception:
+                return "N/A"
+            if value_f == 0:
+                return "N/A"
+            return f"${value_f:.2f}"
 
+        entry_price_val = result.get("entry_price")
+        stop_loss_val = result.get("stop_loss")
+        take_profit_val = result.get("take_profit")
+        if any(val not in (None, 0, 0.0) for val in (entry_price_val, stop_loss_val, take_profit_val)):
             print(f"\n💰 پارامترهای ورود:")
-            print(f"   قیمت ورود: ${ep:.2f}")
-            print(f"   استاپ لاس: ${sl:.2f}")
-            print(f"   تیک پروفیت: ${tp:.2f}")
+            print(f"   قیمت ورود: {_format_optional_price(entry_price_val)}")
+            print(f"   استاپ لاس: {_format_optional_price(stop_loss_val)}")
+            print(f"   تیک پروفیت: {_format_optional_price(take_profit_val)}")
 
             rr = result.get("risk_reward_ratio")
             if rr:
@@ -1449,6 +1493,31 @@ class NDSBot:
                 success = True
                 order_id = order_result
 
+            needs_reconcile = any(
+                value in (None, 0, 0.0) for value in (actual_entry_price, actual_sl, actual_tp)
+            )
+            if needs_reconcile and position_ticket:
+                for attempt in range(3):
+                    try:
+                        positions = self.mt5_client.get_open_positions(symbol=SYMBOL)
+                        matched = next(
+                            (pos for pos in positions if pos.get("position_ticket") == position_ticket),
+                            None,
+                        )
+                        if matched:
+                            actual_entry_price = matched.get("entry_price") or actual_entry_price
+                            actual_sl = matched.get("sl") or actual_sl
+                            actual_tp = matched.get("tp") or actual_tp
+                        if all(value not in (None, 0, 0.0) for value in (actual_entry_price, actual_sl, actual_tp)):
+                            break
+                    except Exception as reconcile_error:
+                        logger.debug(
+                            "⚠️ Fill reconciliation attempt %s failed: %s",
+                            attempt + 1,
+                            reconcile_error,
+                        )
+                    time.sleep(0.2)
+
             if success and order_id:
                 signal_data["order_ticket"] = order_id
                 signal_data["position_ticket"] = position_ticket
@@ -1677,9 +1746,13 @@ class NDSBot:
                 record = closed_records.get(position_ticket) or self.trade_tracker.active_trades.get(position_ticket)
                 if not record:
                     continue
+                record = self.trade_tracker.normalize_trade_record(record)
+                if not record:
+                    continue
                 identity = record.get("trade_identity", {})
 
-                first_seen = record.get("close_event", {}).get("event_time") or now
+                close_event = record.get("close_event") if isinstance(record.get("close_event"), dict) else {}
+                first_seen = close_event.get("event_time") or now
                 if self.trade_tracker.register_pending_close(position_ticket, record, first_seen):
                     logger.info(
                         "[CLOSE_DETECT] ticket=%s symbol=%s side=%s open_time=%s",

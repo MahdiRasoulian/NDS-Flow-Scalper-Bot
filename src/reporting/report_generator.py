@@ -5,6 +5,7 @@
 """
 
 import logging
+import csv
 from datetime import datetime, timedelta
 import os
 from pathlib import Path
@@ -1195,6 +1196,28 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
 
         daily_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         self._logger.info(f"✅ Daily summary updated at {daily_file}")
+
+        daily_csv = self.output_dir / 'daily' / f"daily_{report_date}.csv"
+        try:
+            fieldnames = [
+                "symbol",
+                "ticket",
+                "side",
+                "profit",
+                "entry_price",
+                "exit_price",
+                "reason",
+                "close_time",
+                "status",
+            ]
+            with daily_csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for trade in payload.get("trades", []):
+                    writer.writerow({key: trade.get(key) for key in fieldnames})
+        except Exception as csv_error:
+            self._logger.warning("⚠️ Failed to write daily CSV: %s", csv_error)
+
         return str(daily_file)
     
     def generate_performance_report(self, 
