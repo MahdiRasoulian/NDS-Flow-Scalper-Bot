@@ -1115,7 +1115,16 @@ class MT5Client:
             return None
         return int(newest.ticket)
 
-    def get_position_history(self, position_ticket: int, days_back: int = 2) -> Dict[str, Any]:
+    def get_position_history(
+        self,
+        position_ticket: int,
+        lookback_hours: int = 72,
+        symbol: Optional[str] = None,
+        magic: Optional[int] = None,
+        open_time: Optional[datetime] = None,
+        volume: Optional[float] = None,
+        side: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """دریافت تاریخچه معاملات برای یک position_ticket جهت تایید بسته شدن."""
         if not self.connected:
             self._logger.warning("⚠️ Not connected to MT5")
@@ -1123,12 +1132,22 @@ class MT5Client:
 
         try:
             now = datetime.now()
-            from_time = now - timedelta(days=days_back)
+            from_time = now - timedelta(hours=lookback_hours)
             deals = self._mt5_call(mt5.history_deals_get, from_time, now)
             if deals is None:
                 error = self._mt5_last_error()
                 self._logger.warning(f"⚠️ Failed to get deals history: {error}")
                 return {}
+
+            self._logger.info(
+                "[HISTORY_QUERY] position_ticket=%s symbol=%s magic=%s from=%s to=%s deals=%s",
+                position_ticket,
+                symbol,
+                magic,
+                from_time.isoformat(),
+                now.isoformat(),
+                len(deals),
+            )
 
             position_deals = []
             for deal in deals:
@@ -1136,6 +1155,16 @@ class MT5Client:
                 deal_position = getattr(deal, "position", None)
                 if deal_position_id == position_ticket or deal_position == position_ticket:
                     position_deals.append(deal)
+
+            if not position_deals:
+                position_deals = self._fallback_match_deals(
+                    deals=deals,
+                    symbol=symbol,
+                    magic=magic,
+                    open_time=open_time,
+                    volume=volume,
+                    side=side,
+                )
 
             if not position_deals:
                 return {}
@@ -1170,6 +1199,44 @@ class MT5Client:
         except Exception as e:
             self._logger.error(f"❌ Error getting position history: {e}", exc_info=True)
             return {}
+
+    def _fallback_match_deals(
+        self,
+        deals: List[Any],
+        symbol: Optional[str],
+        magic: Optional[int],
+        open_time: Optional[datetime],
+        volume: Optional[float],
+        side: Optional[str],
+    ) -> List[Any]:
+        """Fallback match for close deals when position_id is missing."""
+        filtered: List[Any] = []
+        for deal in deals:
+            if symbol and getattr(deal, "symbol", None) != symbol:
+                continue
+            if magic is not None and getattr(deal, "magic", None) != magic:
+                continue
+            if volume is not None:
+                deal_volume = float(getattr(deal, "volume", 0.0) or 0.0)
+                if deal_volume and abs(deal_volume - float(volume)) > 1e-6:
+                    continue
+            if side:
+                deal_type = getattr(deal, "type", None)
+                if side.upper() == "BUY" and deal_type not in (getattr(mt5, "DEAL_TYPE_BUY", None),):
+                    continue
+                if side.upper() == "SELL" and deal_type not in (getattr(mt5, "DEAL_TYPE_SELL", None),):
+                    continue
+            if open_time:
+                deal_time = datetime.fromtimestamp(getattr(deal, "time", 0))
+                if deal_time < open_time - timedelta(minutes=5):
+                    continue
+            entry_flag = getattr(deal, "entry", None)
+            if entry_flag not in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
+                continue
+            filtered.append(deal)
+
+        filtered.sort(key=lambda d: getattr(d, "time", 0))
+        return filtered
 
     
     def send_order(self, symbol: str, order_type: str, volume: float, 

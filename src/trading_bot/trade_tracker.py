@@ -14,6 +14,7 @@ class TradeTracker:
     def __init__(self):
         self.active_trades: Dict[int, Dict] = {}
         self.pending_trades_by_order: Dict[int, Dict] = {}
+        self.pending_closes: Dict[int, Dict] = {}
         self.closed_trades: List[Dict] = []
         self.max_daily_profit = 0.0
         self.daily_stats = {
@@ -76,10 +77,14 @@ class TradeTracker:
     def close_trade_event(self, event: ExecutionEvent) -> None:
         """ثبت بسته شدن معامله"""
         position_ticket = event.get("position_ticket")
-        if position_ticket not in self.active_trades:
+        trade = None
+        if position_ticket in self.active_trades:
+            trade = self.active_trades[position_ticket]
+        elif position_ticket in self.pending_closes:
+            trade = self.pending_closes[position_ticket].get("record")
+        if trade is None:
             return
 
-        trade = self.active_trades[position_ticket]
         trade["close_event"] = event
         trade["status"] = "CLOSED"
         self.closed_trades.append(trade)
@@ -91,13 +96,89 @@ class TradeTracker:
         if final_profit > self.max_daily_profit:
             self.max_daily_profit = final_profit
 
-        del self.active_trades[position_ticket]
+        if position_ticket in self.active_trades:
+            del self.active_trades[position_ticket]
+        if position_ticket in self.pending_closes:
+            del self.pending_closes[position_ticket]
 
     def mark_trade_unknown(self, position_ticket: int, reason: str) -> None:
         """علامت‌گذاری معامله برای بررسی مجدد در سیکل بعدی."""
         if position_ticket in self.active_trades:
             self.active_trades[position_ticket]["status"] = "UNKNOWN"
             self.active_trades[position_ticket]["unknown_reason"] = reason
+
+    def register_pending_close(self, position_ticket: int, record: Dict, detected_time: datetime) -> bool:
+        """ثبت معامله بسته‌شده در صف pending برای تایید تاریخچه."""
+        if position_ticket in self.pending_closes:
+            return False
+
+        if position_ticket in self.active_trades:
+            self.active_trades[position_ticket]["status"] = "PENDING_CLOSE"
+
+        self.pending_closes[position_ticket] = {
+            "record": record,
+            "first_seen": detected_time,
+            "last_attempt": None,
+            "retries": 0,
+        }
+
+        if position_ticket in self.active_trades:
+            del self.active_trades[position_ticket]
+
+        return True
+
+    def get_pending_close_candidates(
+        self,
+        now: datetime,
+        base_backoff_sec: float,
+        max_backoff_sec: float,
+        timeout_sec: float,
+    ) -> Tuple[List[Tuple[int, Dict]], List[Tuple[int, Dict]]]:
+        """دریافت لیست pending برای بررسی یا timeout."""
+        ready: List[Tuple[int, Dict]] = []
+        timed_out: List[Tuple[int, Dict]] = []
+
+        for position_ticket, payload in list(self.pending_closes.items()):
+            first_seen = payload.get("first_seen") or now
+            last_attempt = payload.get("last_attempt")
+            retries = int(payload.get("retries") or 0)
+            elapsed = (now - first_seen).total_seconds()
+            if elapsed >= timeout_sec:
+                timed_out.append((position_ticket, payload))
+                continue
+
+            backoff = min(base_backoff_sec * (2 ** retries), max_backoff_sec)
+            if last_attempt is None or (now - last_attempt).total_seconds() >= backoff:
+                ready.append((position_ticket, payload))
+
+        return ready, timed_out
+
+    def mark_pending_attempt(self, position_ticket: int, attempt_time: datetime) -> None:
+        """ثبت تلاش برای تایید بسته شدن."""
+        if position_ticket not in self.pending_closes:
+            return
+        payload = self.pending_closes[position_ticket]
+        payload["last_attempt"] = attempt_time
+        payload["retries"] = int(payload.get("retries") or 0) + 1
+
+    def finalize_unknown_close(self, position_ticket: int, event: ExecutionEvent) -> None:
+        """ثبت وضعیت CLOSE_UNKNOWN و خارج کردن از pending."""
+        record = None
+        if position_ticket in self.pending_closes:
+            record = self.pending_closes[position_ticket].get("record")
+        if record is None and position_ticket in self.active_trades:
+            record = self.active_trades[position_ticket]
+        if record is None:
+            return
+
+        record["close_event"] = event
+        record["status"] = "CLOSE_UNKNOWN"
+        self.closed_trades.append(record)
+
+        if position_ticket in self.pending_closes:
+            del self.pending_closes[position_ticket]
+        if position_ticket in self.active_trades:
+            del self.active_trades[position_ticket]
 
     def reconcile_with_open_positions(
         self, open_positions: List[PositionContract]

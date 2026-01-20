@@ -385,6 +385,12 @@
     "MAX_RISK_USD": 25.0,
     "POSITION_TIMEOUT_MINUTES": 300
   },
+  "close_tracking": {
+    "HISTORY_LOOKBACK_HOURS": 72,
+    "CLOSE_CONFIRM_TIMEOUT_SEC": 180,
+    "CLOSE_RETRY_BACKOFF_SEC": 5,
+    "CLOSE_RETRY_BACKOFF_MAX_SEC": 30
+  },
   "LOG_LEVEL": "INFO",
   "DEBUG_LOG_FILE": "debug.log",
   "flow_settings": {

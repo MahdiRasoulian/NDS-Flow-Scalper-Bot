@@ -1519,6 +1519,18 @@ class NDSBot:
                     float(lot_size),
                     order_type,
                 )
+                logger.info(
+                    "[OPEN] order_ticket=%s position_ticket=%s symbol=%s magic=%s open_time=%s entry=%.2f sl=%.2f tp=%.2f volume=%.3f",
+                    order_id,
+                    position_ticket,
+                    SYMBOL,
+                    getattr(finalized, "magic", None),
+                    datetime.now().isoformat(),
+                    float(actual_entry_price),
+                    float(actual_sl),
+                    float(actual_tp),
+                    float(lot_size),
+                )
                 print(f"✅ سفارش {order_type} ارسال شد - ticket={order_id} | حجم: {lot_size:.3f} لات")
 
                 open_event: ExecutionEvent = {
@@ -1658,19 +1670,58 @@ class NDSBot:
             closed_tickets = self._last_open_position_tickets - current_tickets
             self._last_open_position_tickets = current_tickets
 
+            now = datetime.now()
             for position_ticket in sorted(set(closed_records.keys()) | closed_tickets):
                 if not position_ticket:
                     continue
-                record = closed_records.get(position_ticket, {})
+                record = closed_records.get(position_ticket) or self.trade_tracker.active_trades.get(position_ticket)
+                if not record:
+                    continue
                 identity = record.get("trade_identity", {})
 
-                history = self.mt5_client.get_position_history(position_ticket)
-                if not history or not history.get("close_time"):
-                    if position_ticket in self.trade_tracker.active_trades:
-                        self.trade_tracker.mark_trade_unknown(position_ticket, "history_not_found")
-                    logger.warning(
-                        "[CLOSE] ticket=%s history_not_found - will retry",
+                first_seen = record.get("close_event", {}).get("event_time") or now
+                if self.trade_tracker.register_pending_close(position_ticket, record, first_seen):
+                    logger.info(
+                        "[CLOSE_DETECT] ticket=%s symbol=%s side=%s open_time=%s",
                         position_ticket,
+                        identity.get("symbol"),
+                        record.get("open_event", {}).get("side"),
+                        identity.get("opened_at"),
+                    )
+
+            close_config = self.config.get("close_tracking", {}) if hasattr(self.config, "get") else {}
+            lookback_hours = int(close_config.get("HISTORY_LOOKBACK_HOURS", 72))
+            timeout_sec = float(close_config.get("CLOSE_CONFIRM_TIMEOUT_SEC", 180))
+            backoff_base = float(close_config.get("CLOSE_RETRY_BACKOFF_SEC", 5))
+            backoff_max = float(close_config.get("CLOSE_RETRY_BACKOFF_MAX_SEC", 30))
+
+            pending_checks, pending_timeouts = self.trade_tracker.get_pending_close_candidates(
+                now=now,
+                base_backoff_sec=backoff_base,
+                max_backoff_sec=backoff_max,
+                timeout_sec=timeout_sec,
+            )
+
+            for position_ticket, payload in pending_checks:
+                record = payload.get("record", {})
+                identity = record.get("trade_identity", {})
+                open_event = record.get("open_event", {})
+                history = self.mt5_client.get_position_history(
+                    position_ticket,
+                    lookback_hours=lookback_hours,
+                    symbol=identity.get("symbol"),
+                    magic=identity.get("magic"),
+                    open_time=identity.get("opened_at"),
+                    volume=open_event.get("volume"),
+                    side=open_event.get("side"),
+                )
+                if not history or not history.get("close_time"):
+                    self.trade_tracker.mark_pending_attempt(position_ticket, now)
+                    logger.warning(
+                        "[CLOSE_PENDING] ticket=%s retries=%s backoff=%.1fs",
+                        position_ticket,
+                        payload.get("retries"),
+                        min(backoff_base * (2 ** int(payload.get("retries") or 0)), backoff_max),
                     )
                     continue
 
@@ -1681,6 +1732,10 @@ class NDSBot:
                 profit = history.get("total_profit")
                 close_time = history.get("close_time")
                 reason = history.get("reason")
+                duration_sec = None
+                opened_at = identity.get("opened_at")
+                if opened_at and close_time:
+                    duration_sec = (close_time - opened_at).total_seconds()
 
                 point_size, point_source = resolve_point_size_with_source(
                     self.config,
@@ -1708,11 +1763,10 @@ class NDSBot:
                     "profit": profit,
                     "pips": pips_val,
                     "reason": reason,
-                    "metadata": {"history": history},
+                    "metadata": {"history": history, "duration_sec": duration_sec},
                 }
 
-                if position_ticket in self.trade_tracker.active_trades:
-                    self.trade_tracker.close_trade_event(close_event)
+                self.trade_tracker.close_trade_event(close_event)
                 generate_execution_report(logger=logger, event=close_event)
 
                 logger.info(
@@ -1735,6 +1789,37 @@ class NDSBot:
                         logger.info(f"✅ گزارش تلگرام برای بسته‌شدن پوزیشن #{position_ticket} ارسال شد.")
                     except Exception as tel_err:
                         logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
+
+            for position_ticket, payload in pending_timeouts:
+                record = payload.get("record", {})
+                identity = record.get("trade_identity", {})
+                open_event = record.get("open_event", {})
+                opened_at = identity.get("opened_at")
+                close_event: ExecutionEvent = {
+                    "event_type": "CLOSE_UNKNOWN",
+                    "event_time": now,
+                    "symbol": identity.get("symbol") or SYMBOL,
+                    "order_ticket": identity.get("order_ticket"),
+                    "position_ticket": position_ticket,
+                    "side": open_event.get("side"),
+                    "volume": open_event.get("volume"),
+                    "entry_price": open_event.get("entry_price"),
+                    "exit_price": None,
+                    "sl": open_event.get("sl"),
+                    "tp": open_event.get("tp"),
+                    "profit": None,
+                    "pips": None,
+                    "reason": "history_timeout",
+                    "metadata": {"duration_sec": (now - opened_at).total_seconds() if opened_at else None},
+                }
+                self.trade_tracker.finalize_unknown_close(position_ticket, close_event)
+                generate_execution_report(logger=logger, event=close_event)
+                logger.warning(
+                    "[CLOSE_UNKNOWN] ticket=%s symbol=%s timeout=%.1fs",
+                    position_ticket,
+                    identity.get("symbol"),
+                    timeout_sec,
+                )
 
         except Exception as e:
             logger.error(f"⚠️ خطا در فرآیند مانیتورینگ معاملات: {e}", exc_info=True)
