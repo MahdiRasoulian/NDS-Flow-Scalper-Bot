@@ -9,13 +9,31 @@ from typing import Any, Dict, Optional, Tuple
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-env_path = BASE_DIR / '.env'
-load_dotenv(dotenv_path=env_path)
+# ---------------------------------------------------------------------------
+# Robust .env Loading Logic
+# ---------------------------------------------------------------------------
+# 1. تلاش برای پیدا کردن فایل .env به صورت هوشمند (در پوشه جاری یا پوشه‌های بالاتر)
+ENV_PATH = find_dotenv(filename=".env", usecwd=True)
+
+if ENV_PATH:
+    load_dotenv(dotenv_path=ENV_PATH, override=True)
+    logger.info(f"[ENV] .env file found and loaded from: {ENV_PATH}")
+else:
+    # 2. روش جایگزین (Fallback): تلاش دستی در مسیر والد پروژه
+    try:
+        BASE_DIR = Path(__file__).resolve().parent.parent
+        manual_env_path = BASE_DIR / '.env'
+        if manual_env_path.exists():
+            load_dotenv(dotenv_path=manual_env_path)
+            logger.info(f"[ENV] .env loaded manually from fallback path: {manual_env_path}")
+        else:
+            logger.warning("[ENV] .env file NOT found by find_dotenv OR fallback path.")
+    except Exception as e:
+        logger.warning(f"[ENV] Error in fallback loading: {e}")
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -63,8 +81,12 @@ class TelegramNotifier:
         retry_backoff_sec: float = 1.25,
     ):
         # Credentials: prefer env; DO NOT hardcode secrets in code.
-        self.token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+        # IMPROVEMENT: Strip whitespace and quotes to prevent .env parsing errors
+        raw_token = token or os.getenv("TELEGRAM_BOT_TOKEN")
+        raw_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+
+        self.token = str(raw_token).strip().replace('"', '').replace("'", "") if raw_token else None
+        self.chat_id = str(raw_chat_id).strip().replace('"', '').replace("'", "") if raw_chat_id else None
 
         self.timeout_sec = float(timeout_sec)
         self.max_retries = int(max_retries)
@@ -73,11 +95,12 @@ class TelegramNotifier:
         self.enabled = bool(self.token and self.chat_id)
         if not self.enabled:
             logger.warning(
-                "TelegramNotifier disabled: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set."
+                "TelegramNotifier disabled: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set properly."
             )
             self.api_url = None
         else:
             self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            logger.info(f"TelegramNotifier initialized. ChatID ends with: ...{str(self.chat_id)[-4:] if self.chat_id else 'None'}")
 
         # HTTP session for lower overhead
         self._http = requests.Session()
@@ -87,7 +110,10 @@ class TelegramNotifier:
 
         self._stop_event = threading.Event()
         self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
-        self.worker_thread.start()
+        
+        # Only start worker if enabled
+        if self.enabled:
+            self.worker_thread.start()
 
     # -----------------------------
     # Worker / transport layer
@@ -95,12 +121,16 @@ class TelegramNotifier:
     def _process_queue(self):
         while not self._stop_event.is_set():
             try:
-                message = self.msg_queue.get()
+                # Wait for a message
+                message = self.msg_queue.get(timeout=1.0)
                 if message is None:
                     self.msg_queue.task_done()
                     break
+                
                 self._send_request(message)
                 self.msg_queue.task_done()
+            except queue.Empty:
+                continue
             except Exception as e:
                 # Never allow worker to die
                 logger.error(f"TelegramNotifier worker error: {e}")
@@ -136,16 +166,23 @@ class TelegramNotifier:
 
     def close(self, drain: bool = False):
         """Optional: stop worker. drain=True waits until queue is empty."""
+        if not self.enabled:
+            return
+            
         try:
             if drain:
                 self.msg_queue.join()
         except Exception:
             pass
+            
         self._stop_event.set()
         try:
             self.msg_queue.put_nowait(None)
         except Exception:
             pass
+        
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=2.0)
 
     def _enqueue(self, message: str):
         """Non-blocking enqueue; drop safely if overloaded."""
