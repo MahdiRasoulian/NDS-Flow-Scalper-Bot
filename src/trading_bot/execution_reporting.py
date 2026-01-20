@@ -165,6 +165,9 @@ def generate_execution_report(
                 from src.reporting.report_generator import ReportGenerator
                 if df is not None:
                     report_gen = ReportGenerator(output_dir="trade_reports/scalping_reports")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    symbol = event.get("symbol") or "symbol"
+                    ticket = event.get("position_ticket") or event.get("order_ticket") or "unknown"
                     report_result = report_gen.generate_full_report(
                         df=df,
                         signal_data=event.get("metadata", {}).get("analysis_snapshot", {}),
@@ -174,10 +177,13 @@ def generate_execution_report(
                             "confidence": event.get("metadata", {}).get("confidence", 0),
                             "entry_planned": legacy_report.get("entry_price_planned"),
                             "entry_actual": legacy_report.get("entry_price_actual"),
+                            "entry": legacy_report.get("entry_price_actual"),
                             "sl_planned": legacy_report.get("stop_loss_planned"),
                             "sl_actual": legacy_report.get("stop_loss_actual"),
+                            "sl": legacy_report.get("stop_loss_actual"),
                             "tp_planned": legacy_report.get("take_profit_planned"),
                             "tp_actual": legacy_report.get("take_profit_actual"),
+                            "tp": legacy_report.get("take_profit_actual"),
                             "rr_ratio": event.get("metadata", {}).get("rr_ratio"),
                             "symbol": event.get("symbol"),
                             "timeframe": event.get("metadata", {}).get("timeframe"),
@@ -198,10 +204,27 @@ def generate_execution_report(
                             "tp2_pips": legacy_report.get("tp2_pips"),
                             "spread_pips": legacy_report.get("spread_pips"),
                         },
+                        base_filename=f"{symbol}_OPEN_{ticket}_{timestamp}",
                     )
 
                     if report_result.get("success"):
                         logger.info("📊 گزارش کامل معامله اسکلپینگ Real-Time ذخیره شد")
+            except ImportError:
+                logger.debug("ماژول گزارش‌گیری یافت نشد، فقط JSON ذخیره شد.")
+
+        if event.get("event_type") in ("CLOSE", "CLOSE_UNKNOWN"):
+            try:
+                from src.reporting.report_generator import ReportGenerator
+
+                report_gen = ReportGenerator(output_dir="trade_reports/scalping_reports")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                symbol = event.get("symbol") or "symbol"
+                ticket = event.get("position_ticket") or event.get("order_ticket") or "unknown"
+                report_gen.generate_close_report(
+                    event=event,
+                    base_filename=f"{symbol}_CLOSE_{ticket}_{timestamp}",
+                )
+                report_gen.update_daily_summary(event)
             except ImportError:
                 logger.debug("ماژول گزارش‌گیری یافت نشد، فقط JSON ذخیره شد.")
 

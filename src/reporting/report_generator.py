@@ -4,14 +4,8 @@
 نسخه: 2.0
 """
 
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
 import logging
 from datetime import datetime, timedelta
-import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle, Patch
-from matplotlib.lines import Line2D
 import os
 from pathlib import Path
 import json
@@ -21,13 +15,36 @@ from dataclasses import dataclass, asdict
 
 warnings.filterwarnings('ignore')
 
-# تنظیمات ظاهری نمودار برای نمایش حرفه‌ای‌تر
-plt.style.use('seaborn-v0_8-darkgrid')
-plt.rcParams['figure.figsize'] = [20, 12]
-plt.rcParams['figure.dpi'] = 120
-plt.rcParams['font.size'] = 11
-plt.rcParams['axes.grid'] = True
-plt.rcParams['grid.alpha'] = 0.3
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.patches import Rectangle, Patch
+    from matplotlib.lines import Line2D
+except ImportError:  # pragma: no cover - optional dependency for headless envs
+    plt = None
+    mdates = None
+    Rectangle = None
+    Patch = None
+    Line2D = None
+
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional dependency for headless envs
+    pd = None
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency for headless envs
+    np = None
+
+if plt:
+    # تنظیمات ظاهری نمودار برای نمایش حرفه‌ای‌تر
+    plt.style.use('seaborn-v0_8-darkgrid')
+    plt.rcParams['figure.figsize'] = [20, 12]
+    plt.rcParams['figure.dpi'] = 120
+    plt.rcParams['font.size'] = 11
+    plt.rcParams['axes.grid'] = True
+    plt.rcParams['grid.alpha'] = 0.3
 
 @dataclass
 class TradeMetrics:
@@ -110,6 +127,80 @@ class ReportGenerator:
         if abs(value) >= 1000:
             return f"${value:,.0f}"
         return f"${value:.2f}"
+
+    def _sanitize_filename(self, name: str) -> str:
+        """پاکسازی نام فایل برای جلوگیری از کاراکترهای نامعتبر در ویندوز."""
+        if not name:
+            return "report"
+        invalid = '<>:"/\\|?*'
+        sanitized = "".join("_" if ch in invalid else ch for ch in name)
+        sanitized = sanitized.replace(" ", "_")
+        return sanitized.strip("_") or "report"
+
+    def _coerce_float(self, value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def _format_optional_value(
+        self,
+        value: Optional[float],
+        fmt: str = "{:.2f}",
+        allow_zero: bool = False,
+    ) -> str:
+        if value is None:
+            return "N/A"
+        if value == 0 and not allow_zero:
+            return "N/A"
+        return fmt.format(value)
+
+    def _resolve_atr(self, signal_data: Dict, df: Optional[pd.DataFrame]) -> Tuple[Optional[float], Optional[float]]:
+        atr = self._coerce_float(signal_data.get('atr'))
+        daily_atr = self._coerce_float(signal_data.get('daily_atr'))
+
+        if pd is None:
+            if atr is None or atr == 0:
+                self._logger.warning("⚠️ ATR not available; pandas missing for fallback.")
+            if daily_atr is None or daily_atr == 0:
+                self._logger.warning("⚠️ Daily ATR not available; pandas missing for fallback.")
+            return atr, daily_atr
+
+        if (atr is None or atr == 0) and df is not None and not df.empty:
+            try:
+                high = df['high'].astype(float)
+                low = df['low'].astype(float)
+                close = df['close'].astype(float)
+                prev_close = close.shift(1)
+                tr = pd.concat(
+                    [
+                        (high - low).abs(),
+                        (high - prev_close).abs(),
+                        (low - prev_close).abs(),
+                    ],
+                    axis=1,
+                ).max(axis=1)
+                atr_series = tr.rolling(window=14, min_periods=14).mean()
+                atr = float(atr_series.iloc[-1]) if not atr_series.empty else None
+            except Exception as exc:
+                self._logger.warning(f"⚠️ ATR fallback failed: {exc}")
+
+        if atr is None or atr == 0:
+            self._logger.warning("⚠️ ATR not available; using N/A in reports.")
+
+        if daily_atr is None or daily_atr == 0:
+            self._logger.warning("⚠️ Daily ATR not available; using N/A in reports.")
+
+        return atr, daily_atr
+
+    def _resolve_order_value(self, order_details: Dict, keys: Tuple[str, ...]) -> Optional[float]:
+        for key in keys:
+            value = self._coerce_float(order_details.get(key))
+            if value is not None and value != 0:
+                return value
+        return None
     
     def _calculate_metrics(self, trades_data: List[Dict]) -> TradeMetrics:
         """محاسبه متریک‌های معاملاتی از داده‌های معاملات"""
@@ -203,6 +294,10 @@ class ReportGenerator:
             str: مسیر فایل ذخیره شده
         """
         try:
+            if pd is None:
+                self._logger.warning("⚠️ pandas not available; skipping Excel report generation.")
+                return ""
+
             if filename is None:
                 timestamp = self._get_timestamp()
                 symbol = signal_data.get('symbol', 'XAUUSD')
@@ -222,6 +317,11 @@ class ReportGenerator:
                 df_raw.to_excel(writer, sheet_name='Raw_Data', index=False)
                 
                 # ===== 2. خلاصه اجرا =====
+                atr_value, daily_atr_value = self._resolve_atr(signal_data, df)
+                atr_ratio = None
+                if atr_value and daily_atr_value:
+                    atr_ratio = atr_value / daily_atr_value
+
                 summary_data = {
                     'گزارش تولید شده در': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'نماد': signal_data.get('symbol', 'XAUUSD'),
@@ -232,20 +332,23 @@ class ReportGenerator:
                     'وضعیت بازار': signal_data.get('market_state', 'NORMAL_MARKET'),
                     'منطقه PD': signal_data.get('pd_zone', 'N/A'),
                     'روند': signal_data.get('structure', {}).get('trend', 'N/A'),
-                    'ATR فعلی': self._format_currency(signal_data.get('atr', 0)),
-                    'ATR روزانه': self._format_currency(signal_data.get('daily_atr', 0)),
-                    'نسبت ATR': f"{(signal_data.get('atr', 0) / signal_data.get('daily_atr', 1) if signal_data.get('daily_atr', 0) > 0 else 0):.2f}",
+                    'ATR فعلی': self._format_optional_value(atr_value),
+                    'ATR روزانه': self._format_optional_value(daily_atr_value),
+                    'نسبت ATR': f"{atr_ratio:.2f}" if atr_ratio else "N/A",
                 }
                 
                 # اضافه کردن اطلاعات معامله اگر موجود باشد
                 if order_details:
+                    entry_actual = self._resolve_order_value(order_details, ("entry_actual", "entry", "entry_price"))
+                    sl_actual = self._resolve_order_value(order_details, ("sl_actual", "sl"))
+                    tp_actual = self._resolve_order_value(order_details, ("tp_actual", "tp"))
                     summary_data.update({
-                        'ورود پیشنهادی': self._format_currency(order_details.get('entry', 0)),
-                        'حد ضرر': self._format_currency(order_details.get('sl', 0)),
-                        'حد سود': self._format_currency(order_details.get('tp', 0)),
-                        'فاصله SL': self._format_currency(order_details.get('sl_distance', 0)),
-                        'نسبت R:R': f"{order_details.get('rr_ratio', 0):.2f}",
-                        'حجم معامله': f"{order_details.get('lot', 0):.3f} لات",
+                        'ورود پیشنهادی': self._format_optional_value(entry_actual),
+                        'حد ضرر': self._format_optional_value(sl_actual),
+                        'حد سود': self._format_optional_value(tp_actual),
+                        'فاصله SL': self._format_optional_value(self._coerce_float(order_details.get('sl_distance'))),
+                        'نسبت R:R': f"{float(order_details.get('rr_ratio', 0) or 0):.2f}",
+                        'حجم معامله': f"{float(order_details.get('lot', 0) or 0):.3f} لات",
                         'مقدار ریسک': self._format_currency(order_details.get('lot_calculation', {}).get('actual_risk_amount', 0)),
                         'درصد ریسک': f"{order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):.2f}%",
                     })
@@ -475,6 +578,10 @@ class ReportGenerator:
             str: مسیر فایل ذخیره شده
         """
         try:
+            if plt is None or pd is None or mdates is None:
+                self._logger.warning("⚠️ matplotlib/pandas not available; skipping chart generation.")
+                return ""
+
             if filename is None:
                 timestamp = self._get_timestamp()
                 symbol = signal_data.get('symbol', 'XAUUSD')
@@ -644,30 +751,32 @@ class ReportGenerator:
             
             if order_details:
                 # خطوط ورود، استاپ و تارگت
-                entry_price = order_details.get('entry', 0)
-                sl_price = order_details.get('sl', 0)
-                tp_price = order_details.get('tp', 0)
-                
-                ax_price.axhline(y=entry_price, color='green', 
-                               alpha=0.7, linestyle='-', linewidth=2, label='Entry')
-                ax_price.axhline(y=sl_price, color='red', 
-                               alpha=0.7, linestyle='-', linewidth=2, label='Stop Loss')
-                ax_price.axhline(y=tp_price, color='blue', 
-                               alpha=0.7, linestyle='--', linewidth=2, label='Take Profit')
-                
-                # علامت‌گذاری نقاط
-                ax_price.scatter([df['time_dt'].iloc[-1]], [entry_price], 
-                               color='green', marker='o', s=100, zorder=7, edgecolors='black')
-                ax_price.scatter([df['time_dt'].iloc[-1]], [tp_price], 
-                               color='blue', marker='*', s=150, zorder=7, edgecolors='black')
-                
-                # پر کردن منطقه ریسک/پاداش
-                ax_price.fill_between([df['time_dt'].min(), df['time_dt'].max()], 
-                                     sl_price, entry_price, 
-                                     color='red', alpha=0.1, label='Risk Zone')
-                ax_price.fill_between([df['time_dt'].min(), df['time_dt'].max()], 
-                                     entry_price, tp_price, 
-                                     color='green', alpha=0.1, label='Reward Zone')
+                entry_price = self._resolve_order_value(order_details, ("entry_actual", "entry", "entry_price"))
+                sl_price = self._resolve_order_value(order_details, ("sl_actual", "sl"))
+                tp_price = self._resolve_order_value(order_details, ("tp_actual", "tp"))
+
+                if entry_price:
+                    ax_price.axhline(y=entry_price, color='green',
+                                   alpha=0.7, linestyle='-', linewidth=2, label='Entry')
+                    ax_price.scatter([df['time_dt'].iloc[-1]], [entry_price],
+                                   color='green', marker='o', s=100, zorder=7, edgecolors='black')
+                if sl_price:
+                    ax_price.axhline(y=sl_price, color='red',
+                                   alpha=0.7, linestyle='-', linewidth=2, label='Stop Loss')
+                if tp_price:
+                    ax_price.axhline(y=tp_price, color='blue',
+                                   alpha=0.7, linestyle='--', linewidth=2, label='Take Profit')
+                    ax_price.scatter([df['time_dt'].iloc[-1]], [tp_price],
+                                   color='blue', marker='*', s=150, zorder=7, edgecolors='black')
+
+                if entry_price and sl_price:
+                    ax_price.fill_between([df['time_dt'].min(), df['time_dt'].max()],
+                                         sl_price, entry_price,
+                                         color='red', alpha=0.1, label='Risk Zone')
+                if entry_price and tp_price:
+                    ax_price.fill_between([df['time_dt'].min(), df['time_dt'].max()],
+                                         entry_price, tp_price,
+                                         color='green', alpha=0.1, label='Reward Zone')
             
             # تنظیمات نمودار اصلی
             symbol = signal_data.get('symbol', 'XAUUSD')
@@ -749,6 +858,8 @@ class ReportGenerator:
     
     def _create_info_box_text(self, signal_data, order_details, df):
         """ایجاد متن جعبه اطلاعات"""
+        atr_value, daily_atr_value = self._resolve_atr(signal_data, df)
+        atr_ratio = (atr_value / daily_atr_value) if atr_value and daily_atr_value else None
         info_text = f"""
 Signal: {signal_data.get('signal', 'NEUTRAL')}
 Confidence: {signal_data.get('confidence', 0)}%
@@ -761,25 +872,28 @@ Market Structure:
   PD Zone: {signal_data.get('pd_zone', 'N/A')}
 
 Volatility:
-  Current ATR: ${signal_data.get('atr', 0):.2f}
-  Daily ATR: ${signal_data.get('daily_atr', 0):.2f}
-  Ratio: {(signal_data.get('atr', 0) / signal_data.get('daily_atr', 1) if signal_data.get('daily_atr', 0) > 0 else 0):.2f}
+  Current ATR: {self._format_optional_value(atr_value)}
+  Daily ATR: {self._format_optional_value(daily_atr_value)}
+  Ratio: {self._format_optional_value(atr_ratio)}
 
 Price Analysis:
-  Current: ${df['close'].iloc[-1] if len(df) > 0 else 0:.2f}
-  Daily High: ${df['high'].max() if len(df) > 0 else 0:.2f}
-  Daily Low: ${df['low'].min() if len(df) > 0 else 0:.2f}
-  Range: ${(df['high'].max() - df['low'].min()) if len(df) > 0 else 0:.2f}
+  Current: ${df['close'].iloc[-1] if df is not None and len(df) > 0 else 0:.2f}
+  Daily High: ${df['high'].max() if df is not None and len(df) > 0 else 0:.2f}
+  Daily Low: ${df['low'].min() if df is not None and len(df) > 0 else 0:.2f}
+  Range: ${(df['high'].max() - df['low'].min()) if df is not None and len(df) > 0 else 0:.2f}
         """
         
         if order_details:
+            entry_actual = self._resolve_order_value(order_details, ("entry_actual", "entry", "entry_price"))
+            sl_actual = self._resolve_order_value(order_details, ("sl_actual", "sl"))
+            tp_actual = self._resolve_order_value(order_details, ("tp_actual", "tp"))
             info_text += f"""
 --- ORDER DETAILS ---
 Side: {order_details.get('side', 'N/A')}
-Entry: ${order_details.get('entry', 0):.2f}
-SL: ${order_details.get('sl', 0):.2f}
-TP: ${order_details.get('tp', 0):.2f}
-SL Distance: ${order_details.get('sl_distance', 0):.2f}
+Entry: {self._format_optional_value(entry_actual)}
+SL: {self._format_optional_value(sl_actual)}
+TP: {self._format_optional_value(tp_actual)}
+SL Distance: {self._format_optional_value(self._coerce_float(order_details.get('sl_distance')))}
 R:R Ratio: {order_details.get('rr_ratio', 0):.2f}
 Lot Size: {order_details.get('lot', 0):.3f}
 Risk Amount: ${order_details.get('lot_calculation', {}).get('actual_risk_amount', 0):.2f}
@@ -794,7 +908,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
     def generate_trade_summary(self, 
                                 signal_data: Dict, 
                                 order_details: Optional[Dict] = None,
-                                filename: Optional[str] = None) -> str:
+                                filename: Optional[str] = None,
+                                df: Optional[pd.DataFrame] = None) -> str:
             """
             ایجاد خلاصه متنی از معامله با پشتیبانی از فرمت‌های مختلف داده
             """
@@ -802,7 +917,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 if filename is None:
                     timestamp = self._get_timestamp()
                     symbol = signal_data.get('symbol', 'XAUUSD')
-                    filename = self.output_dir / 'summaries' / f"{symbol}_summary_{timestamp}.txt"
+                    safe_symbol = self._sanitize_filename(symbol)
+                    filename = self.output_dir / 'summaries' / f"{safe_symbol}_summary_{timestamp}.txt"
                 else:
                     filename = Path(filename)
                 
@@ -846,11 +962,10 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 
                 # اطلاعات نوسان
                 summary.append("VOLATILITY ANALYSIS:")
-                atr = float(signal_data.get('atr', 0))
-                daily_atr = float(signal_data.get('daily_atr', 0))
-                summary.append(f"  Current ATR: ${atr:.2f}")
-                summary.append(f"  Daily ATR: ${daily_atr:.2f}")
-                if daily_atr > 0:
+                atr, daily_atr = self._resolve_atr(signal_data, df)
+                summary.append(f"  Current ATR: {self._format_optional_value(atr)}")
+                summary.append(f"  Daily ATR: {self._format_optional_value(daily_atr)}")
+                if atr and daily_atr:
                     summary.append(f"  ATR Ratio: {(atr / daily_atr):.2f}")
                 summary.append(f"  Volatility State: {signal_data.get('volatility_state', 'NORMAL')}")
                 summary.append("")
@@ -872,14 +987,17 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 
                 # اطلاعات معامله
                 if order_details:
+                    entry_actual = self._resolve_order_value(order_details, ("entry_actual", "entry", "entry_price"))
+                    sl_actual = self._resolve_order_value(order_details, ("sl_actual", "sl"))
+                    tp_actual = self._resolve_order_value(order_details, ("tp_actual", "tp"))
                     summary.append("TRADE EXECUTION DETAILS:")
                     summary.append(f"  Side: {order_details.get('side', 'N/A')}")
-                    summary.append(f"  Entry: ${float(order_details.get('entry', 0)):.2f}")
-                    summary.append(f"  Stop Loss: ${float(order_details.get('sl', 0)):.2f}")
-                    summary.append(f"  Take Profit: ${float(order_details.get('tp', 0)):.2f}")
-                    summary.append(f"  SL Distance: ${float(order_details.get('sl_distance', 0)):.2f}")
-                    summary.append(f"  Risk/Reward: {float(order_details.get('rr_ratio', 0)):.2f}")
-                    summary.append(f"  Lot Size: {float(order_details.get('lot', 0)):.3f}")
+                    summary.append(f"  Entry: {self._format_optional_value(entry_actual)}")
+                    summary.append(f"  Stop Loss: {self._format_optional_value(sl_actual)}")
+                    summary.append(f"  Take Profit: {self._format_optional_value(tp_actual)}")
+                    summary.append(f"  SL Distance: {self._format_optional_value(self._coerce_float(order_details.get('sl_distance')))}")
+                    summary.append(f"  Risk/Reward: {float(order_details.get('rr_ratio', 0) or 0):.2f}")
+                    summary.append(f"  Lot Size: {float(order_details.get('lot', 0) or 0):.3f}")
                     
                     lot_calc = order_details.get('lot_calculation', {})
                     if lot_calc:
@@ -934,6 +1052,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 timestamp = self._get_timestamp()
                 symbol = signal_data.get('symbol', 'XAUUSD')
                 base_filename = f"{symbol}_report_{timestamp}"
+
+            base_filename = self._sanitize_filename(base_filename)
             
             # تولید گزارش‌ها
             results = {}
@@ -956,7 +1076,7 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
             # 3. خلاصه متنی
             summary_file = self.output_dir / 'summaries' / f"{base_filename}.txt"
             results['summary'] = self.generate_trade_summary(
-                signal_data, order_details, str(summary_file)
+                signal_data, order_details, str(summary_file), df=df
             )
             file_paths['summary'] = results['summary']
             
@@ -992,6 +1112,90 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
         except Exception as e:
             self._logger.error(f"❌ Error generating full report: {e}", exc_info=True)
             raise
+
+    def generate_close_report(self, event: Dict, base_filename: Optional[str] = None) -> str:
+        """ایجاد گزارش متنی برای بسته شدن معامله."""
+        try:
+            timestamp = self._get_timestamp()
+            symbol = event.get("symbol", "XAUUSD")
+            ticket = event.get("position_ticket") or event.get("order_ticket") or "unknown"
+            if base_filename is None:
+                base_filename = f"{symbol}_close_{ticket}_{timestamp}"
+            base_filename = self._sanitize_filename(base_filename)
+            filename = self.output_dir / 'summaries' / f"{base_filename}.txt"
+            filename.parent.mkdir(parents=True, exist_ok=True)
+
+            duration_sec = event.get("metadata", {}).get("duration_sec")
+            duration_str = f"{float(duration_sec):.0f}s" if duration_sec else "N/A"
+            profit = self._coerce_float(event.get("profit"))
+            close_price = self._coerce_float(event.get("exit_price"))
+            entry_price = self._coerce_float(event.get("entry_price"))
+            sl_price = self._coerce_float(event.get("sl"))
+            tp_price = self._coerce_float(event.get("tp"))
+
+            summary = [
+                "=" * 70,
+                " " * 20 + "NDS TRADING BOT - TRADE CLOSE SUMMARY",
+                "=" * 70,
+                f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Symbol: {symbol}",
+                f"Ticket: {ticket}",
+                f"Side: {event.get('side', 'N/A')}",
+                f"Close Reason: {event.get('reason', 'N/A')}",
+                f"Duration: {duration_str}",
+                "",
+                "EXECUTION DETAILS:",
+                f"  Entry: {self._format_optional_value(entry_price)}",
+                f"  Close: {self._format_optional_value(close_price)}",
+                f"  Stop Loss: {self._format_optional_value(sl_price)}",
+                f"  Take Profit: {self._format_optional_value(tp_price)}",
+                f"  Volume: {float(event.get('volume', 0) or 0):.3f}",
+                f"  PnL: {self._format_optional_value(profit, allow_zero=True)}",
+                "=" * 70,
+            ]
+
+            filename.write_text("\n".join(summary), encoding="utf-8")
+            self._logger.info(f"✅ Close summary saved to {filename}")
+            return str(filename)
+        except Exception as e:
+            self._logger.error(f"❌ Error generating close summary: {e}", exc_info=True)
+            return ""
+
+    def update_daily_summary(self, event: Dict) -> str:
+        """به‌روزرسانی گزارش روزانه بر اساس معاملات بسته‌شده."""
+        if event.get("event_type") not in ("CLOSE", "CLOSE_UNKNOWN"):
+            return ""
+
+        report_date = (event.get("event_time") or datetime.now()).strftime("%Y-%m-%d")
+        daily_file = self.output_dir / 'daily' / f"daily_{report_date}.json"
+        daily_file.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {"date": report_date, "trades": []}
+        if daily_file.exists():
+            try:
+                payload = json.loads(daily_file.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {"date": report_date, "trades": []}
+
+        trade_entry = {
+            "symbol": event.get("symbol"),
+            "ticket": event.get("position_ticket") or event.get("order_ticket"),
+            "side": event.get("side"),
+            "profit": self._coerce_float(event.get("profit")),
+            "entry_price": self._coerce_float(event.get("entry_price")),
+            "exit_price": self._coerce_float(event.get("exit_price")),
+            "reason": event.get("reason"),
+            "close_time": event.get("event_time").isoformat() if event.get("event_time") else None,
+            "status": event.get("event_type"),
+        }
+
+        payload.setdefault("trades", []).append(trade_entry)
+        metrics = self._calculate_metrics([t for t in payload["trades"] if t.get("profit") is not None])
+        payload["metrics"] = asdict(metrics)
+
+        daily_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._logger.info(f"✅ Daily summary updated at {daily_file}")
+        return str(daily_file)
     
     def generate_performance_report(self, 
                                     trades_data: List[Dict],
