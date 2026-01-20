@@ -744,7 +744,7 @@ class MT5Client:
                 'bid': tick.bid,
                 'ask': tick.ask,
                 'last': valid_last,
-                'time': datetime.fromtimestamp(tick.time),
+                'time': datetime.utcfromtimestamp(tick.time),
                 'volume': tick.volume,
                 'spread': tick.ask - tick.bid,
                 'spread_price': tick.ask - tick.bid,
@@ -1105,7 +1105,7 @@ class MT5Client:
 
         def _pos_time(pos_obj: Any) -> datetime:
             try:
-                return datetime.fromtimestamp(pos_obj.time)
+                return datetime.utcfromtimestamp(pos_obj.time)
             except Exception:
                 return datetime.min
 
@@ -1180,7 +1180,7 @@ class MT5Client:
                 entry_flag = getattr(deal, "entry", None)
                 if entry_flag in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
                     exit_price = float(getattr(deal, "price", 0.0) or 0.0)
-                    close_time = datetime.fromtimestamp(getattr(deal, "time", 0))
+                    close_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
                     volume_closed += float(getattr(deal, "volume", 0.0) or 0.0)
 
                 comment = (getattr(deal, "comment", "") or "").lower()
@@ -1227,7 +1227,7 @@ class MT5Client:
                 if side.upper() == "SELL" and deal_type not in (getattr(mt5, "DEAL_TYPE_SELL", None),):
                     continue
             if open_time:
-                deal_time = datetime.fromtimestamp(getattr(deal, "time", 0))
+                deal_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
                 if deal_time < open_time - timedelta(minutes=5):
                     continue
             entry_flag = getattr(deal, "entry", None)
@@ -1596,8 +1596,8 @@ class MT5Client:
                     'profit': pos.profit,
                     'magic': pos.magic,
                     'comment': pos.comment,
-                    'time': datetime.fromtimestamp(pos.time),
-                    'time_update': datetime.fromtimestamp(pos.time_update),
+                    'time': datetime.utcfromtimestamp(pos.time),
+                    'time_update': datetime.utcfromtimestamp(pos.time_update),
                 }
                 result.append(normalize_position(raw_info))
             
@@ -1644,8 +1644,8 @@ class MT5Client:
                     'tp': order.tp,
                     'magic': order.magic,
                     'comment': order.comment,
-                    'time_setup': datetime.fromtimestamp(order.time_setup),
-                    'time_expiration': datetime.fromtimestamp(order.time_expiration) if order.time_expiration > 0 else None,
+                    'time_setup': datetime.utcfromtimestamp(order.time_setup),
+                    'time_expiration': datetime.utcfromtimestamp(order.time_expiration) if order.time_expiration > 0 else None,
                     'state': order.state,
                 }
                 result.append(order_info)
@@ -1966,7 +1966,7 @@ class MT5Client:
                     'commission': deal.commission,
                     'swap': deal.swap,
                     'fee': deal.fee,
-                    'time': datetime.fromtimestamp(deal.time),
+                    'time': datetime.utcfromtimestamp(deal.time),
                     'magic': deal.magic,
                     'comment': deal.comment,
                 }

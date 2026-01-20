@@ -69,9 +69,9 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
         return value
     try:
         if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(value)
+            return datetime.utcfromtimestamp(value)
         if hasattr(value, "timestamp"):
-            return datetime.fromtimestamp(value.timestamp())
+            return datetime.utcfromtimestamp(value.timestamp())
     except Exception:
         return None
     return None

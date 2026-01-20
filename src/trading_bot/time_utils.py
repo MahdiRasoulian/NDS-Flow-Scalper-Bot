@@ -32,7 +32,7 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
             pass
     if isinstance(value, (int, float)):
         try:
-            return datetime.fromtimestamp(value)
+            return datetime.utcfromtimestamp(value)
         except (OSError, ValueError):
             return None
     if isinstance(value, str):

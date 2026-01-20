@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from src.trading_bot.contracts import ExecutionEvent, PositionContract, TradeIdentity
+
+logger = logging.getLogger(__name__)
 
 
 class TradeTracker:
@@ -27,6 +30,30 @@ class TradeTracker:
     def active_trades_view(self) -> Dict[int, Dict]:
         return self.active_trades
 
+    def normalize_trade_record(self, record: Optional[Dict]) -> Dict:
+        """Normalize trade record schema (defensive against None/missing fields)."""
+        if not isinstance(record, dict):
+            return {}
+
+        record.setdefault("trade_identity", {})
+        record.setdefault("open_event", {})
+        record.setdefault("last_update_event", record.get("open_event") or {})
+        record.setdefault("status", record.get("status") or "OPEN")
+
+        close_event = record.get("close_event")
+        if close_event is None or not isinstance(close_event, dict):
+            if close_event is not None:
+                logger.warning("⚠️ Normalizing non-dict close_event to empty dict.")
+            record["close_event"] = {}
+
+        return record
+
+    def normalize_trade_records(self, records: Optional[List[Dict]]) -> List[Dict]:
+        """Normalize list of trade records loaded from disk/DB."""
+        if not records:
+            return []
+        return [self.normalize_trade_record(record) for record in records if isinstance(record, dict)]
+
     def add_trade_open(self, event: ExecutionEvent) -> None:
         """ثبت معامله جدید با رویداد OPEN"""
         identity = TradeIdentity(
@@ -43,7 +70,7 @@ class TradeTracker:
             "trade_identity": identity,
             "open_event": event,
             "last_update_event": event,
-            "close_event": None,
+            "close_event": {},
             "status": "OPEN",
         }
 
@@ -109,6 +136,9 @@ class TradeTracker:
 
     def register_pending_close(self, position_ticket: int, record: Dict, detected_time: datetime) -> bool:
         """ثبت معامله بسته‌شده در صف pending برای تایید تاریخچه."""
+        record = self.normalize_trade_record(record)
+        if not record:
+            return False
         if position_ticket in self.pending_closes:
             return False
 
