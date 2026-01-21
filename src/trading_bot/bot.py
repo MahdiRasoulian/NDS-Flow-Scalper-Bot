@@ -13,9 +13,10 @@ import sys
 import time
 import atexit
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
+
 
 # پیدا کردن مسیر اصلی پروژه (nds_bot)
 current_file = Path(__file__).resolve()
