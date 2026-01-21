@@ -355,3 +355,32 @@ class TelegramNotifier:
         )
 
         self._enqueue(message)
+
+    def send_trade_partial_close_notification(
+        self,
+        symbol: str,
+        signal_type: str,
+        profit_usd: float,
+        pips: Optional[float],
+        reason: str,
+        volume: float,
+    ):
+        trend_emoji = "💰" if profit_usd > 0 else "📉"
+        profit_txt = f"${profit_usd:,.2f}" if profit_usd is not None else "N/A"
+        pips_txt = f"{pips:,.1f} Pips" if pips is not None else "N/A"
+        signal_type = (signal_type or "").upper().strip()
+
+        message = (
+            f"{trend_emoji} <b>بخشی از معامله {symbol} بسته شد</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👤 <b>نوع معامله:</b> {signal_type}\n"
+            f"📦 <b>حجم بسته‌شده:</b> <code>{volume:,.3f}</code>\n"
+            f"💵 <b>سود/ضرر دلار:</b> <code>{profit_txt}</code>\n"
+            f"📏 <b>مقدار جابجایی:</b> <code>{pips_txt}</code>\n"
+            f"📝 <b>علت خروج:</b> {reason}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>زمان بسته شدن:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+            f"📊 <i>NDS Scalping Performance</i>"
+        )
+
+        self._enqueue(message)

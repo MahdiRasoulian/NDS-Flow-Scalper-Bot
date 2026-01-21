@@ -57,6 +57,7 @@ from src.trading_bot.nds.models import LivePriceSnapshot
 from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 from src.trading_bot.trade_tracker import TradeTracker
+from src.trading_bot.position_state import PositionStateStore
 from src.trading_bot.cooldown import (
     CooldownDecision,
     evaluate_cooldown,
@@ -128,6 +129,8 @@ class NDSBot:
         self._last_open_position_tickets: set[int] = set()
         self._latest_open_positions: List[PositionContract] = []
         self._latest_pending_orders: List[Dict[str, Any]] = []
+        self.position_state_store = PositionStateStore(Path("reports") / "state" / "positions.json")
+        self.position_state_store.load()
 
     # ----------------------------
     # Helpers
@@ -1726,7 +1729,12 @@ class NDSBot:
                 self.bot_state.active_signal_direction = None
             self._log_signal_state(bias=exposure_bias, pending_count=len(pending_orders))
 
-            added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(open_positions)
+            now = datetime.utcnow()
+            added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(
+                open_positions,
+                reconcile_time=now,
+            )
+            state_result = self.position_state_store.reconcile(open_positions, now)
 
             if added_count or updated_count:
                 logger.debug("🔄 Trade reconciliation: added=%s updated=%s", added_count, updated_count)
@@ -1739,11 +1747,65 @@ class NDSBot:
             closed_tickets = self._last_open_position_tickets - current_tickets
             self._last_open_position_tickets = current_tickets
 
-            now = datetime.now()
-            for position_ticket in sorted(set(closed_records.keys()) | closed_tickets):
+            def _record_from_state(state_record: Dict[str, Any]) -> Dict[str, Any]:
+                if not state_record:
+                    return {}
+                opened_at = state_record.get("open_time") or now
+                open_event: ExecutionEvent = {
+                    "event_type": "OPEN",
+                    "event_time": opened_at,
+                    "symbol": state_record.get("symbol"),
+                    "order_ticket": None,
+                    "position_ticket": state_record.get("position_ticket"),
+                    "side": state_record.get("side"),
+                    "volume": state_record.get("volume"),
+                    "entry_price": state_record.get("entry_price"),
+                    "exit_price": None,
+                    "sl": None,
+                    "tp": None,
+                    "profit": None,
+                    "pips": None,
+                    "reason": None,
+                    "metadata": {
+                        "magic": state_record.get("magic"),
+                        "comment": state_record.get("comment"),
+                        "detected_by": "recovery_scan",
+                    },
+                }
+                return self.trade_tracker.normalize_trade_record(
+                    {
+                        "trade_identity": {
+                            "order_ticket": None,
+                            "position_ticket": state_record.get("position_ticket"),
+                            "symbol": state_record.get("symbol"),
+                            "magic": state_record.get("magic"),
+                            "comment": state_record.get("comment"),
+                            "opened_at": opened_at,
+                            "detected_by": "recovery_scan",
+                        },
+                        "open_event": open_event,
+                        "last_update_event": open_event,
+                        "close_event": {},
+                        "status": state_record.get("status") or "OPEN",
+                    }
+                )
+
+            state_closed_map = {
+                int(record.get("position_ticket")): record
+                for record in state_result.closed_positions
+                if record.get("position_ticket")
+            }
+
+            for position_ticket in sorted(
+                set(closed_records.keys()) | closed_tickets | set(state_closed_map.keys())
+            ):
                 if not position_ticket:
                     continue
-                record = closed_records.get(position_ticket) or self.trade_tracker.active_trades.get(position_ticket)
+                record = (
+                    closed_records.get(position_ticket)
+                    or self.trade_tracker.active_trades.get(position_ticket)
+                    or _record_from_state(state_closed_map.get(position_ticket, {}))
+                )
                 if not record:
                     continue
                 record = self.trade_tracker.normalize_trade_record(record)
@@ -1779,14 +1841,17 @@ class NDSBot:
                 record = payload.get("record", {})
                 identity = record.get("trade_identity", {})
                 open_event = record.get("open_event", {})
+                opened_at = identity.get("opened_at")
                 history = self.mt5_client.get_position_history(
                     position_ticket,
                     lookback_hours=lookback_hours,
                     symbol=identity.get("symbol"),
                     magic=identity.get("magic"),
-                    open_time=identity.get("opened_at"),
+                    open_time=opened_at,
                     volume=open_event.get("volume"),
                     side=open_event.get("side"),
+                    from_time=(opened_at - timedelta(hours=1)) if opened_at else None,
+                    to_time=now,
                 )
                 if not history or not history.get("close_time"):
                     self.trade_tracker.mark_pending_attempt(position_ticket, now)
@@ -1863,6 +1928,11 @@ class NDSBot:
                     except Exception as tel_err:
                         logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
 
+                state_record = state_closed_map.get(position_ticket)
+                if state_record is not None:
+                    state_record["status"] = "CLOSED"
+                    state_record["close_time"] = close_time or now
+
             for position_ticket, payload in pending_timeouts:
                 record = payload.get("record", {})
                 identity = record.get("trade_identity", {})
@@ -1893,6 +1963,45 @@ class NDSBot:
                     identity.get("symbol"),
                     timeout_sec,
                 )
+
+            for state_record, volume_delta in state_result.partial_positions:
+                position_ticket = state_record.get("position_ticket")
+                if not position_ticket:
+                    continue
+                opened_at = state_record.get("open_time")
+                history = self.mt5_client.get_position_history(
+                    int(position_ticket),
+                    lookback_hours=lookback_hours,
+                    symbol=state_record.get("symbol"),
+                    magic=state_record.get("magic"),
+                    open_time=opened_at,
+                    volume=volume_delta,
+                    side=state_record.get("side"),
+                    from_time=state_record.get("last_reconcile"),
+                    to_time=now,
+                )
+                partial_profit = history.get("total_profit") if history else None
+                logger.info(
+                    "[PARTIAL_CLOSE] ticket=%s volume_delta=%.3f pnl=%s match=%s",
+                    position_ticket,
+                    float(volume_delta or 0.0),
+                    partial_profit,
+                    history.get("match_method") if history else None,
+                )
+                if hasattr(self, "notifier") and self.notifier is not None:
+                    try:
+                        self.notifier.send_trade_partial_close_notification(
+                            symbol=state_record.get("symbol") or SYMBOL,
+                            signal_type=state_record.get("side") or "Unknown",
+                            profit_usd=float(partial_profit or 0.0) if partial_profit is not None else 0.0,
+                            pips=None,
+                            reason="Partial Close",
+                            volume=float(volume_delta or 0.0),
+                        )
+                    except Exception as tel_err:
+                        logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
+
+            self.position_state_store.save()
 
         except Exception as e:
             logger.error(f"⚠️ خطا در فرآیند مانیتورینگ معاملات: {e}", exc_info=True)

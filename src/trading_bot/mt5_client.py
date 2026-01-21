@@ -1124,6 +1124,8 @@ class MT5Client:
         open_time: Optional[datetime] = None,
         volume: Optional[float] = None,
         side: Optional[str] = None,
+        from_time: Optional[datetime] = None,
+        to_time: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """دریافت تاریخچه معاملات برای یک position_ticket جهت تایید بسته شدن."""
         if not self.connected:
@@ -1131,9 +1133,13 @@ class MT5Client:
             return {}
 
         try:
-            now = datetime.now()
-            from_time = now - timedelta(hours=lookback_hours)
-            deals = self._mt5_call(mt5.history_deals_get, from_time, now)
+            now = to_time or datetime.utcnow()
+            history_from = from_time or (now - timedelta(hours=lookback_hours))
+            if open_time:
+                open_anchor = open_time - timedelta(hours=1)
+                if open_anchor < history_from:
+                    history_from = open_anchor
+            deals = self._mt5_call(mt5.history_deals_get, history_from, now)
             if deals is None:
                 error = self._mt5_last_error()
                 self._logger.warning(f"⚠️ Failed to get deals history: {error}")
@@ -1144,7 +1150,7 @@ class MT5Client:
                 position_ticket,
                 symbol,
                 magic,
-                from_time.isoformat(),
+                history_from.isoformat(),
                 now.isoformat(),
                 len(deals),
             )
@@ -1156,6 +1162,8 @@ class MT5Client:
                 if deal_position_id == position_ticket or deal_position == position_ticket:
                     position_deals.append(deal)
 
+            match_method = "position_id"
+
             if not position_deals:
                 position_deals = self._fallback_match_deals(
                     deals=deals,
@@ -1165,27 +1173,73 @@ class MT5Client:
                     volume=volume,
                     side=side,
                 )
+                match_method = "fallback"
 
             if not position_deals:
+                self._logger.warning(
+                    "[HISTORY_MATCH] position_ticket=%s matched=0 method=%s",
+                    position_ticket,
+                    match_method,
+                )
+                return {}
+
+            close_deals = []
+            for deal in position_deals:
+                entry_flag = getattr(deal, "entry", None)
+                if entry_flag in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
+                    close_deals.append(deal)
+
+            if not close_deals:
+                self._logger.warning(
+                    "[HISTORY_MATCH] position_ticket=%s matched=0 close_deals method=%s",
+                    position_ticket,
+                    match_method,
+                )
                 return {}
 
             total_profit = 0.0
-            exit_price = None
+            exit_price_sum = 0.0
+            exit_volume_sum = 0.0
             close_time = None
             volume_closed = 0.0
             reason = "Manual/Other"
 
-            for deal in position_deals:
-                total_profit += float(getattr(deal, "profit", 0.0) or 0.0)
-                entry_flag = getattr(deal, "entry", None)
-                if entry_flag in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
-                    exit_price = float(getattr(deal, "price", 0.0) or 0.0)
-                    close_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
-                    volume_closed += float(getattr(deal, "volume", 0.0) or 0.0)
+            for deal in close_deals:
+                profit = float(getattr(deal, "profit", 0.0) or 0.0)
+                commission = float(getattr(deal, "commission", 0.0) or 0.0)
+                swap = float(getattr(deal, "swap", 0.0) or 0.0)
+                total_profit += profit + commission + swap
+
+                price = float(getattr(deal, "price", 0.0) or 0.0)
+                volume_val = float(getattr(deal, "volume", 0.0) or 0.0)
+                if price and volume_val:
+                    exit_price_sum += price * volume_val
+                    exit_volume_sum += volume_val
+                deal_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
+                if close_time is None or deal_time > close_time:
+                    close_time = deal_time
+                volume_closed += volume_val
 
                 comment = (getattr(deal, "comment", "") or "").lower()
                 if "tp" in comment or "sl" in comment:
                     reason = "TP/SL"
+                deal_reason = getattr(deal, "reason", None)
+                if deal_reason is not None:
+                    if deal_reason == getattr(mt5, "DEAL_REASON_SL", None):
+                        reason = "SL"
+                    elif deal_reason == getattr(mt5, "DEAL_REASON_TP", None):
+                        reason = "TP"
+
+            exit_price = exit_price_sum / exit_volume_sum if exit_volume_sum else None
+
+            self._logger.info(
+                "[HISTORY_MATCH] position_ticket=%s matched=%s method=%s close_deals=%s volume_closed=%.3f",
+                position_ticket,
+                len(close_deals),
+                match_method,
+                len(close_deals),
+                volume_closed,
+            )
 
             return {
                 "position_ticket": position_ticket,
@@ -1194,6 +1248,7 @@ class MT5Client:
                 "close_time": close_time,
                 "volume_closed": volume_closed,
                 "reason": reason,
+                "match_method": match_method,
             }
 
         except Exception as e:
@@ -1476,6 +1531,7 @@ class MT5Client:
             mt5_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
             
             # 2. آماده‌سازی ریکوئست
+            request_time = datetime.utcnow()
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
@@ -1492,7 +1548,21 @@ class MT5Client:
             }
 
             self._logger.info(f"🚀 Sending MARKET {order_type} | P={price} V={volume}")
-            return self._order_send_with_retry(request, symbol, "market")
+            result = self._order_send_with_retry(request, symbol, "market")
+            if not result.get("success"):
+                return result
+
+            position_ticket = self.resolve_position_ticket(
+                symbol=symbol,
+                magic=request.get("magic"),
+                comment=request.get("comment"),
+                opened_after_time=request_time,
+                timeout_sec=5,
+            )
+            result["position_ticket"] = position_ticket
+            result["order_ticket"] = result.get("ticket") or result.get("order")
+            result["request_time"] = request_time
+            return result
 
         except Exception as e:
             self._logger.error(f"❌ Market order exception: {e}", exc_info=True)
@@ -1538,10 +1608,14 @@ class MT5Client:
                 return {
                     "success": True,
                     "ticket": result.order,
+                    "order_ticket": result.order,
+                    "deal_ticket": getattr(result, "deal", None),
                     "order": result.order, # برای سازگاری
                     "price": result.price,
                     "volume": result.volume,
-                    "comment": result.comment
+                    "comment": result.comment,
+                    "request_comment": request.get("comment"),
+                    "magic": request.get("magic"),
                 }
             elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
                 self._logger.warning(f"⚠️ Requote/PriceOff (Attempt {i+1}): {result.comment}")
