@@ -234,7 +234,7 @@ class TradeTracker:
         self, open_positions: List[PositionContract], reconcile_time: Optional[datetime] = None
     ) -> Tuple[int, int, List[Dict]]:
         """همگام‌سازی وضعیت معاملات با پوزیشن‌های باز MT5."""
-        self.last_reconcile_at = reconcile_time or datetime.now()
+        self.last_reconcile_at = reconcile_time or datetime.utcnow()
         added_count = 0
         updated_count = 0
 

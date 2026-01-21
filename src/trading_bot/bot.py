@@ -1604,13 +1604,14 @@ class NDSBot:
                     float(lot_size),
                     order_type,
                 )
+                open_time_utc = datetime.utcnow()
                 logger.info(
                     "[OPEN] order_ticket=%s position_ticket=%s symbol=%s magic=%s open_time=%s entry=%.2f sl=%.2f tp=%.2f volume=%.3f",
                     order_id,
                     position_ticket,
                     SYMBOL,
                     getattr(finalized, "magic", None),
-                    datetime.now().isoformat(),
+                    open_time_utc.isoformat(),
                     float(actual_entry_price),
                     float(actual_sl),
                     float(actual_tp),
@@ -1620,7 +1621,7 @@ class NDSBot:
 
                 open_event: ExecutionEvent = {
                     "event_type": "OPEN",
-                    "event_time": datetime.now(),
+                    "event_time": open_time_utc,
                     "symbol": SYMBOL,
                     "order_ticket": order_id,
                     "position_ticket": position_ticket,
@@ -1855,6 +1856,9 @@ class NDSBot:
                 identity = record.get("trade_identity", {})
                 open_event = record.get("open_event", {})
                 opened_at = identity.get("opened_at")
+                retries = int(payload.get("retries") or 0)
+                from_time = (opened_at - timedelta(hours=1 + retries)) if opened_at else None
+                to_time = now + timedelta(minutes=1 + retries)
                 history = self.mt5_client.get_position_history(
                     position_ticket,
                     lookback_hours=lookback_hours,
@@ -1863,8 +1867,8 @@ class NDSBot:
                     open_time=opened_at,
                     volume=open_event.get("volume"),
                     side=open_event.get("side"),
-                    from_time=(opened_at - timedelta(hours=1)) if opened_at else None,
-                    to_time=now,
+                    from_time=from_time,
+                    to_time=to_time,
                 )
                 if not history or not history.get("close_time"):
                     self.trade_tracker.mark_pending_attempt(position_ticket, now)
@@ -1901,7 +1905,7 @@ class NDSBot:
 
                 close_event: ExecutionEvent = {
                     "event_type": "CLOSE",
-                    "event_time": close_time or datetime.now(),
+                    "event_time": close_time or datetime.utcnow(),
                     "symbol": symbol,
                     "order_ticket": identity.get("order_ticket"),
                     "position_ticket": position_ticket,

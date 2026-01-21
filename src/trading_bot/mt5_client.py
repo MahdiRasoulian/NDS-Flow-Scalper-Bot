@@ -356,6 +356,32 @@ class MT5Client:
     def _mt5_last_error(self) -> Any:
         return self._mt5_call(mt5.last_error)
 
+    def _resolve_time_settings(self) -> Dict[str, Any]:
+        time_mode = str(
+            get_setting(self.config, "trading_settings.TIME_MODE", DEFAULT_TIME_MODE)
+            if self.config is not None
+            else DEFAULT_TIME_MODE
+        ).upper()
+        broker_offset = float(
+            get_setting(self.config, "trading_settings.BROKER_UTC_OFFSET_HOURS", DEFAULT_BROKER_OFFSET_HOURS)
+            if self.config is not None
+            else DEFAULT_BROKER_OFFSET_HOURS
+        )
+        return {"time_mode": time_mode, "broker_offset": broker_offset}
+
+    def _normalize_to_utc(self, dt: Optional[datetime], *, time_mode: str, broker_offset: float) -> Optional[datetime]:
+        if dt is None:
+            return None
+        normalized = dt.replace(tzinfo=None)
+        if time_mode == "BROKER":
+            return normalized - timedelta(hours=broker_offset)
+        return normalized
+
+    def _mt5_timestamp_to_utc(self, timestamp: Optional[float], *, time_mode: str, broker_offset: float) -> Optional[datetime]:
+        if not timestamp:
+            return None
+        return datetime.utcfromtimestamp(timestamp)
+
     def _log_symbol_snapshot(self, symbol: str) -> Dict[str, Any]:
         if not symbol:
             return {}
@@ -1134,29 +1160,25 @@ class MT5Client:
             return {}
 
         try:
-            time_mode = str(
-                get_setting(self.config, "trading_settings.TIME_MODE", DEFAULT_TIME_MODE)
-                if self.config is not None
-                else DEFAULT_TIME_MODE
-            ).upper()
-            broker_offset = float(
-                get_setting(self.config, "trading_settings.BROKER_UTC_OFFSET_HOURS", DEFAULT_BROKER_OFFSET_HOURS)
-                if self.config is not None
-                else DEFAULT_BROKER_OFFSET_HOURS
-            )
+            settings = self._resolve_time_settings()
+            time_mode = settings["time_mode"]
+            broker_offset = settings["broker_offset"]
 
-            base_now = to_time or datetime.utcnow()
-            history_from = from_time or (base_now - timedelta(hours=lookback_hours))
-            if open_time:
-                open_anchor = open_time - timedelta(hours=1)
+            base_now_utc = self._normalize_to_utc(to_time or datetime.utcnow(), time_mode=time_mode, broker_offset=broker_offset)
+            open_time_utc = self._normalize_to_utc(open_time, time_mode=time_mode, broker_offset=broker_offset)
+            history_from = self._normalize_to_utc(from_time, time_mode=time_mode, broker_offset=broker_offset) or (
+                base_now_utc - timedelta(hours=lookback_hours)
+            )
+            if open_time_utc:
+                open_anchor = open_time_utc - timedelta(hours=1)
                 if open_anchor < history_from:
                     history_from = open_anchor
-            safe_floor = base_now - timedelta(hours=12)
+            safe_floor = base_now_utc - timedelta(hours=12)
             if safe_floor < history_from:
                 history_from = safe_floor
 
             # Defensive window: always ensure "to" is after "from" for MT5 history queries.
-            history_to = base_now + timedelta(minutes=1)
+            history_to = base_now_utc + timedelta(minutes=1)
             if history_to <= history_from:
                 self._logger.warning(
                     "[HISTORY_REPAIR] position_ticket=%s to<=from detected. "
@@ -1164,23 +1186,24 @@ class MT5Client:
                     position_ticket,
                     history_from.isoformat(),
                     history_to.isoformat(),
-                    open_time.isoformat() if open_time else None,
-                    base_now.isoformat(),
+                    open_time_utc.isoformat() if open_time_utc else None,
+                    base_now_utc.isoformat(),
                     time_mode,
                     broker_offset,
                 )
-                history_to = max(history_from + timedelta(hours=6), base_now + timedelta(minutes=1))
+                history_to = max(history_from + timedelta(hours=6), base_now_utc + timedelta(minutes=1))
 
             self._logger.info(
                 "[HISTORY_TIME] position_ticket=%s basis=UTC time_mode=%s broker_offset=%.2f "
-                "now=%s open_time=%s from=%s to=%s",
+                "now=%s open_time=%s from=%s to=%s close_detect_time=%s",
                 position_ticket,
                 time_mode,
                 broker_offset,
-                base_now.isoformat(),
-                open_time.isoformat() if open_time else None,
+                base_now_utc.isoformat(),
+                open_time_utc.isoformat() if open_time_utc else None,
                 history_from.isoformat(),
                 history_to.isoformat(),
+                base_now_utc.isoformat(),
             )
 
             deals = self._mt5_call(mt5.history_deals_get, history_from, history_to)
@@ -1200,23 +1223,31 @@ class MT5Client:
             )
 
             position_deals = []
+            match_field = None
             for deal in deals:
-                deal_position_id = getattr(deal, "position_id", None)
-                deal_position = getattr(deal, "position", None)
-                if deal_position_id == position_ticket or deal_position == position_ticket:
-                    position_deals.append(deal)
+                for field in ("position_id", "position", "order"):
+                    if getattr(deal, field, None) == position_ticket:
+                        position_deals.append(deal)
+                        match_field = match_field or field
+                        break
 
             match_method = "position_id"
+            self._logger.info(
+                "[HISTORY_MATCH_FIELD] position_ticket=%s fields_checked=%s matched_field=%s",
+                position_ticket,
+                "position_id,position,order",
+                match_field,
+            )
 
             if not position_deals:
                 position_deals = self._fallback_match_deals(
                     deals=deals,
                     symbol=symbol,
                     magic=magic,
-                    open_time=open_time,
+                    open_time=open_time_utc,
                     volume=volume,
                     side=side,
-                    close_time=base_now,
+                    close_time=base_now_utc,
                 )
                 match_method = "fallback"
 
@@ -1226,10 +1257,24 @@ class MT5Client:
                     position_ticket,
                     match_method,
                 )
+                self._log_history_rejections(
+                    deals=deals,
+                    position_ticket=position_ticket,
+                    symbol=symbol,
+                    magic=magic,
+                    open_time=open_time_utc,
+                    volume=volume,
+                    side=side,
+                    close_time=base_now_utc,
+                )
                 return {}
 
             for deal in position_deals[:5]:
-                deal_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
+                deal_time = self._mt5_timestamp_to_utc(
+                    getattr(deal, "time", 0),
+                    time_mode=time_mode,
+                    broker_offset=broker_offset,
+                )
                 self._logger.info(
                     "[HISTORY_CANDIDATE] position_ticket=%s deal_ticket=%s pos_id=%s symbol=%s magic=%s "
                     "entry=%s type=%s time=%s volume=%.3f price=%.5f profit=%.2f reason=%s",
@@ -1240,7 +1285,7 @@ class MT5Client:
                     getattr(deal, "magic", None),
                     getattr(deal, "entry", None),
                     getattr(deal, "type", None),
-                    deal_time.isoformat(),
+                    deal_time.isoformat() if deal_time else None,
                     float(getattr(deal, "volume", 0.0) or 0.0),
                     float(getattr(deal, "price", 0.0) or 0.0),
                     float(getattr(deal, "profit", 0.0) or 0.0),
@@ -1279,7 +1324,11 @@ class MT5Client:
                 if price and volume_val:
                     exit_price_sum += price * volume_val
                     exit_volume_sum += volume_val
-                deal_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
+                deal_time = self._mt5_timestamp_to_utc(
+                    getattr(deal, "time", 0),
+                    time_mode=time_mode,
+                    broker_offset=broker_offset,
+                )
                 if close_time is None or deal_time > close_time:
                     close_time = deal_time
                 volume_closed += volume_val
@@ -1328,10 +1377,13 @@ class MT5Client:
         volume: Optional[float],
         side: Optional[str],
         close_time: Optional[datetime] = None,
+        close_window_minutes: int = 120,
     ) -> List[Any]:
         """Fallback match for close deals when position_id is missing."""
         filtered: List[Any] = []
         close_hint = close_time or datetime.utcnow()
+        close_window = timedelta(minutes=float(close_window_minutes))
+        settings = self._resolve_time_settings()
         for deal in deals:
             if symbol and getattr(deal, "symbol", None) != symbol:
                 continue
@@ -1343,14 +1395,20 @@ class MT5Client:
                     continue
             if side:
                 deal_type = getattr(deal, "type", None)
-                if side.upper() == "BUY" and deal_type not in (getattr(mt5, "DEAL_TYPE_BUY", None),):
+                if side.upper() == "BUY" and deal_type not in (getattr(mt5, "DEAL_TYPE_SELL", None),):
                     continue
-                if side.upper() == "SELL" and deal_type not in (getattr(mt5, "DEAL_TYPE_SELL", None),):
+                if side.upper() == "SELL" and deal_type not in (getattr(mt5, "DEAL_TYPE_BUY", None),):
                     continue
-            deal_time = datetime.utcfromtimestamp(getattr(deal, "time", 0))
+            deal_time = self._mt5_timestamp_to_utc(
+                getattr(deal, "time", 0),
+                time_mode=settings["time_mode"],
+                broker_offset=settings["broker_offset"],
+            )
+            if deal_time is None:
+                continue
             if open_time and deal_time < open_time - timedelta(minutes=5):
                 continue
-            if close_time and deal_time > close_hint + timedelta(hours=1):
+            if close_time and abs((deal_time - close_hint).total_seconds()) > close_window.total_seconds():
                 continue
             entry_flag = getattr(deal, "entry", None)
             if entry_flag not in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
@@ -1359,6 +1417,95 @@ class MT5Client:
 
         filtered.sort(key=lambda item: (item[0], item[1]))
         return [item[2] for item in filtered]
+
+    def _log_history_rejections(
+        self,
+        deals: List[Any],
+        position_ticket: int,
+        symbol: Optional[str],
+        magic: Optional[int],
+        open_time: Optional[datetime],
+        volume: Optional[float],
+        side: Optional[str],
+        close_time: Optional[datetime],
+        max_rows: int = 10,
+    ) -> None:
+        if not deals:
+            return
+        settings = self._resolve_time_settings()
+        time_mode = settings["time_mode"]
+        broker_offset = settings["broker_offset"]
+        close_hint = close_time or datetime.utcnow()
+        scored: List[Tuple[float, datetime, Any, List[str]]] = []
+        for deal in deals:
+            reasons: List[str] = []
+            deal_symbol = getattr(deal, "symbol", None)
+            if symbol and deal_symbol != symbol:
+                reasons.append("WRONG_SYMBOL")
+            if magic is not None and getattr(deal, "magic", None) != magic:
+                reasons.append("MAGIC_MISMATCH")
+            deal_time = self._mt5_timestamp_to_utc(
+                getattr(deal, "time", 0),
+                time_mode=time_mode,
+                broker_offset=broker_offset,
+            )
+            if deal_time is None:
+                reasons.append("TIME_INVALID")
+                deal_time = datetime.min
+            if open_time and deal_time < open_time:
+                reasons.append("TIME_BEFORE_OPEN")
+            if close_time and deal_time < close_hint - timedelta(hours=2):
+                reasons.append("TIME_BEFORE_CLOSE_WINDOW")
+            if close_time and deal_time > close_hint + timedelta(hours=2):
+                reasons.append("TIME_AFTER_CLOSE_WINDOW")
+            if volume is not None:
+                deal_volume = float(getattr(deal, "volume", 0.0) or 0.0)
+                if deal_volume and abs(deal_volume - float(volume)) > 1e-6:
+                    reasons.append("VOLUME_MISMATCH")
+            if side:
+                deal_type = getattr(deal, "type", None)
+                if side.upper() == "BUY" and deal_type not in (getattr(mt5, "DEAL_TYPE_SELL", None),):
+                    reasons.append("SIDE_MISMATCH")
+                if side.upper() == "SELL" and deal_type not in (getattr(mt5, "DEAL_TYPE_BUY", None),):
+                    reasons.append("SIDE_MISMATCH")
+            entry_flag = getattr(deal, "entry", None)
+            if entry_flag not in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
+                reasons.append("ENTRY_NOT_CLOSE")
+            position_match = False
+            for field in ("position_id", "position", "order"):
+                if getattr(deal, field, None) == position_ticket:
+                    position_match = True
+                    break
+            if not position_match:
+                reasons.append("POSITION_ID_MISMATCH")
+            delta = abs((deal_time - close_hint).total_seconds())
+            scored.append((delta, deal_time, deal, reasons))
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        self._logger.warning(
+            "[HISTORY_REJECTS] position_ticket=%s close_detect_time=%s top=%s",
+            position_ticket,
+            close_hint.isoformat(),
+            min(len(scored), max_rows),
+        )
+        for delta, deal_time, deal, reasons in scored[:max_rows]:
+            self._logger.warning(
+                "[HISTORY_REJECT] ticket=%s order=%s position_id=%s symbol=%s magic=%s time=%s type=%s entry=%s "
+                "volume=%.3f price=%.5f profit=%.2f delta_s=%.0f reject=%s",
+                getattr(deal, "ticket", None),
+                getattr(deal, "order", None),
+                getattr(deal, "position_id", None) or getattr(deal, "position", None),
+                getattr(deal, "symbol", None),
+                getattr(deal, "magic", None),
+                deal_time.isoformat() if deal_time else None,
+                getattr(deal, "type", None),
+                getattr(deal, "entry", None),
+                float(getattr(deal, "volume", 0.0) or 0.0),
+                float(getattr(deal, "price", 0.0) or 0.0),
+                float(getattr(deal, "profit", 0.0) or 0.0),
+                float(delta),
+                ",".join(reasons) if reasons else "NONE",
+            )
 
     
     def send_order(self, symbol: str, order_type: str, volume: float, 
