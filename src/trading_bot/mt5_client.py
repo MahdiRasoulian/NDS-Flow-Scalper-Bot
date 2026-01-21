@@ -1138,7 +1138,8 @@ class MT5Client:
 
         newest = max(matched_positions, key=_pos_time)
         pos_time = _pos_time(newest)
-        if pos_time < opened_after_time - timedelta(seconds=2):
+        # استفاده از یک tolerance کوچک برای اختلاف ساعت سرور و کلاینت
+        if pos_time < opened_after_time - timedelta(seconds=5):
             return None
         return int(newest.ticket)
 
@@ -1165,91 +1166,87 @@ class MT5Client:
             broker_offset = settings["broker_offset"]
 
             # ----------------------------
-            # 1) Canonical "now" in UTC
+            # 1) Canonical "now" in UTC (CRITICAL FIX)
             # ----------------------------
-            # Rule: datetime.utcnow() is already UTC -> NEVER pass it through _normalize_to_utc
-            if to_time is None:
-                base_now_utc = datetime.utcnow()
-                now_source = "utcnow"
-            else:
-                # to_time could be broker-time or utc depending on your usage; we normalize it consistently
-                base_now_utc = self._normalize_to_utc(to_time, time_mode=time_mode, broker_offset=broker_offset)
-                now_source = "to_time"
+            # همیشه زمان حال را از سیستم می‌گیریم تا از آلودگی پارامترهای بیرونی جلوگیری کنیم
+            base_now_utc = datetime.utcnow()
+            
+            # اگر to_time پاس داده شده، آن را نرمال می‌کنیم فقط برای سقف کوئری
+            query_end_limit = None
+            if to_time:
+                query_end_limit = self._normalize_to_utc(to_time, time_mode=time_mode, broker_offset=broker_offset)
 
             # ----------------------------
             # 2) Normalize open_time into UTC
             # ----------------------------
-            open_time_utc = self._normalize_to_utc(open_time, time_mode=time_mode, broker_offset=broker_offset) if open_time else None
+            open_time_utc = None
+            if open_time:
+                open_time_utc = self._normalize_to_utc(open_time, time_mode=time_mode, broker_offset=broker_offset)
 
-            # Defensive skew repair: open_time should never be ahead of now in a correct basis
-            if open_time_utc and open_time_utc > (base_now_utc + timedelta(seconds=120)):
+            # ----------------------------
+            # 3) Skew Detection & Window Calculation
+            # ----------------------------
+            # فرض اولیه: فیلتر شروع جستجو از open_time است (اگر موجود باشد)
+            filter_start_time = open_time_utc
+            is_skewed = False
+
+            # بررسی Skew: اگر زمان باز شدن جلوتر از زمان حال است
+            if open_time_utc and open_time_utc > (base_now_utc + timedelta(minutes=5)):
+                delta_s = (open_time_utc - base_now_utc).total_seconds()
                 self._logger.warning(
-                    "[HISTORY_SKEW] position_ticket=%s open_time_utc_ahead_of_now "
-                    "open_time_utc=%s now_utc=%s delta_s=%s time_mode=%s broker_offset=%.2f now_source=%s",
+                    "[HISTORY_SKEW_DETECTED] position_ticket=%s open_ahead_of_now "
+                    "open_utc=%s now_utc=%s delta_s=%d. STRATEGY: EXPAND WINDOW, DISABLE FILTER.",
                     position_ticket,
                     open_time_utc.isoformat(),
                     base_now_utc.isoformat(),
-                    int((open_time_utc - base_now_utc).total_seconds()),
-                    time_mode,
-                    broker_offset,
-                    now_source,
+                    int(delta_s)
                 )
-                # Conservative repair: clamp open_time_utc to now_utc (so we don't reject everything)
-                open_time_utc = base_now_utc
+                is_skewed = True
+                # در حالت Skew، نمی‌توانیم به open_time اعتماد کنیم، پس فیلتر را غیرفعال می‌کنیم
+                filter_start_time = None 
 
-            # ----------------------------
-            # 3) Build history window in UTC
-            # ----------------------------
-            # Normalize from/to if user passed explicit ones; otherwise derive
-            history_from = None
-            if from_time is not None:
+            # تعیین history_from (شروع بازه کوئری به MT5)
+            if from_time:
                 history_from = self._normalize_to_utc(from_time, time_mode=time_mode, broker_offset=broker_offset)
-
-            # Primary lookback
-            if history_from is None:
+            else:
+                # Default lookback
                 history_from = base_now_utc - timedelta(hours=lookback_hours)
+                
+                # اگر open_time داریم و Skew نیست، مطمئن می‌شویم بازه شامل آن می‌شود
+                if open_time_utc and not is_skewed:
+                    # یک ساعت قبل از open_time برای اطمینان
+                    if (open_time_utc - timedelta(hours=1)) < history_from:
+                        history_from = open_time_utc - timedelta(hours=1)
+                
+                # اگر Skew داریم، باید خیلی عقب‌تر برویم چون open_time اشتباه است
+                if is_skewed:
+                    history_from = base_now_utc - timedelta(hours=lookback_hours + 24)
 
-            # Ensure we include open time vicinity
-            if open_time_utc:
-                open_anchor = open_time_utc - timedelta(hours=1)
-                if open_anchor < history_from:
-                    history_from = open_anchor
+            # تعیین history_to (پایان بازه کوئری)
+            if query_end_limit:
+                 # اگر کاربر سقف تعیین کرده، تا همان جا می‌رویم (به علاوه کمی بافر)
+                history_to = query_end_limit + timedelta(minutes=5)
+            else:
+                # در حالت عادی، تا کمی بعد از الان
+                history_to = base_now_utc + timedelta(minutes=5)
+            
+            # در حالت Skew شدید، اگر open_time خیلی در آینده است، باید history_to را هم پوشش دهیم
+            # تا اگر MT5 دیل را در آینده ثبت کرده، آن را ببینیم
+            if is_skewed and open_time_utc and open_time_utc > history_to:
+                history_to = open_time_utc + timedelta(minutes=30)
 
-            # Always keep at least 12h floor behind "now" (helps with retries/race)
-            safe_floor = base_now_utc - timedelta(hours=12)
-            if safe_floor < history_from:
-                history_from = safe_floor
-
-            # "to" must include close-detect moment and give MT5 a bit of headroom
-            history_to = base_now_utc + timedelta(minutes=2)
-
+            # اطمینان نهایی از ترتیب زمانی
             if history_to <= history_from:
-                self._logger.warning(
-                    "[HISTORY_REPAIR] position_ticket=%s to<=from detected. "
-                    "from=%s to=%s open_time_utc=%s now_utc=%s time_mode=%s broker_offset=%.2f now_source=%s",
-                    position_ticket,
-                    history_from.isoformat(),
-                    history_to.isoformat(),
-                    open_time_utc.isoformat() if open_time_utc else None,
-                    base_now_utc.isoformat(),
-                    time_mode,
-                    broker_offset,
-                    now_source,
-                )
-                history_to = max(history_from + timedelta(hours=6), base_now_utc + timedelta(minutes=2))
+                history_to = history_from + timedelta(hours=24)
 
             self._logger.info(
-                "[HISTORY_TIME] position_ticket=%s basis=UTC time_mode=%s broker_offset=%.2f now_source=%s "
-                "now_utc=%s open_time_utc=%s from_utc=%s to_utc=%s close_detect_time_utc=%s",
-                position_ticket,
-                time_mode,
-                broker_offset,
-                now_source,
+                "[HISTORY_QUERY_PARAMS] ticket=%s mode=%s offset=%.1f "
+                "now_utc=%s from=%s to=%s skewed=%s",
+                position_ticket, time_mode, broker_offset,
                 base_now_utc.isoformat(),
-                open_time_utc.isoformat() if open_time_utc else None,
                 history_from.isoformat(),
                 history_to.isoformat(),
-                base_now_utc.isoformat(),
+                is_skewed
             )
 
             deals = self._mt5_call(mt5.history_deals_get, history_from, history_to)
@@ -1258,53 +1255,65 @@ class MT5Client:
                 self._logger.warning(f"⚠️ Failed to get deals history: {error}")
                 return {}
 
-            self._logger.info(
-                "[HISTORY_QUERY] position_ticket=%s symbol=%s magic=%s from=%s to=%s deals=%s",
-                position_ticket,
-                symbol,
-                magic,
-                history_from.isoformat(),
-                history_to.isoformat(),
-                len(deals),
-            )
+            self._logger.info(f"[HISTORY_QUERY_RESULT] ticket={position_ticket} deals_count={len(deals)}")
 
             # ----------------------------
-            # 4) Your existing matching logic (unchanged)
+            # 4) Matching Logic
             # ----------------------------
             position_deals = []
             match_field = None
+            
+            # Phase A: Exact ID Match
             for deal in deals:
+                # بررسی تمام فیلدهای ممکن که ID پوزیشن در آنها ذخیره می‌شود
+                # position_id: استاندارد MT5
+                # order: گاهی سفارش بستن به این نام است
+                # position: فیلد قدیمی‌تر
                 for field in ("position_id", "position", "order"):
-                    if getattr(deal, field, None) == position_ticket:
+                    val = getattr(deal, field, None)
+                    if val == position_ticket:
                         position_deals.append(deal)
-                        match_field = match_field or field
-                        break
+                        if match_field is None: match_field = field
+                        break # یک بار مچ شود کافی است برای این دیل
+            
+            match_method = "direct_id" if position_deals else "none"
 
-            match_method = "position_id"
-            self._logger.info(
-                "[HISTORY_MATCH_FIELD] position_ticket=%s fields_checked=%s matched_field=%s",
-                position_ticket,
-                "position_id,position,order",
-                match_field,
-            )
-
+            if position_deals:
+                self._logger.info(
+                    "[HISTORY_MATCH_SUCCESS] ticket=%s method=%s field=%s count=%d", 
+                    position_ticket, match_method, match_field, len(position_deals)
+                )
+            
+            # Phase B: Fallback Logic
             if not position_deals:
+                # اگر Skew داشتیم، filter_start_time مقدار None دارد تا همه دیل‌ها چک شوند
+                # اگر Skew نداشتیم، filter_start_time همان open_time_utc است
+                
+                # گزارش تشخیصی قبل از Fallback
+                if len(deals) > 0:
+                     # لاگ کردن 3 دیل آخر برای دیدن اینکه چرا مچ نمی‌شوند
+                    debug_deals = deals[-3:] 
+                    debug_msg = ", ".join([f"id={d.ticket}/pos={d.position_id}/ord={d.order}/t={d.time}" for d in debug_deals])
+                    self._logger.info(f"[HISTORY_DEBUG_DUMP] Last 3 deals in window: {debug_msg}")
+
                 position_deals = self._fallback_match_deals(
                     deals=deals,
                     symbol=symbol,
                     magic=magic,
-                    open_time=open_time_utc,
+                    open_time=filter_start_time, # پاس دادن None در حالت Skew حیاتی است
                     volume=volume,
                     side=side,
                     close_time=base_now_utc,
                 )
-                match_method = "fallback"
+                if position_deals:
+                    match_method = "fallback_heuristic"
+                    self._logger.info(f"[HISTORY_FALLBACK_SUCCESS] ticket={position_ticket} matched={len(position_deals)}")
 
+            # اگر هنوز خالی است
             if not position_deals:
                 self._logger.warning(
-                    "[HISTORY_MATCH] position_ticket=%s matched=0 method=%s",
-                    position_ticket,
-                    match_method,
+                    "[HISTORY_MATCH_FAIL] ticket=%s matched=0. logic=exhausted.",
+                    position_ticket
                 )
                 self._log_history_rejections(
                     deals=deals,
@@ -1318,41 +1327,18 @@ class MT5Client:
                 )
                 return {}
 
-            for deal in position_deals[:5]:
-                deal_time = self._mt5_timestamp_to_utc(
-                    getattr(deal, "time", 0),
-                    time_mode=time_mode,
-                    broker_offset=broker_offset,
-                )
-                self._logger.info(
-                    "[HISTORY_CANDIDATE] position_ticket=%s deal_ticket=%s pos_id=%s symbol=%s magic=%s "
-                    "entry=%s type=%s time=%s volume=%.3f price=%.5f profit=%.2f reason=%s",
-                    position_ticket,
-                    getattr(deal, "ticket", None),
-                    getattr(deal, "position_id", None) or getattr(deal, "position", None),
-                    getattr(deal, "symbol", None),
-                    getattr(deal, "magic", None),
-                    getattr(deal, "entry", None),
-                    getattr(deal, "type", None),
-                    deal_time.isoformat() if deal_time else None,
-                    float(getattr(deal, "volume", 0.0) or 0.0),
-                    float(getattr(deal, "price", 0.0) or 0.0),
-                    float(getattr(deal, "profit", 0.0) or 0.0),
-                    getattr(deal, "reason", None),
-                )
-
+            # ----------------------------
+            # 5) Analyze Closing Deals
+            # ----------------------------
             close_deals = []
             for deal in position_deals:
                 entry_flag = getattr(deal, "entry", None)
-                if entry_flag in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_INOUT", None)):
+                # ENTRY_OUT (1) or ENTRY_INOUT (3) means closing or partial closing
+                if entry_flag in (getattr(mt5, "DEAL_ENTRY_OUT", 1), getattr(mt5, "DEAL_ENTRY_INOUT", 3)):
                     close_deals.append(deal)
 
             if not close_deals:
-                self._logger.warning(
-                    "[HISTORY_MATCH] position_ticket=%s matched=0 close_deals method=%s",
-                    position_ticket,
-                    match_method,
-                )
+                self._logger.warning(f"[HISTORY_NO_CLOSE_ENTRY] ticket={position_ticket} deals_found={len(position_deals)} but no ENTRY_OUT.")
                 return {}
 
             total_profit = 0.0
@@ -1370,7 +1356,8 @@ class MT5Client:
 
                 price = float(getattr(deal, "price", 0.0) or 0.0)
                 volume_val = float(getattr(deal, "volume", 0.0) or 0.0)
-                if price and volume_val:
+                
+                if price > 0 and volume_val > 0:
                     exit_price_sum += price * volume_val
                     exit_volume_sum += volume_val
 
@@ -1384,25 +1371,23 @@ class MT5Client:
 
                 volume_closed += volume_val
 
-                comment = (getattr(deal, "comment", "") or "").lower()
-                if "tp" in comment or "sl" in comment:
-                    reason = "TP/SL"
+                # Reason logic
+                comment_txt = (getattr(deal, "comment", "") or "").lower()
                 deal_reason = getattr(deal, "reason", None)
-                if deal_reason is not None:
+                
+                if "tp" in comment_txt or "sl" in comment_txt:
+                    reason = "TP/SL"
+                elif deal_reason is not None:
                     if deal_reason == getattr(mt5, "DEAL_REASON_SL", None):
                         reason = "SL"
                     elif deal_reason == getattr(mt5, "DEAL_REASON_TP", None):
                         reason = "TP"
 
-            exit_price = exit_price_sum / exit_volume_sum if exit_volume_sum else None
+            exit_price = exit_price_sum / exit_volume_sum if exit_volume_sum else 0.0
 
             self._logger.info(
-                "[HISTORY_MATCH] position_ticket=%s matched=%s method=%s close_deals=%s volume_closed=%.3f",
-                position_ticket,
-                len(close_deals),
-                match_method,
-                len(close_deals),
-                volume_closed,
+                "[HISTORY_FINAL] ticket=%s profit=%.2f exit_px=%.5f closed_vol=%.2f reason=%s",
+                position_ticket, total_profit, exit_price, volume_closed, reason
             )
 
             return {
