@@ -86,7 +86,7 @@ class TradeTracker:
             symbol=event.get("symbol") or "",
             magic=metadata.get("magic"),
             comment=metadata.get("comment"),
-            opened_at=event.get("event_time") or datetime.now(),
+            opened_at=event.get("event_time") or datetime.utcnow(),
             detected_by=metadata.get("detected_by", "order_send"),
         )
 
@@ -191,6 +191,18 @@ class TradeTracker:
 
         return ready, timed_out
 
+    def get_pending_close_tickets_for_symbol(self, symbol: Optional[str]) -> List[int]:
+        """Return pending close tickets for a specific symbol."""
+        if not symbol:
+            return []
+        matches: List[int] = []
+        for position_ticket, payload in self.pending_closes.items():
+            record = payload.get("record", {})
+            identity = record.get("trade_identity", {}) if isinstance(record, dict) else {}
+            if identity.get("symbol") == symbol:
+                matches.append(int(position_ticket))
+        return matches
+
     def mark_pending_attempt(self, position_ticket: int, attempt_time: datetime) -> None:
         """ثبت تلاش برای تایید بسته شدن."""
         if position_ticket not in self.pending_closes:
@@ -222,7 +234,7 @@ class TradeTracker:
         self, open_positions: List[PositionContract], reconcile_time: Optional[datetime] = None
     ) -> Tuple[int, int, List[Dict]]:
         """همگام‌سازی وضعیت معاملات با پوزیشن‌های باز MT5."""
-        self.last_reconcile_at = reconcile_time or datetime.now()
+        self.last_reconcile_at = reconcile_time or datetime.utcnow()
         added_count = 0
         updated_count = 0
 
