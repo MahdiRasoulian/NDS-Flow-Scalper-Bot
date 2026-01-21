@@ -865,6 +865,18 @@ class NDSBot:
 
             # --- اجرای معامله ---
             if final_signal in ("BUY", "SELL"):
+                symbol = result.get("symbol") or self.config.get("trading_settings.SYMBOL")
+                pending_tickets = []
+                if hasattr(self, "trade_tracker") and self.trade_tracker:
+                    pending_tickets = self.trade_tracker.get_pending_close_tickets_for_symbol(symbol)
+                if pending_tickets:
+                    logger.warning(
+                        "[TRADE_BLOCK] symbol=%s reason=pending_close tickets=%s",
+                        symbol,
+                        pending_tickets,
+                    )
+                    return
+
                 cooldown_decision = evaluate_cooldown(
                     signal=final_signal,
                     min_candles_between=MIN_CANDLES_BETWEEN,

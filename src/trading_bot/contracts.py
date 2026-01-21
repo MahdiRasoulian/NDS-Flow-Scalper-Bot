@@ -83,7 +83,8 @@ def normalize_position(raw: Dict[str, Any]) -> PositionContract:
     side = raw.get("side", raw.get("type", "BUY"))
     side = "BUY" if str(side).upper() == "BUY" else "SELL"
 
-    open_time = _coerce_datetime(raw.get("open_time", raw.get("time"))) or datetime.now()
+    # Use UTC as a safe fallback to avoid local-time skew in history queries.
+    open_time = _coerce_datetime(raw.get("open_time", raw.get("time"))) or datetime.utcnow()
     update_time = _coerce_datetime(raw.get("update_time", raw.get("time_update")))
 
     return PositionContract(
