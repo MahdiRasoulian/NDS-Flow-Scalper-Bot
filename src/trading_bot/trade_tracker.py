@@ -25,6 +25,7 @@ class TradeTracker:
             'winning_trades': 0,
             'total_profit': 0.0
         }
+        self.last_reconcile_at: Optional[datetime] = None
 
     @property
     def active_trades_view(self) -> Dict[int, Dict]:
@@ -56,15 +57,7 @@ class TradeTracker:
 
     def add_trade_open(self, event: ExecutionEvent) -> None:
         """ثبت معامله جدید با رویداد OPEN"""
-        identity = TradeIdentity(
-            order_ticket=event.get("order_ticket"),
-            position_ticket=event.get("position_ticket"),
-            symbol=event.get("symbol") or "",
-            magic=event.get("metadata", {}).get("magic"),
-            comment=event.get("metadata", {}).get("comment"),
-            opened_at=event.get("event_time") or datetime.now(),
-            detected_by=event.get("metadata", {}).get("detected_by", "order_send"),
-        )
+        identity = self._build_trade_identity(event)
 
         record = {
             "trade_identity": identity,
@@ -81,6 +74,21 @@ class TradeTracker:
 
         if identity.get("detected_by") != "recovery_scan":
             self.daily_stats['total_trades'] += 1
+
+    def _build_trade_identity(self, event: ExecutionEvent) -> TradeIdentity:
+        metadata = event.get("metadata", {}) or {}
+        order_ticket = event.get("order_ticket") or metadata.get("order_ticket") or metadata.get("deal_ticket")
+        position_ticket = event.get("position_ticket") or metadata.get("position_ticket")
+
+        return TradeIdentity(
+            order_ticket=order_ticket,
+            position_ticket=position_ticket,
+            symbol=event.get("symbol") or "",
+            magic=metadata.get("magic"),
+            comment=metadata.get("comment"),
+            opened_at=event.get("event_time") or datetime.now(),
+            detected_by=metadata.get("detected_by", "order_send"),
+        )
 
     def update_trade_event(self, event: ExecutionEvent) -> None:
         """به‌روزرسانی رویدادهای OPEN/UPDATE"""
@@ -211,9 +219,10 @@ class TradeTracker:
             del self.active_trades[position_ticket]
 
     def reconcile_with_open_positions(
-        self, open_positions: List[PositionContract]
+        self, open_positions: List[PositionContract], reconcile_time: Optional[datetime] = None
     ) -> Tuple[int, int, List[Dict]]:
         """همگام‌سازی وضعیت معاملات با پوزیشن‌های باز MT5."""
+        self.last_reconcile_at = reconcile_time or datetime.now()
         added_count = 0
         updated_count = 0
 
