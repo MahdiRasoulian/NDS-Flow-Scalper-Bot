@@ -1164,25 +1164,69 @@ class MT5Client:
             time_mode = settings["time_mode"]
             broker_offset = settings["broker_offset"]
 
-            base_now_utc = self._normalize_to_utc(to_time or datetime.utcnow(), time_mode=time_mode, broker_offset=broker_offset)
-            open_time_utc = self._normalize_to_utc(open_time, time_mode=time_mode, broker_offset=broker_offset)
-            history_from = self._normalize_to_utc(from_time, time_mode=time_mode, broker_offset=broker_offset) or (
-                base_now_utc - timedelta(hours=lookback_hours)
-            )
+            # ----------------------------
+            # 1) Canonical "now" in UTC
+            # ----------------------------
+            # Rule: datetime.utcnow() is already UTC -> NEVER pass it through _normalize_to_utc
+            if to_time is None:
+                base_now_utc = datetime.utcnow()
+                now_source = "utcnow"
+            else:
+                # to_time could be broker-time or utc depending on your usage; we normalize it consistently
+                base_now_utc = self._normalize_to_utc(to_time, time_mode=time_mode, broker_offset=broker_offset)
+                now_source = "to_time"
+
+            # ----------------------------
+            # 2) Normalize open_time into UTC
+            # ----------------------------
+            open_time_utc = self._normalize_to_utc(open_time, time_mode=time_mode, broker_offset=broker_offset) if open_time else None
+
+            # Defensive skew repair: open_time should never be ahead of now in a correct basis
+            if open_time_utc and open_time_utc > (base_now_utc + timedelta(seconds=120)):
+                self._logger.warning(
+                    "[HISTORY_SKEW] position_ticket=%s open_time_utc_ahead_of_now "
+                    "open_time_utc=%s now_utc=%s delta_s=%s time_mode=%s broker_offset=%.2f now_source=%s",
+                    position_ticket,
+                    open_time_utc.isoformat(),
+                    base_now_utc.isoformat(),
+                    int((open_time_utc - base_now_utc).total_seconds()),
+                    time_mode,
+                    broker_offset,
+                    now_source,
+                )
+                # Conservative repair: clamp open_time_utc to now_utc (so we don't reject everything)
+                open_time_utc = base_now_utc
+
+            # ----------------------------
+            # 3) Build history window in UTC
+            # ----------------------------
+            # Normalize from/to if user passed explicit ones; otherwise derive
+            history_from = None
+            if from_time is not None:
+                history_from = self._normalize_to_utc(from_time, time_mode=time_mode, broker_offset=broker_offset)
+
+            # Primary lookback
+            if history_from is None:
+                history_from = base_now_utc - timedelta(hours=lookback_hours)
+
+            # Ensure we include open time vicinity
             if open_time_utc:
                 open_anchor = open_time_utc - timedelta(hours=1)
                 if open_anchor < history_from:
                     history_from = open_anchor
+
+            # Always keep at least 12h floor behind "now" (helps with retries/race)
             safe_floor = base_now_utc - timedelta(hours=12)
             if safe_floor < history_from:
                 history_from = safe_floor
 
-            # Defensive window: always ensure "to" is after "from" for MT5 history queries.
-            history_to = base_now_utc + timedelta(minutes=1)
+            # "to" must include close-detect moment and give MT5 a bit of headroom
+            history_to = base_now_utc + timedelta(minutes=2)
+
             if history_to <= history_from:
                 self._logger.warning(
                     "[HISTORY_REPAIR] position_ticket=%s to<=from detected. "
-                    "from=%s to=%s open_time=%s now=%s time_mode=%s broker_offset=%.2f",
+                    "from=%s to=%s open_time_utc=%s now_utc=%s time_mode=%s broker_offset=%.2f now_source=%s",
                     position_ticket,
                     history_from.isoformat(),
                     history_to.isoformat(),
@@ -1190,15 +1234,17 @@ class MT5Client:
                     base_now_utc.isoformat(),
                     time_mode,
                     broker_offset,
+                    now_source,
                 )
-                history_to = max(history_from + timedelta(hours=6), base_now_utc + timedelta(minutes=1))
+                history_to = max(history_from + timedelta(hours=6), base_now_utc + timedelta(minutes=2))
 
             self._logger.info(
-                "[HISTORY_TIME] position_ticket=%s basis=UTC time_mode=%s broker_offset=%.2f "
-                "now=%s open_time=%s from=%s to=%s close_detect_time=%s",
+                "[HISTORY_TIME] position_ticket=%s basis=UTC time_mode=%s broker_offset=%.2f now_source=%s "
+                "now_utc=%s open_time_utc=%s from_utc=%s to_utc=%s close_detect_time_utc=%s",
                 position_ticket,
                 time_mode,
                 broker_offset,
+                now_source,
                 base_now_utc.isoformat(),
                 open_time_utc.isoformat() if open_time_utc else None,
                 history_from.isoformat(),
@@ -1222,6 +1268,9 @@ class MT5Client:
                 len(deals),
             )
 
+            # ----------------------------
+            # 4) Your existing matching logic (unchanged)
+            # ----------------------------
             position_deals = []
             match_field = None
             for deal in deals:
@@ -1324,13 +1373,15 @@ class MT5Client:
                 if price and volume_val:
                     exit_price_sum += price * volume_val
                     exit_volume_sum += volume_val
+
                 deal_time = self._mt5_timestamp_to_utc(
                     getattr(deal, "time", 0),
                     time_mode=time_mode,
                     broker_offset=broker_offset,
                 )
-                if close_time is None or deal_time > close_time:
+                if close_time is None or (deal_time and deal_time > close_time):
                     close_time = deal_time
+
                 volume_closed += volume_val
 
                 comment = (getattr(deal, "comment", "") or "").lower()
@@ -1367,6 +1418,7 @@ class MT5Client:
         except Exception as e:
             self._logger.error(f"❌ Error getting position history: {e}", exc_info=True)
             return {}
+
 
     def _fallback_match_deals(
         self,
