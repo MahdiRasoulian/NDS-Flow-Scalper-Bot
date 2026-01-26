@@ -66,6 +66,7 @@ class ScalpingRiskManager:
     """
 
     GOLD_SPECS = {}
+    VERSION_TAG = "2025-02-14-stop-far-rr-repair"
 
     # ==================== تنظیمات پیش‌فرض اسکلپینگ ====================
 
@@ -156,6 +157,7 @@ class ScalpingRiskManager:
 
         # ۲. مقداردهی لاگر
         self._logger = logger or logging.getLogger(__name__)
+        self._logger.info("[RISK][VERSION] %s", self.VERSION_TAG)
 
         self._logger.info("🔄 Single Source of Truth loaded for RiskManager (ConfigManager + overrides).")
 
@@ -726,15 +728,20 @@ class ScalpingRiskManager:
         elif signal == "SELL" and recent_high is not None:
             ref_distance = max(0.0, float(recent_high) - float(entry_price))
 
+        sl_source = "none"
         if atr_distance > 0 and ref_distance > 0:
             sl_distance = min(atr_distance, ref_distance)
+            sl_source = "atr_ref_min"
         elif atr_distance > 0:
             sl_distance = atr_distance
+            sl_source = "atr_only"
         else:
             sl_distance = ref_distance
+            sl_source = "ref_only"
 
         if sl_distance <= 0:
             sl_distance = pips_to_price(sl_min_pips, point_size)
+            sl_source = "min_pips"
 
         sl_metrics = calculate_distance_metrics(
             entry_price=float(entry_price),
@@ -802,7 +809,9 @@ class ScalpingRiskManager:
             "tp2_pips": tp2_pips,
             "tp2_price": tp2_price,
             "tp1_source": tp1_source,
+            "sl_source": sl_source,
             "sl_pips": sl_pips,
+            "raw_sl_pips": raw_sl_pips,
             "sl_distance": sl_distance,
             "atr_distance": atr_distance,
             "ref_distance": ref_distance,
@@ -912,6 +921,14 @@ class ScalpingRiskManager:
         )
 
         if deviation_pips < stop_soft_pips:
+            decision_notes.append(
+                f"STOP_FAR_POLICY:SKIP deviation_pips={deviation_pips:.1f} soft={stop_soft_pips:.1f}"
+            )
+            self._logger.info(
+                "[NDS][STOP_FAR_POLICY] action=SKIP deviation_pips=%.2f soft=%.2f",
+                deviation_pips,
+                stop_soft_pips,
+            )
             return None
 
         adx_val, adx_source = self._resolve_adx_from_signal(analysis_payload)
@@ -1017,6 +1034,119 @@ class ScalpingRiskManager:
             "reject_reason": "Stop far from market; no regime match.",
             "deviation_pips": deviation_pips,
         }
+
+    def _attempt_rr_repair(
+        self,
+        *,
+        signal: str,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        min_rr_ratio: float,
+        point_size: float,
+        atr_value: Optional[float],
+        risk_manager_config: Dict[str, Any],
+        decision_notes: List[str],
+    ) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+        """Attempt to repair RR by expanding TP within safe bounds."""
+        rr_repair_enabled = bool(risk_manager_config.get("RR_REPAIR_ENABLED", True))
+        if not rr_repair_enabled:
+            return None, None, None
+        rr_epsilon = float(risk_manager_config.get("RR_EPSILON", 1e-6))
+
+        sl_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=stop_loss,
+            point_size=point_size,
+        )
+        tp_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=take_profit,
+            point_size=point_size,
+        )
+        sl_distance = float(sl_metrics.get("dist_price") or 0.0)
+        tp_distance = float(tp_metrics.get("dist_price") or 0.0)
+        sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
+        tp_pips = float(tp_metrics.get("dist_pips") or 0.0)
+
+        rr_before = tp_distance / sl_distance if sl_distance > 0 else 0.0
+        if rr_before + rr_epsilon >= min_rr_ratio:
+            return None, None, None
+
+        desired_tp_distance = sl_distance * min_rr_ratio
+        max_tp_pips = float(
+            risk_manager_config.get(
+                "RR_REPAIR_MAX_TP_PIPS",
+                max(tp_pips, float(self.settings.get("TP2_PIPS", tp_pips))),
+            )
+        )
+        max_tp_atr_mult = float(risk_manager_config.get("RR_REPAIR_MAX_TP_ATR_MULT", 2.0))
+        max_tp_price_atr = None
+        if atr_value and float(atr_value) > 0:
+            max_tp_price_atr = float(atr_value) * max_tp_atr_mult
+
+        desired_tp_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=entry_price + desired_tp_distance if signal == "BUY" else entry_price - desired_tp_distance,
+            point_size=point_size,
+        )
+        desired_tp_pips = float(desired_tp_metrics.get("dist_pips") or 0.0)
+
+        cap_reasons = []
+        if desired_tp_pips > max_tp_pips:
+            cap_reasons.append(
+                f"tp_pips_cap {desired_tp_pips:.1f}>{max_tp_pips:.1f}"
+            )
+        if max_tp_price_atr is not None and desired_tp_distance > max_tp_price_atr:
+            cap_reasons.append(
+                f"tp_atr_cap {desired_tp_distance:.2f}>{max_tp_price_atr:.2f}"
+            )
+
+        decision_notes.append(
+            f"RR_CHECK sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_before:.2f} min_rr={min_rr_ratio:.2f}"
+        )
+
+        if cap_reasons:
+            decision_notes.append(
+                f"RR_REPAIR_REJECT caps_exceeded={'|'.join(cap_reasons)}"
+            )
+            self._logger.info(
+                "[NDS][RR_REPAIR] action=REJECT rr=%.2f min_rr=%.2f sl_pips=%.2f tp_pips=%.2f caps=%s",
+                rr_before,
+                min_rr_ratio,
+                sl_pips,
+                tp_pips,
+                "|".join(cap_reasons),
+            )
+            return None, None, "TP cap exceeded for RR repair."
+
+        new_take_profit = (
+            entry_price + desired_tp_distance
+            if signal == "BUY"
+            else entry_price - desired_tp_distance
+        )
+        new_tp_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=new_take_profit,
+            point_size=point_size,
+        )
+        new_tp_pips = float(new_tp_metrics.get("dist_pips") or 0.0)
+        rr_after = desired_tp_distance / sl_distance if sl_distance > 0 else 0.0
+
+        decision_notes.append(
+            "RR_REPAIR_TP "
+            f"tp_pips={tp_pips:.1f}->{new_tp_pips:.1f} rr={rr_before:.2f}->{rr_after:.2f} "
+            f"max_tp_pips={max_tp_pips:.1f} max_tp_atr_mult={max_tp_atr_mult:.2f}"
+        )
+        self._logger.info(
+            "[NDS][RR_REPAIR] action=TP_ADJUST rr=%.2f->%.2f sl_pips=%.2f tp_pips=%.2f->%.2f",
+            rr_before,
+            rr_after,
+            sl_pips,
+            tp_pips,
+            new_tp_pips,
+        )
+        return new_take_profit, "rr_repair", None
 
     def finalize_order(
         self,
@@ -1197,6 +1327,7 @@ class ScalpingRiskManager:
 
         max_entry_atr_deviation = risk_settings.get('MAX_ENTRY_ATR_DEVIATION')
         min_rr_ratio = risk_manager_config.get('MIN_RR_RATIO')
+        rr_epsilon = float(risk_manager_config.get("RR_EPSILON", 1e-6))
 
         if min_rr_ratio is None:
             return _finalize(
@@ -1326,6 +1457,12 @@ class ScalpingRiskManager:
         tp2_price = sltp.get("tp2_price")
         decision_notes.append("SL/TP computed by risk manager scalping model.")
         tp1_source = sltp.get("tp1_source", "fixed_pips")
+        sl_source = sltp.get("sl_source", "unknown")
+        sl_pips = float(sltp.get("sl_pips") or 0.0)
+        tp1_pips = float(sltp.get("tp1_pips") or 0.0)
+        decision_notes.append(
+            f"SL model: {sl_source} sl_pips={sl_pips:.1f} tp1_source={tp1_source} tp1_pips={tp1_pips:.1f}"
+        )
         tp1_partial = float(self.settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5))
         move_sl_to_be = bool(self.settings.get("FLOW_TP1_MOVE_SL_TO_BE", True))
         trail_atr_mult = float(self.settings.get("FLOW_TRAIL_ATR_MULT", 2.0))
@@ -1374,6 +1511,33 @@ class ScalpingRiskManager:
                 is_trade_allowed=False,
                 reject_reason="Distance sanity failed.",
             )
+
+        sl_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=stop_loss,
+            point_size=point_size,
+        )
+        tp_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=take_profit,
+            point_size=point_size,
+        )
+        sl_distance = float(sl_metrics.get("dist_price") or 0.0)
+        tp_distance = float(tp_metrics.get("dist_price") or 0.0)
+        sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
+        tp_pips = float(tp_metrics.get("dist_pips") or 0.0)
+        rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
+        decision_notes.append(
+            f"RR_PRECHECK sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_ratio:.2f}"
+        )
+        self._logger.info(
+            "[NDS][RR_METRICS] sl_pips=%.2f tp_pips=%.2f rr=%.2f sl_src=%s tp_src=%s",
+            sl_pips,
+            tp_pips,
+            rr_ratio,
+            sl_source,
+            tp1_source,
+        )
 
         # ===============================
         # ✅ FIX: inject last signal context for can_scalp session gating
@@ -1426,25 +1590,65 @@ class ScalpingRiskManager:
             )
 
         rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
-
-        if rr_ratio < min_rr_ratio:
-            decision_notes.append(
-                f"RR {rr_ratio:.2f} below minimum {min_rr_ratio:.2f}."
-            )
-            return _finalize(
+        if rr_ratio + rr_epsilon < min_rr_ratio:
+            repaired_tp, repair_source, repair_reject = self._attempt_rr_repair(
                 signal=signal,
-                order_type='NONE',
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                lot_size=0.0,
-                risk_amount_usd=0.0,
-                rr_ratio=rr_ratio,
-                deviation_pips=deviation_pips,
+                min_rr_ratio=float(min_rr_ratio),
+                point_size=point_size,
+                atr_value=atr_value,
+                risk_manager_config=risk_manager_config,
                 decision_notes=decision_notes,
-                is_trade_allowed=False,
-                reject_reason="RR ratio below minimum.",
             )
+            if repair_reject:
+                return _finalize(
+                    signal=signal,
+                    order_type='NONE',
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    lot_size=0.0,
+                    risk_amount_usd=0.0,
+                    rr_ratio=rr_ratio,
+                    deviation_pips=deviation_pips,
+                    decision_notes=decision_notes,
+                    is_trade_allowed=False,
+                    reject_reason=repair_reject,
+                )
+            if repaired_tp is not None:
+                take_profit = repaired_tp
+                tp1_source = repair_source or tp1_source
+                tp_metrics = calculate_distance_metrics(
+                    entry_price=entry_price,
+                    current_price=take_profit,
+                    point_size=point_size,
+                )
+                tp_distance = float(tp_metrics.get("dist_price") or 0.0)
+                tp_pips = float(tp_metrics.get("dist_pips") or 0.0)
+                rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
+                decision_notes.append(
+                    f"RR_POSTREPAIR sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_ratio:.2f}"
+                )
+            if rr_ratio + rr_epsilon < min_rr_ratio:
+                decision_notes.append(
+                    f"RR {rr_ratio:.2f} below minimum {min_rr_ratio:.2f}."
+                )
+                return _finalize(
+                    signal=signal,
+                    order_type='NONE',
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    lot_size=0.0,
+                    risk_amount_usd=0.0,
+                    rr_ratio=rr_ratio,
+                    deviation_pips=deviation_pips,
+                    decision_notes=decision_notes,
+                    is_trade_allowed=False,
+                    reject_reason="RR ratio below minimum.",
+                )
 
         account_equity = config.get('ACCOUNT_BALANCE')
         max_risk_usd = risk_settings.get('RISK_AMOUNT_USD')

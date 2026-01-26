@@ -163,4 +163,9 @@ def test_stop_far_policy_threshold_below_soft_does_not_trigger():
     )
 
     assert finalized.is_trade_allowed
-    assert not any("STOP_FAR_POLICY" in note for note in finalized.decision_notes)
+    assert any("STOP_FAR_POLICY:SKIP" in note for note in finalized.decision_notes)
+    assert not any(
+        token in note
+        for note in finalized.decision_notes
+        for token in ("STOP_FAR_POLICY:LIMIT", "STOP_FAR_POLICY:CAP_ENTRY", "STOP_FAR_POLICY:REJECT")
+    )
