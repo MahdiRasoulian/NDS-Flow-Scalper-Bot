@@ -861,6 +861,163 @@ class ScalpingRiskManager:
             return False, tp_issue
         return True, "ok"
 
+    def _apply_stop_far_from_market_policy(
+        self,
+        *,
+        signal: str,
+        order_type: str,
+        planned_entry: float,
+        market_entry: float,
+        deviation_pips: float,
+        point_size: float,
+        confidence: float,
+        analysis_payload: Dict[str, Any],
+        analysis_context: Dict[str, Any],
+        risk_settings: Dict[str, Any],
+        risk_manager_config: Dict[str, Any],
+        decision_notes: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        if order_type != "STOP":
+            return None
+
+        stop_soft_pips = float(
+            risk_manager_config.get(
+                "STOP_MAX_DEVIATION_PIPS",
+                risk_settings.get("MAX_PRICE_DEVIATION_PIPS", 70.0),
+            )
+        )
+        stop_hard_pips = float(
+            risk_manager_config.get(
+                "STOP_HARD_REJECT_PIPS",
+                max(stop_soft_pips * 1.5, stop_soft_pips + 10.0),
+            )
+        )
+        limit_pips = float(
+            risk_manager_config.get(
+                "STOP_CONVERT_TO_LIMIT_PIPS",
+                max(5.0, stop_soft_pips * 0.5),
+            )
+        )
+        cap_pips = float(
+            risk_manager_config.get(
+                "MAX_ENTRY_CAP_PIPS",
+                stop_soft_pips,
+            )
+        )
+        trend_adx_min = float(
+            risk_manager_config.get("TREND_STRENGTH_ADX_MIN", 25.0)
+        )
+        mean_rev_adx_max = float(
+            risk_manager_config.get("MEAN_REVERSION_ADX_MAX", 18.0)
+        )
+
+        if deviation_pips < stop_soft_pips:
+            return None
+
+        adx_val, adx_source = self._resolve_adx_from_signal(analysis_payload)
+        market_metrics = analysis_payload.get("market_metrics") or analysis_context.get("market_metrics", {})
+        volatility_state = str(market_metrics.get("volatility_state") or "").upper()
+
+        decision_notes.append(
+            "STOP_FAR_POLICY:deviation_pips="
+            f"{deviation_pips:.1f} soft={stop_soft_pips:.1f} hard={stop_hard_pips:.1f} "
+            f"adx={adx_val:.1f}({adx_source}) vol={volatility_state or 'NA'}"
+        )
+
+        if deviation_pips >= stop_hard_pips:
+            decision_notes.append("STOP_FAR_POLICY:REJECT_HARD")
+            self._logger.info(
+                "[NDS][STOP_FAR_POLICY] action=REJECT_HARD deviation_pips=%.2f hard=%.2f",
+                deviation_pips,
+                stop_hard_pips,
+            )
+            return {
+                "action": "REJECT_HARD",
+                "order_type": "NONE",
+                "entry_price": planned_entry,
+                "reject_reason": "Stop too far.",
+                "deviation_pips": deviation_pips,
+            }
+
+        is_trend_continuation = adx_val >= trend_adx_min if adx_val > 0 else False
+        is_mean_reversion = (adx_val > 0 and adx_val <= mean_rev_adx_max) or volatility_state == "LOW"
+
+        if is_trend_continuation:
+            cap_pips = min(cap_pips, deviation_pips)
+            cap_price = pips_to_price(cap_pips, point_size)
+            if signal == "BUY":
+                capped_entry = min(planned_entry, market_entry + cap_price)
+            else:
+                capped_entry = max(planned_entry, market_entry - cap_price)
+            decision_notes.append(
+                f"STOP_FAR_POLICY:CAP_ENTRY capped_entry={capped_entry:.2f} cap_pips={cap_pips:.1f}"
+            )
+            return {
+                "action": "CAP_ENTRY",
+                "order_type": "STOP",
+                "entry_price": capped_entry,
+                "reject_reason": None,
+                "deviation_pips": float(
+                    calculate_distance_metrics(
+                        entry_price=capped_entry,
+                        current_price=market_entry,
+                        point_size=point_size,
+                    ).get("dist_pips")
+                    or 0.0
+                ),
+            }
+
+        if is_mean_reversion:
+            limit_min_conf = float(
+                risk_settings.get(
+                    "LIMIT_ORDER_MIN_CONFIDENCE",
+                    self.settings.get("LIMIT_ORDER_MIN_CONFIDENCE", 0.0),
+                )
+            )
+            if confidence < limit_min_conf:
+                decision_notes.append(
+                    f"STOP_FAR_POLICY:WAIT conf={confidence:.1f} < limit_min_conf={limit_min_conf:.1f}"
+                )
+                return {
+                    "action": "WAIT",
+                    "order_type": "WAIT",
+                    "entry_price": planned_entry,
+                    "reject_reason": "Stop far from market; wait for pullback.",
+                    "deviation_pips": deviation_pips,
+                }
+
+            limit_price = pips_to_price(limit_pips, point_size)
+            if signal == "BUY":
+                limit_entry = market_entry - limit_price
+            else:
+                limit_entry = market_entry + limit_price
+            decision_notes.append(
+                f"STOP_FAR_POLICY:LIMIT limit_entry={limit_entry:.2f} limit_pips={limit_pips:.1f}"
+            )
+            return {
+                "action": "LIMIT",
+                "order_type": "LIMIT",
+                "entry_price": limit_entry,
+                "reject_reason": None,
+                "deviation_pips": float(
+                    calculate_distance_metrics(
+                        entry_price=limit_entry,
+                        current_price=market_entry,
+                        point_size=point_size,
+                    ).get("dist_pips")
+                    or 0.0
+                ),
+            }
+
+        decision_notes.append("STOP_FAR_POLICY:REJECT_NO_REGIME")
+        return {
+            "action": "REJECT_NO_REGIME",
+            "order_type": "NONE",
+            "entry_price": planned_entry,
+            "reject_reason": "Stop far from market; no regime match.",
+            "deviation_pips": deviation_pips,
+        }
+
     def finalize_order(
         self,
         analysis: Union['AnalysisResult', Dict[str, Any]],
@@ -1082,20 +1239,66 @@ class ScalpingRiskManager:
         entry_price = planned_entry if order_type in ("STOP", "LIMIT") else market_entry
 
         if order_type == "STOP":
-            if signal == "BUY" and planned_entry <= ask:
+            stop_policy = self._apply_stop_far_from_market_policy(
+                signal=signal,
+                order_type=order_type,
+                planned_entry=planned_entry,
+                market_entry=market_entry,
+                deviation_pips=deviation_pips,
+                point_size=point_size,
+                confidence=float(confidence or 0.0),
+                analysis_payload=analysis_payload,
+                analysis_context=analysis_context,
+                risk_settings=risk_settings,
+                risk_manager_config=risk_manager_config,
+                decision_notes=decision_notes,
+            )
+            if stop_policy:
+                order_type = stop_policy.get("order_type", order_type)
+                entry_price = stop_policy.get("entry_price", entry_price)
+                deviation_pips = float(stop_policy.get("deviation_pips", deviation_pips))
+                if stop_policy.get("reject_reason"):
+                    return _finalize(
+                        signal=signal,
+                        order_type=order_type,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss or 0.0,
+                        take_profit=take_profit or 0.0,
+                        lot_size=0.0,
+                        risk_amount_usd=0.0,
+                        rr_ratio=0.0,
+                        deviation_pips=deviation_pips,
+                        decision_notes=decision_notes,
+                        is_trade_allowed=False,
+                        reject_reason=stop_policy.get("reject_reason"),
+                    )
+                deviation = abs(entry_price - market_entry)
+                deviation_metrics = calculate_distance_metrics(
+                    entry_price=entry_price,
+                    current_price=market_entry,
+                    point_size=point_size,
+                    atr_value=None,
+                )
+                deviation_pips = float(deviation_metrics.get("dist_pips") or deviation_pips)
+                decision_notes.append(
+                    f"STOP_FAR_POLICY:adjusted_entry_deviation_pips={deviation_pips:.1f}"
+                )
+
+        if order_type == "STOP":
+            if signal == "BUY" and entry_price <= ask:
                 decision_notes.append("Stop already triggered; switching to MARKET.")
                 order_type = "MARKET"
                 entry_price = market_entry
-            elif signal == "SELL" and planned_entry >= bid:
+            elif signal == "SELL" and entry_price >= bid:
                 decision_notes.append("Stop already triggered; switching to MARKET.")
                 order_type = "MARKET"
                 entry_price = market_entry
         elif order_type == "LIMIT":
-            if signal == "BUY" and planned_entry >= ask:
+            if signal == "BUY" and entry_price >= ask:
                 decision_notes.append("Limit already at/inside market; switching to MARKET.")
                 order_type = "MARKET"
                 entry_price = market_entry
-            elif signal == "SELL" and planned_entry <= bid:
+            elif signal == "SELL" and entry_price <= bid:
                 decision_notes.append("Limit already at/inside market; switching to MARKET.")
                 order_type = "MARKET"
                 entry_price = market_entry
