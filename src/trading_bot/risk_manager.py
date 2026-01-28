@@ -685,6 +685,67 @@ class ScalpingRiskManager:
             payload["entry_price"] = payload.get("entry_level")
         return payload
 
+    def _resolve_signal_context(
+        self,
+        analysis_payload: Dict[str, Any],
+        analysis_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Resolve signal context (bias/reversal/trend) from analyzer payloads."""
+        signal_context = analysis_payload.get("analysis_signal_context")
+        if isinstance(signal_context, dict):
+            return signal_context
+        context_signal = (analysis_payload.get("context") or {}).get("analysis_signal_context")
+        if isinstance(context_signal, dict):
+            return context_signal
+        context_signal = analysis_context.get("analysis_signal_context")
+        if isinstance(context_signal, dict):
+            return context_signal
+        return {}
+
+    def _apply_tp1_target_policy(
+        self,
+        *,
+        signal: str,
+        entry_context: Dict[str, Any],
+        signal_context: Dict[str, Any],
+        decision_notes: List[str],
+    ) -> Dict[str, Any]:
+        """Apply TP1 policy for counter-trend opposing-structure IFVG targets."""
+        tp1_target_price = entry_context.get("tp1_target_price")
+        tp1_target_source = entry_context.get("tp1_target_source")
+        zone_type = entry_context.get("tp1_target_zone_type")
+        zone_direction = entry_context.get("tp1_target_zone_direction")
+
+        if tp1_target_price is None or tp1_target_source is None:
+            return {"tp1_target_price": tp1_target_price, "action": "keep"}
+
+        bias = str(signal_context.get("bias", "") or "")
+        trend = str(signal_context.get("trend", "") or "")
+        reversal_ok = bool(signal_context.get("reversal_ok"))
+        counter_trend = (bias == "BULLISH" and signal == "SELL") or (bias == "BEARISH" and signal == "BUY")
+        aligned_trend = (
+            (trend == "DOWNTREND" and zone_direction == "BEARISH")
+            or (trend == "UPTREND" and zone_direction == "BULLISH")
+        )
+
+        if counter_trend and not reversal_ok and zone_type == "IFVG" and aligned_trend:
+            policy = str(self.settings.get("FLOW_TP1_COUNTERTREND_IFVG_POLICY", "fixed_pips")).lower()
+            if policy == "reject":
+                decision_notes.append(
+                    "TP1 policy: reject counter-trend trade using aligned IFVG opposing structure."
+                )
+                return {
+                    "tp1_target_price": None,
+                    "action": "reject",
+                    "reject_reason": "Counter-trend IFVG TP blocked without reversal confirmation.",
+                }
+            decision_notes.append(
+                "TP1 policy: counter-trend aligned IFVG -> fixed_pips (reversal_ok=false)."
+            )
+            return {"tp1_target_price": None, "action": "fixed_pips"}
+
+        return {"tp1_target_price": tp1_target_price, "action": "keep"}
+
     def _get_point_size(self, config_payload: Dict[str, Any]) -> float:
         """Resolve point size with default for XAUUSD mapping."""
         default_point_size = self._get_gold_spec("point", DEFAULT_POINT_SIZE)
@@ -1439,9 +1500,48 @@ class ScalpingRiskManager:
             or analysis_context.get("entry_context", {})
             or {}
         )
+        signal_context = self._resolve_signal_context(analysis_payload, analysis_context)
+        tp1_target_source = entry_context.get("tp1_target_source")
+        tp1_target_zone_type = entry_context.get("tp1_target_zone_type")
+        tp1_target_zone_direction = entry_context.get("tp1_target_zone_direction")
+        decision_notes.append(
+            "CTX counter_trend={counter_trend} reversal_ok={reversal_ok} liquidity_ok={liquidity_ok} trend_ok={trend_ok}".format(
+                counter_trend=entry_context.get("counter_trend"),
+                reversal_ok=entry_context.get("reversal_ok"),
+                liquidity_ok=entry_context.get("liquidity_ok"),
+                trend_ok=entry_context.get("trend_ok"),
+            )
+        )
+        if tp1_target_source or tp1_target_zone_type:
+            decision_notes.append(
+                f"TP1 target source={tp1_target_source} zone_type={tp1_target_zone_type} direction={tp1_target_zone_direction}"
+            )
         recent_low = entry_context.get("recent_low")
         recent_high = entry_context.get("recent_high")
         tp1_target_price = entry_context.get("tp1_target_price")
+        tp1_policy = self._apply_tp1_target_policy(
+            signal=signal,
+            entry_context=entry_context,
+            signal_context=signal_context,
+            decision_notes=decision_notes,
+        )
+        if tp1_policy.get("action") == "reject":
+            return _finalize(
+                signal=signal,
+                order_type='NONE',
+                entry_price=entry_price,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason=tp1_policy.get("reject_reason") or "TP1 policy reject.",
+            )
+        if "tp1_target_price" in tp1_policy:
+            tp1_target_price = tp1_policy.get("tp1_target_price")
         sltp = self._compute_scalping_sl_tp(
             signal=signal,
             entry_price=entry_price,
