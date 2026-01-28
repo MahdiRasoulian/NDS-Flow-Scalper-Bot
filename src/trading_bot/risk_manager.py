@@ -1114,6 +1114,9 @@ class ScalpingRiskManager:
         if not rr_repair_enabled:
             return None, None, None
         rr_epsilon = float(risk_manager_config.get("RR_EPSILON", 1e-6))
+        rr_target_buffer = float(
+            risk_manager_config.get("RR_REPAIR_TARGET_BUFFER", max(rr_epsilon, 1e-4))
+        )
 
         sl_metrics = calculate_distance_metrics(
             entry_price=entry_price,
@@ -1134,7 +1137,8 @@ class ScalpingRiskManager:
         if rr_before + rr_epsilon >= min_rr_ratio:
             return None, None, None
 
-        desired_tp_distance = sl_distance * min_rr_ratio
+        desired_rr = min_rr_ratio + rr_target_buffer
+        desired_tp_distance = sl_distance * desired_rr
         max_tp_pips = float(
             risk_manager_config.get(
                 "RR_REPAIR_MAX_TP_PIPS",
@@ -1164,7 +1168,15 @@ class ScalpingRiskManager:
             )
 
         decision_notes.append(
-            f"RR_CHECK sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_before:.2f} min_rr={min_rr_ratio:.2f}"
+            "RR_CHECK sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} "
+            "rr={rr_before:.6f} min_rr={min_rr_ratio:.2f} target_rr={target_rr:.4f}"
+            .format(
+                sl_pips=sl_pips,
+                tp_pips=tp_pips,
+                rr_before=rr_before,
+                min_rr_ratio=min_rr_ratio,
+                target_rr=desired_rr,
+            )
         )
 
         if cap_reasons:
@@ -1196,16 +1208,17 @@ class ScalpingRiskManager:
 
         decision_notes.append(
             "RR_REPAIR_TP "
-            f"tp_pips={tp_pips:.1f}->{new_tp_pips:.1f} rr={rr_before:.2f}->{rr_after:.2f} "
+            f"tp_pips={tp_pips:.1f}->{new_tp_pips:.1f} rr={rr_before:.6f}->{rr_after:.6f} "
             f"max_tp_pips={max_tp_pips:.1f} max_tp_atr_mult={max_tp_atr_mult:.2f}"
         )
         self._logger.info(
-            "[NDS][RR_REPAIR] action=TP_ADJUST rr=%.2f->%.2f sl_pips=%.2f tp_pips=%.2f->%.2f",
+            "[NDS][RR_REPAIR] action=TP_ADJUST rr=%.6f->%.6f sl_pips=%.2f tp_pips=%.2f->%.2f target_rr=%.4f",
             rr_before,
             rr_after,
             sl_pips,
             tp_pips,
             new_tp_pips,
+            desired_rr,
         )
         return new_take_profit, "rr_repair", None
 
@@ -1476,6 +1489,33 @@ class ScalpingRiskManager:
                     f"STOP_FAR_POLICY:adjusted_entry_deviation_pips={deviation_pips:.1f}"
                 )
 
+        stop_revalidate_pips = risk_manager_config.get("STOP_REVALIDATE_PIPS")
+        if order_type == "STOP" and stop_revalidate_pips is not None:
+            stop_revalidate_pips = float(stop_revalidate_pips)
+            if deviation_pips > stop_revalidate_pips:
+                decision_notes.append(
+                    f"STOP_REVALIDATE:deviation_pips={deviation_pips:.1f} threshold={stop_revalidate_pips:.1f}"
+                )
+                self._logger.info(
+                    "[NDS][STOP_REVALIDATE] action=REJECT deviation_pips=%.2f threshold=%.2f",
+                    deviation_pips,
+                    stop_revalidate_pips,
+                )
+                return _finalize(
+                    signal=signal,
+                    order_type="NONE",
+                    entry_price=entry_price,
+                    stop_loss=stop_loss or 0.0,
+                    take_profit=take_profit or 0.0,
+                    lot_size=0.0,
+                    risk_amount_usd=0.0,
+                    rr_ratio=0.0,
+                    deviation_pips=deviation_pips,
+                    decision_notes=decision_notes,
+                    is_trade_allowed=False,
+                    reject_reason="Stop entry deviation exceeds revalidation threshold.",
+                )
+
         if order_type == "STOP":
             if signal == "BUY" and entry_price <= ask:
                 decision_notes.append("Stop already triggered; switching to MARKET.")
@@ -1638,6 +1678,14 @@ class ScalpingRiskManager:
             sl_source,
             tp1_source,
         )
+        self._logger.info(
+            "[NDS][RR_VALIDATE] rr_raw=%.8f min_rr=%.4f epsilon=%.6f sl_pips=%.2f tp_pips=%.2f",
+            rr_ratio,
+            float(min_rr_ratio),
+            rr_epsilon,
+            sl_pips,
+            tp_pips,
+        )
 
         # ===============================
         # ✅ FIX: inject last signal context for can_scalp session gating
@@ -1730,6 +1778,14 @@ class ScalpingRiskManager:
                 rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
                 decision_notes.append(
                     f"RR_POSTREPAIR sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_ratio:.2f}"
+                )
+                self._logger.info(
+                    "[NDS][RR_VALIDATE] rr_raw=%.8f min_rr=%.4f epsilon=%.6f sl_pips=%.2f tp_pips=%.2f post_repair=true",
+                    rr_ratio,
+                    float(min_rr_ratio),
+                    rr_epsilon,
+                    sl_pips,
+                    tp_pips,
                 )
             if rr_ratio + rr_epsilon < min_rr_ratio:
                 decision_notes.append(
@@ -1893,8 +1949,16 @@ class ScalpingRiskManager:
         rr_ratio = abs(tp - entry) / sl_distance if sl_distance > 0 else 0
         min_rr_ratio = s.get('MIN_RISK_REWARD', 1.0)
 
-        if rr_ratio < min_rr_ratio:
-            errors.append(f"Risk/Reward ratio ({rr_ratio:.2f}) below minimum ({min_rr_ratio})")
+        rr_epsilon = float(s.get("RR_EPSILON", 1e-6))
+        if rr_ratio + rr_epsilon < min_rr_ratio:
+            errors.append(
+                "Risk/Reward ratio ({rr:.6f}) below minimum ({min_rr:.2f}) "
+                "after epsilon ({eps:.6f}).".format(
+                    rr=rr_ratio,
+                    min_rr=min_rr_ratio,
+                    eps=rr_epsilon,
+                )
+            )
 
         # بررسی با ATR
         if atr_value and atr_value > 0:

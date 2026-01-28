@@ -315,6 +315,7 @@ class MT5Client:
         self.symbol_cache = {}
         self.session_start = None
         self._last_equity_log = None
+        self._disconnecting = False
         
         # متغیرهای مستقیم برای دسترسی راحت‌تر و مقداردهی از بیرون
         self.login = None
@@ -2306,16 +2307,24 @@ class MT5Client:
     
     def disconnect(self):
         """قطع اتصال از MT5"""
+        if self._disconnecting:
+            return
+        self._disconnecting = True
         # 🔥 توقف مانیتور Real-Time
         if self.real_time_monitor:
             self.real_time_monitor.stop()
             self.real_time_monitor = None
-        
-        if self.connected:
-            try:
-                self._mt5_call(mt5.shutdown)
-                self.connected = False
-                self.session_start = None
-                self._logger.info("Disconnected from MT5 (Real-Time monitor stopped)")
-            except Exception as e:
-                self._logger.error(f"Error disconnecting: {e}")
+        if not self.connected:
+            self._logger.info("MT5 already disconnected; skipping shutdown.")
+            self._disconnecting = False
+            return
+
+        try:
+            self._mt5_call(mt5.shutdown)
+            self.connected = False
+            self.session_start = None
+            self._logger.info("Disconnected from MT5 (Real-Time monitor stopped)")
+        except Exception as e:
+            self._logger.error(f"Error disconnecting: {e}")
+        finally:
+            self._disconnecting = False
