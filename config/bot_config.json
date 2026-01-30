@@ -1,7 +1,7 @@
 {
   "bot_name": "NDS Trading Bot Pro",
   "version": "5.2",
-  "ACCOUNT_BALANCE": 1000.00,
+  "ACCOUNT_BALANCE": 742.44,
   "trading_rules": {
     "MIN_CANDLES_BETWEEN_TRADES": 4,
     "MAX_POSITIONS": 5,
@@ -137,7 +137,7 @@
     "OB_MIN_SIZE_MULTIPLIER": 0.2,
     "MIN_SWEEP_PENETRATION_MULTIPLIER": 0.15,
     "MIN_CANDLE_RANGE_MULTIPLIER": 0.6,
-    "MIN_RVOL_SCALPING": 0.35,
+    "MIN_RVOL_SCALPING": 0.02,
     "SMC_MIN_CANDLES": 300,
     "SMC_MAX_FVG_COUNT": 50,
     "SMC_MAX_OB_COUNT": 25,
