@@ -132,6 +132,8 @@ class NDSBot:
         self._latest_pending_orders: List[Dict[str, Any]] = []
         self.position_state_store = PositionStateStore(Path("reports") / "state" / "positions.json")
         self.position_state_store.load()
+        self._shutdown_started = False
+        self._cleanup_done = False
 
     # ----------------------------
     # Helpers
@@ -483,6 +485,11 @@ class NDSBot:
 
     def _maybe_monitor_trades(self, force: bool = False):
         """مانیتورینگ معاملات با throttle برای جلوگیری از فشار"""
+        if self._cleanup_done:
+            return
+        if self.mt5_client is not None and hasattr(self.mt5_client, "connected"):
+            if not self.mt5_client.connected:
+                return
         now = time.time()
         if force or (now - self._last_trade_monitor_ts) >= self._trade_monitor_interval_sec:
             self._last_trade_monitor_ts = now
@@ -1128,14 +1135,27 @@ class NDSBot:
                 return "N/A"
             return f"${value_f:.2f}"
 
-        entry_price_val = result.get("entry_price")
-        stop_loss_val = result.get("stop_loss")
-        take_profit_val = result.get("take_profit")
-        if any(val not in (None, 0, 0.0) for val in (entry_price_val, stop_loss_val, take_profit_val)):
-            print(f"\n💰 پارامترهای ورود:")
-            print(f"   قیمت ورود: {_format_optional_price(entry_price_val)}")
-            print(f"   استاپ لاس: {_format_optional_price(stop_loss_val)}")
-            print(f"   تیک پروفیت: {_format_optional_price(take_profit_val)}")
+        entry_price_val = result.get("entry_level") or result.get("entry_price")
+        entry_model = result.get("entry_model") or result.get("entry_type") or "N/A"
+        entry_context = result.get("entry_context") or (result.get("context") or {}).get("entry_context", {}) or {}
+        tp1_target = entry_context.get("tp1_target_price")
+        tp1_source = entry_context.get("tp1_target_source")
+        if entry_price_val not in (None, 0, 0.0):
+            print("\n🧾 ایده ورود (Analyzer - برنامه‌ریزی اولیه):")
+            print(f"   قیمت ورود پیشنهادی: {_format_optional_price(entry_price_val)}")
+            print(f"   مدل ورود: {entry_model}")
+            if tp1_target:
+                print(f"   هدف TP1 اولیه: {_format_optional_price(tp1_target)} ({tp1_source or 'N/A'})")
+            print("   ℹ️  SL/TP نهایی بعد از RiskManager محاسبه می‌شود.")
+
+        final_entry = result.get("final_entry")
+        final_sl = result.get("final_stop_loss") or result.get("final_sl")
+        final_tp = result.get("final_take_profit") or result.get("final_tp")
+        if any(val not in (None, 0, 0.0) for val in (final_entry, final_sl, final_tp)):
+            print("\n🧮 تصمیم نهایی (RiskManager):")
+            print(f"   قیمت ورود نهایی: {_format_optional_price(final_entry)}")
+            print(f"   استاپ لاس نهایی: {_format_optional_price(final_sl)}")
+            print(f"   تیک پروفیت نهایی: {_format_optional_price(final_tp)}")
 
             rr = result.get("risk_reward_ratio")
             if rr:
@@ -1316,6 +1336,26 @@ class NDSBot:
                 (signal_data.get("context") or {}).get("entry_distance_pips"),
                 (signal_data.get("context") or {}).get("entry_distance_atr"),
             )
+            entry_context = (
+                signal_data.get("entry_context")
+                or (signal_data.get("context") or {}).get("entry_context", {})
+                or {}
+            )
+            planned_entry = signal_data.get("entry_level") or signal_data.get("entry_price")
+            planned_model = signal_data.get("entry_model") or signal_data.get("entry_type") or "N/A"
+            print("\n🧾 ایده ورود (Analyzer - برنامه‌ریزی اولیه):")
+            if planned_entry not in (None, 0, 0.0):
+                print(f"   قیمت ورود پیشنهادی: {planned_entry:.2f}")
+            print(f"   مدل ورود: {planned_model}")
+            if entry_context.get("tp1_target_price"):
+                print(
+                    "   هدف TP1 اولیه: %.2f (%s)"
+                    % (
+                        float(entry_context.get("tp1_target_price")),
+                        entry_context.get("tp1_target_source") or "N/A",
+                    )
+                )
+            print("   ℹ️  SL/TP نهایی بعد از RiskManager محاسبه می‌شود.")
             # ------------------------------------------------------------------
 
             finalized = self.risk_manager.finalize_order(
@@ -1338,6 +1378,15 @@ class NDSBot:
                 finalized.lot_size,
                 finalized.reject_reason,
                 finalized.decision_notes[-3:],
+            )
+            print(
+                "🧮 تصمیم نهایی (RiskManager): entry=%.2f sl=%.2f tp=%.2f rr=%.2f"
+                % (
+                    float(finalized.entry_price),
+                    float(finalized.stop_loss),
+                    float(finalized.take_profit),
+                    float(finalized.rr_ratio),
+                )
             )
             # ------------------------------------------------------------------
 
@@ -2028,6 +2077,10 @@ class NDSBot:
     # ----------------------------
     def cleanup(self):
         """تمیزکاری منابع و قطع اتصال"""
+        if self._cleanup_done:
+            logger.info("🧹 cleanup already completed; skipping duplicate call.")
+            return
+        self._shutdown_started = True
         logger.info("🧹 در حال ذخیره وضعیت و تمیزکاری...")
         print("\n🧹 در حال ذخیره وضعیت...")
 
@@ -2038,7 +2091,7 @@ class NDSBot:
             pass
 
         try:
-            if self.mt5_client:
+            if self.mt5_client and getattr(self.mt5_client, "connected", False):
                 logger.info("قطع اتصال MT5...")
                 self.mt5_client.disconnect()
                 logger.info("✅ اتصال MT5 قطع شد")
@@ -2046,6 +2099,8 @@ class NDSBot:
         except Exception as e:
             logger.error(f"⚠️ خطا در قطع اتصال MT5: {e}", exc_info=True)
             print(f"⚠️ خطا در قطع اتصال MT5: {e}")
+        finally:
+            self._cleanup_done = True
 
     def print_summary(self):
         """چاپ گزارش نهایی عملکرد"""
@@ -2180,6 +2235,10 @@ class NDSBot:
         update_config_interactive()
 
     def _execute_shutdown_procedure(self):
+        if self._shutdown_started and self._cleanup_done:
+            logger.info("🧹 shutdown already completed; skipping duplicate shutdown procedure.")
+            return
+        self._shutdown_started = True
         logger.info("🧹 شروع فرآیند تمیزکاری نهایی")
 
         # ابتدا summary (هنوز اتصال برقرار است)
