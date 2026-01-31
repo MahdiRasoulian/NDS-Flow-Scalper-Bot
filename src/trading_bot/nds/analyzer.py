@@ -8,6 +8,7 @@ Config keys (whitelisted via ANALYSIS_CONFIG_KEYS):
 - MIN_RVOL_SCALPING, MIN_SESSION_WEIGHT, MIN_STRUCTURE_SCORE
 - DEFAULT_TIMEFRAME, MIN_RR, ATR_BUFFER_MULTIPLIER
 - ADX_OVERRIDE_THRESHOLD, ADX_OVERRIDE_PERSISTENCE_BARS, ADX_OVERRIDE_REQUIRE_BOS
+- STRICT_QUALITY_MODE, FLOW_REQUIRES_BASE_SIGNAL
 """
 # CHANGELOG:
 # - Added directional bias computation + counter-trend gate (with reversal confirmation) to block signals
@@ -170,6 +171,12 @@ class GoldNDSAnalyzer:
             'MIN_RVOL_SCALPING': float,
             'MIN_SESSION_WEIGHT': float,
             'MIN_STRUCTURE_SCORE': float,
+            'STRICT_QUALITY_MODE': bool,
+            'FLOW_REQUIRES_BASE_SIGNAL': bool,
+            'COUNTERTREND_VERY_LOW_RVOL_MAX': float,
+            'COUNTERTREND_LOW_RVOL_EXCEPTIONAL_STRUCTURE_SCORE': float,
+            'COUNTERTREND_LOW_RVOL_CONF_PENALTY': float,
+            'INTEGRITY_LOW_LIQUIDITY_PENALTY_MULT': float,
             'DEFAULT_TIMEFRAME': str,
             'MIN_RR': float,
             'ATR_BUFFER_MULTIPLIER': float,
@@ -747,6 +754,11 @@ class GoldNDSAnalyzer:
                 signal,
                 volatility_state,
             )
+            strict_quality_mode = bool(self.GOLD_SETTINGS.get("STRICT_QUALITY_MODE", True))
+            self._append_reason(
+                reasons,
+                f"strict_quality_mode={'true' if strict_quality_mode else 'false'}",
+            )
 
             result_payload = self._build_initial_result(
                 signal=signal,
@@ -864,7 +876,9 @@ class GoldNDSAnalyzer:
 
             if low_liquidity and entry_idea.get("signal") in {"BUY", "SELL"}:
                 exceptional_threshold = float(self.GOLD_SETTINGS.get("INTEGRITY_EXCEPTIONAL_SETUP_SCORE", 0.78))
-                force_none = bool(self.GOLD_SETTINGS.get("INTEGRITY_LOW_LIQUIDITY_FORCE_NONE", True))
+                force_none_cfg = bool(self.GOLD_SETTINGS.get("INTEGRITY_LOW_LIQUIDITY_FORCE_NONE", True))
+                force_none = force_none_cfg if strict_quality_mode else False
+                penalty_mult = float(self.GOLD_SETTINGS.get("INTEGRITY_LOW_LIQUIDITY_PENALTY_MULT", 0.7))
                 setup_score = None
                 if isinstance(entry_idea.get("zone"), dict):
                     setup_score = entry_idea["zone"].get("setup_score")
@@ -882,12 +896,15 @@ class GoldNDSAnalyzer:
                         reasons,
                         f"Low liquidity gate (rvol={float(volume_analysis.get('rvol', 0.0)):.2f}, session_activity={session_activity})",
                     )
+                    self._append_reason(reasons, "strict_quality_block:integrity_low_liquidity")
                 else:
-                    confidence = round(float(confidence) * 0.7, 1)
+                    confidence = round(float(confidence) * penalty_mult, 1)
                     self._append_reason(
                         reasons,
                         f"Low liquidity penalty (setup_score={setup_score:.2f} >= {exceptional_threshold:.2f})",
                     )
+                    if not strict_quality_mode:
+                        self._append_reason(reasons, "integrity_low_liquidity_penalty")
             result_payload["confidence"] = confidence
 
             entry_price = entry_idea.get("entry_level")
@@ -906,15 +923,30 @@ class GoldNDSAnalyzer:
             result_payload["entry_price"] = entry_price
 
             if signal in {"BUY", "SELL"} and entry_price is not None:
+                min_rvol = float(self.GOLD_SETTINGS.get("MIN_RVOL_SCALPING", 0.35))
+                adx_threshold = float(self.GOLD_SETTINGS.get("ADX_THRESHOLD_WEAK", 20.0))
+                market_status = str(volume_analysis.get("market_status", "") or "").upper()
+                liquidity_ok = market_status not in {"CLOSED", "HALTED"} and float(volume_analysis.get("rvol", 1.0)) >= min_rvol
+                trend_ok = float(analysis_signal_context.get("adx", 0.0)) >= adx_threshold
+                bias = str(analysis_signal_context.get("bias", "") or "")
+                reversal_ok = bool(analysis_signal_context.get("reversal_ok"))
+                counter_trend = (bias == "BULLISH" and signal == "SELL") or (bias == "BEARISH" and signal == "BUY")
+                entry_context = dict(entry_context)
+                entry_context["counter_trend"] = counter_trend
+                entry_context["reversal_ok"] = reversal_ok
+                entry_context["liquidity_ok"] = liquidity_ok
+                entry_context["trend_ok"] = trend_ok
                 tp1_target = self._resolve_opposing_structure_target(
                     signal=signal,
                     entry_price=float(entry_price),
                     fvgs=fvgs,
                     order_blocks=order_blocks,
+                    signal_context=analysis_signal_context,
                 )
-                entry_context = dict(entry_context)
                 entry_context["tp1_target_price"] = tp1_target.get("price")
                 entry_context["tp1_target_source"] = tp1_target.get("source")
+                entry_context["tp1_target_zone_type"] = tp1_target.get("zone_type")
+                entry_context["tp1_target_zone_direction"] = tp1_target.get("zone_direction")
                 entry_context["tp1_target_reason"] = tp1_target.get("reason")
 
             entry_signal_context = {
@@ -1022,26 +1054,52 @@ class GoldNDSAnalyzer:
         entry_price: float,
         fvgs: List[FVG],
         order_blocks: List[OrderBlock],
+        signal_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Find nearest opposing structure level for dynamic TP1 planning."""
         if signal not in {"BUY", "SELL"}:
-            return {"price": None, "source": None, "reason": "no_signal"}
+            return {
+                "price": None,
+                "source": None,
+                "zone_type": None,
+                "zone_direction": None,
+                "reason": "no_signal",
+            }
         if entry_price is None:
-            return {"price": None, "source": None, "reason": "no_entry"}
+            return {
+                "price": None,
+                "source": None,
+                "zone_type": None,
+                "zone_direction": None,
+                "reason": "no_entry",
+            }
 
-        candidates: List[Tuple[float, str]] = []
+        signal_context = signal_context or {}
+        bias = str(signal_context.get("bias", "") or "")
+        trend = str(signal_context.get("trend", "") or "")
+        reversal_ok = bool(signal_context.get("reversal_ok"))
+        counter_trend = (bias == "BULLISH" and signal == "SELL") or (bias == "BEARISH" and signal == "BUY")
+
+        candidates: List[Tuple[float, str, str, str]] = []
+        blocked_ifvg = False
 
         for fvg in fvgs:
             if getattr(fvg, "filled", False) or getattr(fvg, "stale", False):
                 continue
             if signal == "BUY" and fvg.type == FVGType.BEARISH:
+                if counter_trend and not reversal_ok and trend == MarketTrend.DOWNTREND.value:
+                    blocked_ifvg = True
+                    continue
                 target = float(fvg.bottom)
                 if target > entry_price:
-                    candidates.append((target, "BEARISH_FVG"))
+                    candidates.append((target, "BEARISH_FVG", "IFVG", "BEARISH"))
             elif signal == "SELL" and fvg.type == FVGType.BULLISH:
+                if counter_trend and not reversal_ok and trend == MarketTrend.UPTREND.value:
+                    blocked_ifvg = True
+                    continue
                 target = float(fvg.top)
                 if target < entry_price:
-                    candidates.append((target, "BULLISH_FVG"))
+                    candidates.append((target, "BULLISH_FVG", "IFVG", "BULLISH"))
 
         for ob in order_blocks:
             if getattr(ob, "stale", False):
@@ -1049,21 +1107,41 @@ class GoldNDSAnalyzer:
             if signal == "BUY" and ob.type == "BEARISH_OB":
                 target = float(ob.low)
                 if target > entry_price:
-                    candidates.append((target, "BEARISH_OB"))
+                    candidates.append((target, "BEARISH_OB", "OB", "BEARISH"))
             elif signal == "SELL" and ob.type == "BULLISH_OB":
                 target = float(ob.high)
                 if target < entry_price:
-                    candidates.append((target, "BULLISH_OB"))
+                    candidates.append((target, "BULLISH_OB", "OB", "BULLISH"))
 
         if not candidates:
-            return {"price": None, "source": None, "reason": "no_opposing_structure"}
+            if blocked_ifvg and counter_trend and not reversal_ok:
+                return {
+                    "price": None,
+                    "source": None,
+                    "zone_type": None,
+                    "zone_direction": None,
+                    "reason": "aligned_ifvg_blocked_no_reversal",
+                }
+            return {
+                "price": None,
+                "source": None,
+                "zone_type": None,
+                "zone_direction": None,
+                "reason": "no_opposing_structure",
+            }
 
         if signal == "BUY":
-            target_price, source = min(candidates, key=lambda c: c[0])
+            target_price, source, zone_type, zone_direction = min(candidates, key=lambda c: c[0])
         else:
-            target_price, source = max(candidates, key=lambda c: c[0])
+            target_price, source, zone_type, zone_direction = max(candidates, key=lambda c: c[0])
 
-        return {"price": float(target_price), "source": source, "reason": "nearest_opposing_structure"}
+        return {
+            "price": float(target_price),
+            "source": source,
+            "zone_type": zone_type,
+            "zone_direction": zone_direction,
+            "reason": "nearest_opposing_structure",
+        }
 
     def _score_flow_setup(
         self,
@@ -1393,33 +1471,131 @@ class GoldNDSAnalyzer:
         order_blocks: List[OrderBlock],
     ) -> Dict[str, Any]:
         """Single authoritative entry idea selector for Flow-tier logic."""
+        settings = self.GOLD_SETTINGS
+        strict_quality_mode = bool(settings.get("STRICT_QUALITY_MODE", True))
+        flow_requires_base_signal = bool(settings.get("FLOW_REQUIRES_BASE_SIGNAL", strict_quality_mode))
+        if strict_quality_mode:
+            flow_requires_base_signal = True
         base_signal = str(market_metrics.get("signal", "NONE") or "NONE")
         if base_signal not in {"BUY", "SELL"}:
-            override_entry = self._select_flow_entry_override(
-                structure=structure,
-                market_metrics=market_metrics,
-                session_analysis=session_analysis,
-                signal_context=signal_context,
-                volume_analysis=volume_analysis,
-                scalping_mode=scalping_mode,
+            if flow_requires_base_signal:
+                override_entry = self._select_flow_entry_override(
+                    structure=structure,
+                    market_metrics=market_metrics,
+                    session_analysis=session_analysis,
+                    signal_context=signal_context,
+                    volume_analysis=volume_analysis,
+                    scalping_mode=scalping_mode,
+                )
+                if override_entry.get("signal") in {"BUY", "SELL"}:
+                    return override_entry
+                self._log_info(
+                    "[NDS][FLOW_DECISION] tier=NONE type=NONE allowed=false reject=BASE_SIGNAL_NONE reason=no_base_signal",
+                )
+                return {
+                    "signal": "NONE",
+                    "tier": "NONE",
+                    "entry_type": "NONE",
+                    "entry_model": "NONE",
+                    "entry_level": None,
+                    "zone": None,
+                    "confidence": 0.0,
+                    "reason": "no_base_signal",
+                    "reject_reason": "BASE_SIGNAL_NONE",
+                    "metrics": {},
+                }
+
+            promoted = []
+            for side in ("BUY", "SELL"):
+                entry = self._select_flow_entry(
+                    signal=side,
+                    structure=structure,
+                    current_price=float(market_metrics.get("current_price", 0.0) or 0.0),
+                    atr_value=float(market_metrics.get("atr_short") or market_metrics.get("atr") or 0.0),
+                    adx_value=float(market_metrics.get("adx") or 0.0),
+                    session_analysis=session_analysis,
+                    volume_analysis=volume_analysis,
+                    scalping_mode=scalping_mode,
+                    signal_context=signal_context,
+                )
+                if entry.get("signal") in {"BUY", "SELL"}:
+                    promoted.append(entry)
+
+            if len(promoted) != 1:
+                self._log_info(
+                    "[NDS][FLOW_PROMOTION] allow=false reason=conflict_or_none count=%s",
+                    len(promoted),
+                )
+                return {
+                    "signal": "NONE",
+                    "tier": "NONE",
+                    "entry_type": "NONE",
+                    "entry_model": "NONE",
+                    "entry_level": None,
+                    "zone": None,
+                    "confidence": 0.0,
+                    "reason": "flow_promotion_conflict",
+                    "reject_reason": "BASE_SIGNAL_NONE",
+                    "metrics": {},
+                }
+
+            candidate = promoted[0]
+            bias = str(signal_context.get("bias", "") or "")
+            reversal_ok = bool(signal_context.get("reversal_ok"))
+            counter_trend = (bias == "BULLISH" and candidate.get("signal") == "SELL") or (
+                bias == "BEARISH" and candidate.get("signal") == "BUY"
             )
-            if override_entry.get("signal") in {"BUY", "SELL"}:
-                return override_entry
+            market_status = str(volume_analysis.get("market_status", "") or "").upper()
+            min_rvol = float(settings.get("MIN_RVOL_SCALPING", 0.35))
+            liquidity_ok = (
+                market_status not in {"CLOSED", "HALTED"}
+                and float(volume_analysis.get("rvol", 1.0)) >= min_rvol
+                and bool(getattr(session_analysis, "is_active_session", True))
+            )
+
+            if counter_trend and not reversal_ok:
+                self._log_info(
+                    "[NDS][FLOW_PROMOTION] allow=false reason=counter_trend_without_reversal",
+                )
+                return {
+                    "signal": "NONE",
+                    "tier": "NONE",
+                    "entry_type": "NONE",
+                    "entry_model": "NONE",
+                    "entry_level": None,
+                    "zone": None,
+                    "confidence": 0.0,
+                    "reason": "flow_promotion_counter_trend_block",
+                    "reject_reason": "BASE_SIGNAL_NONE",
+                    "metrics": {},
+                }
+
+            if not liquidity_ok:
+                self._log_info(
+                    "[NDS][FLOW_PROMOTION] allow=false reason=liquidity_block",
+                )
+                return {
+                    "signal": "NONE",
+                    "tier": "NONE",
+                    "entry_type": "NONE",
+                    "entry_model": "NONE",
+                    "entry_level": None,
+                    "zone": None,
+                    "confidence": 0.0,
+                    "reason": "flow_promotion_liquidity_block",
+                    "reject_reason": "BASE_SIGNAL_NONE",
+                    "metrics": {},
+                }
+
+            candidate.setdefault("metrics", {})
+            candidate["metrics"]["flow_promoted_base_signal"] = True
+            candidate["reason"] = f"{candidate.get('reason', 'flow_promoted_base_signal')} | flow_promoted_base_signal"
             self._log_info(
-                "[NDS][FLOW_DECISION] tier=NONE type=NONE allowed=false reject=BASE_SIGNAL_NONE reason=no_base_signal",
+                "[NDS][FLOW_PROMOTION] allow=true signal=%s tier=%s reason=flow_promoted_base_signal",
+                candidate.get("signal"),
+                candidate.get("tier"),
             )
-            return {
-                "signal": "NONE",
-                "tier": "NONE",
-                "entry_type": "NONE",
-                "entry_model": "NONE",
-                "entry_level": None,
-                "zone": None,
-                "confidence": 0.0,
-                "reason": "no_base_signal",
-                "reject_reason": "BASE_SIGNAL_NONE",
-                "metrics": {},
-            }
+            return candidate
 
         flow_entry = self._select_flow_entry(
             signal=base_signal,
@@ -1519,12 +1695,50 @@ class GoldNDSAnalyzer:
             counter_trend = (bias == "BULLISH" and side == "SELL") or (bias == "BEARISH" and side == "BUY")
             required_setup = min_setup + (ct_bonus if (counter_trend and strong_trend and not reversal_ok) else 0.0)
 
+            market_status = str(volume_analysis.get("market_status", "") or "").upper()
+            min_rvol = float(settings.get("MIN_RVOL_SCALPING", 0.35))
+            very_low_rvol = float(settings.get("INTEGRITY_LOW_LIQUIDITY_RVOL_MAX", 0.55))
+            liquidity_ok = market_status not in {"CLOSED", "HALTED"} and float(volume_analysis.get("rvol", 1.0)) >= min_rvol
+            trend_ok = float(signal_context.get("adx", 0.0)) >= float(settings.get("ADX_THRESHOLD_WEAK", 20.0))
+            override_bypass = []
+            if not liquidity_ok:
+                override_bypass.append("liquidity_ok")
+            if not trend_ok:
+                override_bypass.append("trend_ok")
+            if not reversal_ok:
+                override_bypass.append("reversal_ok")
+
+            if not liquidity_ok and not reversal_ok:
+                self._log_info(
+                    "[NDS][FLOW_OVERRIDE] blocked reason=liquidity_reversal_gate side=%s rvol=%.2f market_status=%s",
+                    side,
+                    float(volume_analysis.get("rvol", 0.0)),
+                    market_status,
+                )
+                continue
+            if counter_trend and not reversal_ok and float(volume_analysis.get("rvol", 0.0)) <= very_low_rvol:
+                self._log_info(
+                    "[NDS][FLOW_OVERRIDE] blocked reason=counter_trend_low_rvol side=%s rvol=%.2f",
+                    side,
+                    float(volume_analysis.get("rvol", 0.0)),
+                )
+                continue
+
             if setup_score < required_setup or entry_conf < min_conf:
                 continue
 
             entry.setdefault("metrics", {})
             entry["metrics"]["override"] = True
             entry["metrics"]["override_reason"] = "flow_override"
+            entry["metrics"]["override_gates"] = {
+                "liquidity_ok": liquidity_ok,
+                "trend_ok": trend_ok,
+                "reversal_ok": reversal_ok,
+                "counter_trend": counter_trend,
+                "strong_trend": strong_trend,
+                "rvol": float(volume_analysis.get("rvol", 0.0)),
+            }
+            entry["metrics"]["override_bypassed_gates"] = override_bypass
             entry["reason"] = f"{entry.get('reason', 'flow_override')} | override"
             candidates.append(entry)
 
@@ -1550,11 +1764,12 @@ class GoldNDSAnalyzer:
         )
         best = candidates[0]
         self._log_info(
-            "[NDS][FLOW_OVERRIDE] signal=%s setup_score=%.2f conf=%.2f reason=%s",
+            "[NDS][FLOW_OVERRIDE] signal=%s setup_score=%.2f conf=%.2f reason=%s bypassed_gates=%s",
             best.get("signal"),
             float((best.get("zone") or {}).get("setup_score", 0.0) or 0.0),
             float(best.get("confidence", 0.0) or 0.0),
             best.get("reason"),
+            (best.get("metrics") or {}).get("override_bypassed_gates"),
         )
         return best
 
@@ -3483,6 +3698,11 @@ class GoldNDSAnalyzer:
         """
         اعمال فیلترهای نهایی با اتصال به تنظیمات مرکزی
         """
+        # NOTE (Quality RCA): Trades that used to pass now hit ANALYZER_NONE mainly due to
+        # (1) strict low-liquidity integrity blocking, (2) counter-trend + very-low RVOL hard blocks,
+        # (3) override hardening against liquidity+reversal bypass, and (4) base-signal coupling
+        # that stops Flow tiers from promoting signals. STRICT_QUALITY_MODE controls the hard/soft
+        # behavior of these gates while preserving safety invariants.
         original_signal = analysis_result.get('signal', 'NONE')
         reasons = analysis_result.get('reasons', [])
 
@@ -3649,6 +3869,49 @@ class GoldNDSAnalyzer:
                         (bias == "BULLISH" and analysis_result.get("signal") == "SELL")
                         or (bias == "BEARISH" and analysis_result.get("signal") == "BUY")
                     )
+                    current_rvol = float(analysis_result.get("market_metrics", {}).get("current_rvol", 1.0))
+                    very_low_rvol = float(
+                        settings.get(
+                            "COUNTERTREND_VERY_LOW_RVOL_MAX",
+                            settings.get("INTEGRITY_LOW_LIQUIDITY_RVOL_MAX", 0.55),
+                        )
+                    )
+                    strict_quality_mode = bool(settings.get("STRICT_QUALITY_MODE", True))
+                    exceptional_structure = float(
+                        settings.get("COUNTERTREND_LOW_RVOL_EXCEPTIONAL_STRUCTURE_SCORE", 85.0)
+                    )
+                    conf_penalty = float(settings.get("COUNTERTREND_LOW_RVOL_CONF_PENALTY", 0.85))
+                    if counter_signal and not reversal_ok and current_rvol <= very_low_rvol:
+                        structure_score = float(structure.get("structure_score", 0.0))
+                        if not strict_quality_mode and structure_score >= exceptional_structure:
+                            analysis_result["confidence"] = round(
+                                float(analysis_result.get("confidence", 0.0)) * conf_penalty,
+                                1,
+                            )
+                            self._append_reason(
+                                reasons,
+                                "countertrend_soft_allowed",
+                            )
+                            self._log_debug(
+                                "[NDS][FILTER] counter-trend low RVOL soft-allowed rvol=%.2f threshold=%.2f score=%.1f",
+                                current_rvol,
+                                very_low_rvol,
+                                structure_score,
+                            )
+                        else:
+                            analysis_result['signal'] = 'NONE'
+                            self._append_reason(
+                                reasons,
+                                f"Counter-trend blocked: very low RVOL ({current_rvol:.2f} <= {very_low_rvol:.2f})",
+                            )
+                            if strict_quality_mode:
+                                self._append_reason(reasons, "strict_quality_block:countertrend_low_rvol")
+                            self._log_debug(
+                                "[NDS][FILTER] counter-trend low RVOL blocked rvol=%.2f threshold=%.2f",
+                                current_rvol,
+                                very_low_rvol,
+                            )
+                            counter_signal = False
                     if counter_signal and not reversal_ok:
                         analysis_result['signal'] = 'NONE'
                         self._append_reason(
