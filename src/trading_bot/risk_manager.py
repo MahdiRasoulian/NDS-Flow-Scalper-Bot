@@ -291,6 +291,8 @@ class ScalpingRiskManager:
                 'RR_REPAIR_MAX_TP_ATR_MULT': 'RR_REPAIR_MAX_TP_ATR_MULT',
                 'RR_REPAIR_MODE': 'RR_REPAIR_MODE',
                 'RR_REPAIR_TP1_CAP_PIPS': 'RR_REPAIR_TP1_CAP_PIPS',
+                'SCALP_RR_MODE': 'SCALP_RR_MODE',
+                'SCALP_TP1_ONLY_MIN_RR': 'SCALP_TP1_ONLY_MIN_RR',
                 'RR_EPSILON': 'RR_EPSILON',
                 'POSITION_TIMEOUT_MINUTES': 'POSITION_TIMEOUT_MINUTES'
             },
@@ -1870,13 +1872,46 @@ class ScalpingRiskManager:
         tp2_distance = float(tp2_metrics.get("dist_price") or 0.0)
         tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
         rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
-        rr_ratio_tp2 = tp2_distance / sl_distance if sl_distance > 0 and tp2_distance > 0 else None
+        tp2_pips_target = tp2_pips
+        rr_ratio_tp2 = None
+        if sl_distance > 0 and tp2_distance > 0:
+            rr_ratio_tp2 = tp2_distance / sl_distance
+        elif sl_pips > 0 and tp2_pips_target > 0:
+            rr_ratio_tp2 = tp2_pips_target / sl_pips
+
+        scalping_mode = bool(analysis_payload.get("scalping_mode", True))
+        trail_after_tp1 = bool(self.settings.get("FLOW_TRAIL_AFTER_TP1", True))
+        preserve_tp1 = bool(self.settings.get("SCALP_PRESERVE_TP1", False))
+        if counter_trend and not reversal_ok:
+            preserve_tp1 = True
+        rr_mode_setting = str(risk_manager_config.get("SCALP_RR_MODE", "AUTO") or "AUTO").upper()
+        rr_validate_mode = "TP1"
+        if scalping_mode:
+            if rr_mode_setting == "TP2_ONLY":
+                rr_validate_mode = "TP2_ONLY"
+            elif rr_mode_setting == "TP1":
+                rr_validate_mode = "TP1"
+            elif preserve_tp1:
+                rr_validate_mode = "TP2_ONLY"
+
         decision_notes.append(
-            f"RR_PRECHECK sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_ratio:.2f}"
+            "RR_CONTEXT mode=SCALP tp1_pips={tp1_pips:.1f} tp2_pips={tp2_pips:.1f} rr_tp1={rr_tp1:.2f} "
+            "rr_tp2={rr_tp2} rr_mode={rr_mode} tp1_sacred={tp1_sacred} trail_after_tp1={trail}".format(
+                tp1_pips=tp_pips,
+                tp2_pips=tp2_pips_target,
+                rr_tp1=rr_ratio,
+                rr_tp2=f"{float(rr_ratio_tp2):.2f}" if rr_ratio_tp2 is not None else "N/A",
+                rr_mode=rr_validate_mode,
+                tp1_sacred=preserve_tp1,
+                trail=trail_after_tp1,
+            )
+        )
+        decision_notes.append(
+            f"RR_PRECHECK sl_pips={sl_pips:.1f} tp1_pips={tp_pips:.1f} rr_tp1={rr_ratio:.2f}"
         )
         if rr_ratio_tp2 is not None:
             decision_notes.append(
-                f"RR_TP2 sl_pips={sl_pips:.1f} tp2_pips={tp2_pips:.1f} rr_tp2={rr_ratio_tp2:.2f}"
+                f"RR_TP2 sl_pips={sl_pips:.1f} tp2_pips={tp2_pips_target:.1f} rr_tp2={rr_ratio_tp2:.2f}"
             )
         self._logger.info(
             "[NDS][RR_METRICS] sl_pips=%.2f tp_pips=%.2f rr=%.2f sl_src=%s tp_src=%s",
@@ -1890,16 +1925,19 @@ class ScalpingRiskManager:
             self._logger.info(
                 "[NDS][RR_METRICS_TP2] sl_pips=%.2f tp2_pips=%.2f rr=%.2f",
                 sl_pips,
-                tp2_pips,
+                tp2_pips_target,
                 rr_ratio_tp2,
             )
+        rr_tp2_display = f"{float(rr_ratio_tp2):.2f}" if rr_ratio_tp2 is not None else "N/A"
         self._logger.info(
-            "[NDS][RR_VALIDATE] rr_raw=%.8f min_rr=%.4f epsilon=%.6f sl_pips=%.2f tp_pips=%.2f",
-            rr_ratio,
-            float(min_rr_ratio),
-            rr_epsilon,
-            sl_pips,
+            "[NDS][RR_CONTEXT] mode=%s tp1_pips=%.2f tp2_pips=%.2f rr_tp1=%.2f rr_tp2=%s tp1_sacred=%s trail_after_tp1=%s",
+            rr_validate_mode,
             tp_pips,
+            tp2_pips_target,
+            rr_ratio,
+            rr_tp2_display,
+            preserve_tp1,
+            trail_after_tp1,
         )
 
         # ===============================
@@ -1954,18 +1992,96 @@ class ScalpingRiskManager:
 
         rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
         rr_repair_mode = str(risk_manager_config.get("RR_REPAIR_MODE", "LEGACY") or "LEGACY").upper()
-        preserve_tp1 = bool(self.settings.get("SCALP_PRESERVE_TP1", False))
-        if counter_trend and not reversal_ok:
-            preserve_tp1 = True
         if preserve_tp1 and rr_repair_mode == "LEGACY":
             rr_repair_mode = "TP2_ONLY"
 
-        if rr_ratio + rr_epsilon < min_rr_ratio:
+        rr_tp1_only_min = float(risk_manager_config.get("SCALP_TP1_ONLY_MIN_RR", 0.4))
+        tp2_available = tp2_price is not None or (trail_after_tp1 and tp2_pips_target > 0)
+        rr_eval = rr_ratio
+        if rr_validate_mode == "TP2_ONLY":
+            if not tp2_available:
+                decision_notes.append(
+                    f"RR_TP1_ONLY min_rr={rr_tp1_only_min:.2f} tp2_missing=true"
+                )
+                if rr_ratio + rr_epsilon < rr_tp1_only_min:
+                    return _finalize(
+                        signal=signal,
+                        order_type='NONE',
+                        entry_price=entry_price,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        lot_size=0.0,
+                        risk_amount_usd=0.0,
+                        rr_ratio=rr_ratio,
+                        deviation_pips=deviation_pips,
+                        decision_notes=decision_notes,
+                        is_trade_allowed=False,
+                        reject_reason="TP2 required for RR-min under TP1-scaling policy.",
+                    )
+            else:
+                rr_eval = rr_ratio_tp2 if rr_ratio_tp2 is not None else rr_ratio
+
+        self._logger.info(
+            "[NDS][RR_VALIDATE] scope=%s rr_raw=%.8f min_rr=%.4f epsilon=%.6f sl_pips=%.2f tp_pips=%.2f",
+            rr_validate_mode,
+            rr_eval,
+            float(min_rr_ratio),
+            rr_epsilon,
+            sl_pips,
+            tp_pips,
+        )
+
+        if rr_eval + rr_epsilon < min_rr_ratio:
             if rr_repair_mode == "OFF":
                 decision_notes.append("RR_REPAIR_SKIPPED mode=OFF")
             elif rr_repair_mode == "TP2_ONLY":
                 if tp2_price is None:
-                    decision_notes.append("RR_REPAIR_TP2_SKIP tp2_missing")
+                    if trail_after_tp1 and tp2_pips_target > 0 and rr_ratio_tp2 is not None:
+                        rr_target_buffer = float(
+                            risk_manager_config.get("RR_REPAIR_TARGET_BUFFER", max(rr_epsilon, 1e-4))
+                        )
+                        desired_rr = min_rr_ratio + rr_target_buffer
+                        desired_tp2_pips = desired_rr * sl_pips
+                        max_tp_pips = float(
+                            risk_manager_config.get(
+                                "RR_REPAIR_MAX_TP_PIPS",
+                                max(tp_pips, float(self.settings.get("TP2_PIPS", tp_pips))),
+                            )
+                        )
+                        cap_reasons = []
+                        if desired_tp2_pips > max_tp_pips:
+                            cap_reasons.append(
+                                f"tp_pips_cap {desired_tp2_pips:.1f}>{max_tp_pips:.1f}"
+                            )
+                        if cap_reasons:
+                            decision_notes.append(
+                                f"RR_REPAIR_TP2_REJECT caps_exceeded={'|'.join(cap_reasons)}"
+                            )
+                            return _finalize(
+                                signal=signal,
+                                order_type='NONE',
+                                entry_price=entry_price,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                lot_size=0.0,
+                                risk_amount_usd=0.0,
+                                rr_ratio=rr_eval,
+                                deviation_pips=deviation_pips,
+                                decision_notes=decision_notes,
+                                is_trade_allowed=False,
+                                reject_reason="TP2 cap exceeded for RR repair.",
+                            )
+                        tp2_pips_target = desired_tp2_pips
+                        rr_ratio_tp2 = desired_rr
+                        rr_eval = desired_rr
+                        decision_notes.append(
+                            "RR_REPAIR_TP2 trail_after_tp1=true tp2_pips_target={:.1f} rr_tp2={:.2f}".format(
+                                tp2_pips_target,
+                                desired_rr,
+                            )
+                        )
+                    else:
+                        decision_notes.append("RR_REPAIR_TP2_SKIP tp2_missing")
                 else:
                     repaired_tp2, repair_source, repair_reject = self._attempt_rr_repair_tp2(
                         signal=signal,
@@ -2004,6 +2120,7 @@ class ScalpingRiskManager:
                         tp2_distance = float(tp2_metrics.get("dist_price") or 0.0)
                         tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
                         rr_ratio_tp2 = tp2_distance / sl_distance if sl_distance > 0 else None
+                        rr_eval = rr_ratio_tp2 if rr_ratio_tp2 is not None else rr_eval
                         decision_notes.append(
                             f"RR_TP2_POSTREPAIR tp2_pips={tp2_pips:.1f} rr_tp2={float(rr_ratio_tp2 or 0.0):.2f}"
                         )
@@ -2047,12 +2164,14 @@ class ScalpingRiskManager:
                     tp_distance = float(tp_metrics.get("dist_price") or 0.0)
                     tp_pips = float(tp_metrics.get("dist_pips") or 0.0)
                     rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0.0
+                    rr_eval = rr_ratio
                     decision_notes.append(
                         f"RR_POSTREPAIR sl_pips={sl_pips:.1f} tp_pips={tp_pips:.1f} rr={rr_ratio:.2f}"
                     )
                     self._logger.info(
-                        "[NDS][RR_VALIDATE] rr_raw=%.8f min_rr=%.4f epsilon=%.6f sl_pips=%.2f tp_pips=%.2f post_repair=true",
-                        rr_ratio,
+                        "[NDS][RR_VALIDATE] scope=%s rr_raw=%.8f min_rr=%.4f epsilon=%.6f sl_pips=%.2f tp_pips=%.2f post_repair=true",
+                        rr_validate_mode,
+                        rr_eval,
                         float(min_rr_ratio),
                         rr_epsilon,
                         sl_pips,
@@ -2060,7 +2179,7 @@ class ScalpingRiskManager:
                     )
 
             if rr_repair_mode == "TP2_ONLY":
-                rr_eval = rr_ratio_tp2 if rr_ratio_tp2 is not None else rr_ratio
+                rr_eval = rr_ratio_tp2 if rr_ratio_tp2 is not None else rr_eval
             else:
                 rr_eval = rr_ratio
 
@@ -2082,6 +2201,8 @@ class ScalpingRiskManager:
                     is_trade_allowed=False,
                     reject_reason="RR ratio below minimum.",
                 )
+
+        rr_ratio = rr_eval
 
         account_equity = config.get('ACCOUNT_BALANCE')
         max_risk_usd = risk_settings.get('RISK_AMOUNT_USD')

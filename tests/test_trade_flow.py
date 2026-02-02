@@ -1,6 +1,6 @@
 from config.settings import config
 from src.trading_bot.bot import NDSBot
-from src.trading_bot.nds.models import LivePriceSnapshot
+from src.trading_bot.nds.models import FinalizedOrderParams, LivePriceSnapshot
 from src.trading_bot.risk_manager import create_scalping_risk_manager
 
 
@@ -38,7 +38,10 @@ def _build_config_payload() -> dict:
     cfg = config.get_full_config()
     cfg.setdefault("risk_manager_config", {})
     cfg.setdefault("risk_settings", {})
+    cfg.setdefault("technical_settings", {})
     cfg["risk_manager_config"]["MIN_RR_RATIO"] = 0.1
+    cfg["risk_settings"]["MIN_RISK_REWARD"] = 0.1
+    cfg["technical_settings"]["ATR_SL_MULTIPLIER"] = 10.0
     cfg["risk_settings"].setdefault("RISK_AMOUNT_USD", 25.0)
     return cfg
 
@@ -52,7 +55,7 @@ def test_entry_idea_flows_without_sl_tp_and_finalizes():
     assert entry_level == 2000.0
     assert entry_model == "MARKET"
 
-    risk_manager = create_scalping_risk_manager()
+    risk_manager = create_scalping_risk_manager(overrides=_build_config_payload())
     live_snapshot = LivePriceSnapshot(bid=2000.0, ask=2000.01, timestamp="2026-01-15T01:00:00")
     finalized = risk_manager.finalize_order(
         analysis=analysis_payload,
@@ -67,8 +70,8 @@ def test_entry_idea_flows_without_sl_tp_and_finalizes():
 
 
 def test_geometry_validation_after_finalize_buy_sell():
-    risk_manager = create_scalping_risk_manager()
     cfg = _build_config_payload()
+    risk_manager = create_scalping_risk_manager(overrides=cfg)
 
     buy_payload = _build_analysis_payload("BUY", 2100.0)
     buy_final = risk_manager.finalize_order(
@@ -89,3 +92,26 @@ def test_geometry_validation_after_finalize_buy_sell():
     )
     assert sell_final.is_trade_allowed
     assert sell_final.take_profit < sell_final.entry_price < sell_final.stop_loss
+
+
+def test_rejected_trade_summary_does_not_show_zero_sl_tp():
+    bot = NDSBot(DummyMT5)
+    rejected = FinalizedOrderParams(
+        signal="SELL",
+        order_type="NONE",
+        symbol="XAUUSD",
+        entry_price=0.0,
+        stop_loss=0.0,
+        take_profit=0.0,
+        lot_size=0.0,
+        risk_amount_usd=0.0,
+        rr_ratio=0.0,
+        deviation_pips=0.0,
+        decision_notes=["Rejected"],
+        is_trade_allowed=False,
+        reject_reason="Test reject",
+    )
+
+    summary = bot._format_final_decision_summary(rejected)
+    assert "sl=N/A" in summary
+    assert "tp=N/A" in summary
