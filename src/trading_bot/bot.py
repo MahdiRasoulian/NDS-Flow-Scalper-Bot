@@ -508,6 +508,97 @@ class NDSBot:
             rr_text = "N/A"
         return f"🧮 تصمیم نهایی (RiskManager): entry={entry_text} sl={sl_text} tp={tp_text} rr={rr_text}"
 
+    def _build_entry_snapshot(
+        self,
+        *,
+        signal_data: Dict[str, Any],
+        finalized: FinalizedOrderParams,
+        entry_source: Optional[Dict[str, Any]],
+        entry_context: Dict[str, Any],
+        spread_pips: Optional[float],
+        session: Optional[str],
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        tp2_price: Optional[float],
+        sl_pips: float,
+        tp1_pips: float,
+        tp2_pips: float,
+    ) -> Dict[str, Any]:
+        analysis_context = signal_data.get("context", {}) or {}
+        signal_context = (
+            signal_data.get("analysis_signal_context")
+            or analysis_context.get("analysis_signal_context")
+            or {}
+        )
+        market_metrics = signal_data.get("market_metrics", {}) or {}
+        entry_source = entry_source or {}
+        zone_top = entry_source.get("top")
+        zone_bottom = entry_source.get("bottom")
+        if zone_top is None:
+            zone_top = entry_source.get("high")
+        if zone_bottom is None:
+            zone_bottom = entry_source.get("low")
+
+        setup_type = entry_source.get("type") or signal_data.get("entry_type")
+        snapshot = {
+            "analyzer": {
+                "signal": signal_data.get("signal"),
+                "score": signal_data.get("score"),
+                "confidence": signal_data.get("confidence"),
+                "bias": signal_context.get("bias"),
+                "trend": signal_context.get("directional_bias") or signal_context.get("trend"),
+                "bos": signal_context.get("bos"),
+                "choch": signal_context.get("choch"),
+                "structure_score": signal_context.get("structure_score"),
+                "volatility_state": signal_context.get("volatility_state")
+                or market_metrics.get("volatility_state"),
+            },
+            "setup": {
+                "type": setup_type,
+                "zone_id": entry_source.get("zone_id"),
+                "zone_top": zone_top,
+                "zone_bottom": zone_bottom,
+                "retest_reason": entry_source.get("retest_reason"),
+                "dist_atr": entry_source.get("dist_atr"),
+            },
+            "risk": {
+                "entry": entry_price,
+                "sl": stop_loss,
+                "tp1": take_profit,
+                "tp2": tp2_price,
+                "sl_pips": sl_pips,
+                "tp1_pips": tp1_pips,
+                "tp2_pips": tp2_pips,
+                "rr_tp1": getattr(finalized, "rr_tp1", None),
+                "rr_tp2": getattr(finalized, "rr_tp2", None),
+                "rr_checked": getattr(finalized, "rr_checked", None),
+                "min_rr_effective": getattr(finalized, "min_rr_effective", None),
+                "min_rr_source": getattr(finalized, "min_rr_source", None),
+            },
+            "guards": {
+                "counter_trend": entry_context.get("counter_trend"),
+                "reversal_ok": entry_context.get("reversal_ok"),
+                "liquidity_ok": entry_context.get("liquidity_ok"),
+                "trend_ok": entry_context.get("trend_ok"),
+                "session": session,
+                "spread_pips": spread_pips,
+            },
+        }
+
+        static_sr = (
+            signal_data.get("static_sr")
+            or analysis_context.get("static_sr")
+            or entry_context.get("static_sr")
+        )
+        if isinstance(static_sr, dict) and static_sr:
+            snapshot["setup"]["static_sr"] = {
+                "nearest_resistance": static_sr.get("nearest_resistance"),
+                "nearest_support": static_sr.get("nearest_support"),
+            }
+
+        return snapshot
+
     def _maybe_monitor_trades(self, force: bool = False):
         """مانیتورینگ معاملات با throttle برای جلوگیری از فشار"""
         if self._cleanup_done:
@@ -1688,6 +1779,23 @@ class NDSBot:
                     float(lot_size),
                     order_type,
                 )
+
+                entry_snapshot = self._build_entry_snapshot(
+                    signal_data=signal_data,
+                    finalized=finalized,
+                    entry_source=entry_source if isinstance(entry_source, dict) else None,
+                    entry_context=entry_context,
+                    spread_pips=spread_pips,
+                    session=current_session,
+                    entry_price=float(actual_entry_price),
+                    stop_loss=float(actual_sl),
+                    take_profit=float(actual_tp),
+                    tp2_price=tp2_price,
+                    sl_pips=sl_pips,
+                    tp1_pips=tp1_pips,
+                    tp2_pips=tp2_pips,
+                )
+                logger.info("[ENTRY_SNAPSHOT] %s", entry_snapshot)
                 open_time_utc = datetime.utcnow()
                 logger.info(
                     "[OPEN] order_ticket=%s position_ticket=%s symbol=%s magic=%s open_time=%s entry=%.2f sl=%.2f tp=%.2f volume=%.3f",
@@ -1717,6 +1825,7 @@ class NDSBot:
                     "tp": actual_tp,
                     "profit": None,
                     "pips": None,
+                    "pips_abs": None,
                     "reason": None,
                     "metadata": {
                         "confidence": signal_data.get("confidence", 0),
@@ -1747,6 +1856,7 @@ class NDSBot:
                         "tp_plan": tp_plan,
                         "tp2_enabled": tp2_enabled,
                         "trail_after_tp1": trail_after_tp1,
+                        "entry_snapshot": entry_snapshot,
                     },
                 }
                 self.trade_tracker.add_trade_open(open_event)
@@ -1876,6 +1986,7 @@ class NDSBot:
                     "tp": None,
                     "profit": None,
                     "pips": None,
+                    "pips_abs": None,
                     "reason": None,
                     "metadata": {
                         "magic": state_record.get("magic"),
@@ -1998,7 +2109,19 @@ class NDSBot:
                     point_size,
                     point_source,
                 )
-                pips_val = compute_pips(symbol, entry_price or 0.0, exit_price or 0.0, config_payload=self.config)
+                pips_val = compute_pips(
+                    symbol,
+                    entry_price or 0.0,
+                    exit_price or 0.0,
+                    side=side,
+                    config_payload=self.config,
+                )
+                pips_abs = abs(float(pips_val or 0.0))
+                entry_snapshot = (
+                    record.get("open_event", {})
+                    .get("metadata", {})
+                    .get("entry_snapshot")
+                )
 
                 close_event: ExecutionEvent = {
                     "event_type": "CLOSE",
@@ -2014,8 +2137,13 @@ class NDSBot:
                     "tp": record.get("open_event", {}).get("tp"),
                     "profit": profit,
                     "pips": pips_val,
+                    "pips_abs": pips_abs,
                     "reason": reason,
-                    "metadata": {"history": history, "duration_sec": duration_sec},
+                    "metadata": {
+                        "history": history,
+                        "duration_sec": duration_sec,
+                        "entry_snapshot": entry_snapshot,
+                    },
                 }
 
                 self.trade_tracker.close_trade_event(close_event)
@@ -2052,6 +2180,7 @@ class NDSBot:
                 identity = record.get("trade_identity", {})
                 open_event = record.get("open_event", {})
                 opened_at = identity.get("opened_at")
+                entry_snapshot = open_event.get("metadata", {}).get("entry_snapshot")
                 close_event: ExecutionEvent = {
                     "event_type": "CLOSE_UNKNOWN",
                     "event_time": now,
@@ -2066,8 +2195,12 @@ class NDSBot:
                     "tp": open_event.get("tp"),
                     "profit": None,
                     "pips": None,
+                    "pips_abs": None,
                     "reason": "history_timeout",
-                    "metadata": {"duration_sec": (now - opened_at).total_seconds() if opened_at else None},
+                    "metadata": {
+                        "duration_sec": (now - opened_at).total_seconds() if opened_at else None,
+                        "entry_snapshot": entry_snapshot,
+                    },
                 }
                 self.trade_tracker.finalize_unknown_close(position_ticket, close_event)
                 generate_execution_report(logger=logger, event=close_event)

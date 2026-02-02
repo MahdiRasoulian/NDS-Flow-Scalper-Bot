@@ -778,6 +778,83 @@ class ScalpingRiskManager:
 
         return {"tp1_target_price": tp1_target_price, "action": "keep"}
 
+    def _resolve_directional_trend(self, signal_context: Dict[str, Any]) -> str:
+        directional_bias = str(signal_context.get("directional_bias", "") or "").upper()
+        if directional_bias:
+            return directional_bias
+        return str(signal_context.get("trend", "") or "").upper()
+
+    def _counter_trend_confirmation(
+        self,
+        *,
+        signal: str,
+        signal_context: Dict[str, Any],
+        entry_context: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        bias = str(signal_context.get("bias", "") or "").upper()
+        directional_trend = self._resolve_directional_trend(signal_context)
+        choch = str(signal_context.get("choch", "") or "").upper()
+        bos = str(signal_context.get("bos", "") or "").upper()
+        sweeps = int(signal_context.get("sweeps_count") or 0)
+
+        disp_atr = entry_context.get("disp_atr")
+        if disp_atr is None and isinstance(entry_context.get("static_sr"), dict):
+            disp_atr = entry_context["static_sr"].get("disp_atr")
+        try:
+            disp_atr_val = float(disp_atr or 0.0)
+        except (TypeError, ValueError):
+            disp_atr_val = 0.0
+        min_disp_atr = float(self.settings.get("COUNTER_TREND_DISPLACEMENT_ATR_MIN", 0.6))
+
+        bearish_structure = choch == "BEARISH_CHOCH" or bos == "BEARISH_BOS"
+        bullish_structure = choch == "BULLISH_CHOCH" or bos == "BULLISH_BOS"
+        sweeps_ok = sweeps > 0
+        displacement_ok = disp_atr_val >= min_disp_atr
+
+        if signal == "SELL" and bias == "BULLISH" and directional_trend == "UPTREND":
+            ok = bearish_structure and sweeps_ok and displacement_ok
+            reason = (
+                f"bearish_structure={bearish_structure} sweeps={sweeps} disp_atr={disp_atr_val:.2f}"
+            )
+            return ok, reason
+        if signal == "BUY" and bias == "BEARISH" and directional_trend == "DOWNTREND":
+            ok = bullish_structure and sweeps_ok and displacement_ok
+            reason = (
+                f"bullish_structure={bullish_structure} sweeps={sweeps} disp_atr={disp_atr_val:.2f}"
+            )
+            return ok, reason
+        return True, "not_counter_trend_regime"
+
+    def _sr_break_confirmation(
+        self,
+        *,
+        signal: str,
+        signal_context: Dict[str, Any],
+        entry_context: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        choch = str(signal_context.get("choch", "") or "").upper()
+        bos = str(signal_context.get("bos", "") or "").upper()
+        disp_atr = entry_context.get("disp_atr")
+        try:
+            disp_atr_val = float(disp_atr or 0.0)
+        except (TypeError, ValueError):
+            disp_atr_val = 0.0
+        min_disp_atr = float(self.settings.get("STATIC_SR_BREAK_DISPLACEMENT_ATR_MIN", 0.5))
+
+        bullish_break = choch == "BULLISH_CHOCH" or bos == "BULLISH_BOS"
+        bearish_break = choch == "BEARISH_CHOCH" or bos == "BEARISH_BOS"
+        displacement_ok = disp_atr_val >= min_disp_atr
+
+        if signal == "BUY":
+            ok = bullish_break and displacement_ok
+            reason = f"bullish_break={bullish_break} disp_atr={disp_atr_val:.2f}"
+            return ok, reason
+        if signal == "SELL":
+            ok = bearish_break and displacement_ok
+            reason = f"bearish_break={bearish_break} disp_atr={disp_atr_val:.2f}"
+            return ok, reason
+        return True, "no_signal"
+
     def _get_point_size(self, config_payload: Dict[str, Any]) -> float:
         """Resolve point size with default for XAUUSD mapping."""
         default_point_size = self._get_gold_spec("point", DEFAULT_POINT_SIZE)
@@ -1477,6 +1554,14 @@ class ScalpingRiskManager:
             is_trade_allowed: bool,
             reject_reason: Optional[str],
             take_profit2: Optional[float] = None,
+            rr_tp1: Optional[float] = None,
+            rr_tp2: Optional[float] = None,
+            rr_checked: Optional[str] = None,
+            min_rr_effective: Optional[float] = None,
+            min_rr_source: Optional[str] = None,
+            sl_pips: Optional[float] = None,
+            tp1_pips: Optional[float] = None,
+            tp2_pips: Optional[float] = None,
         ) -> FinalizedOrderParams:
             return FinalizedOrderParams(
                 signal=signal,
@@ -1500,6 +1585,14 @@ class ScalpingRiskManager:
                 final_sl=stop_loss,
                 final_tp=take_profit,
                 lot=lot_size,
+                rr_tp1=rr_tp1,
+                rr_tp2=rr_tp2,
+                rr_checked=rr_checked,
+                min_rr_effective=min_rr_effective,
+                min_rr_source=min_rr_source,
+                sl_pips=sl_pips,
+                tp1_pips=tp1_pips,
+                tp2_pips=tp2_pips,
             )
 
         decision_notes: List[str] = []
@@ -1759,6 +1852,12 @@ class ScalpingRiskManager:
             or {}
         )
         signal_context = self._resolve_signal_context(analysis_payload, analysis_context)
+        sr_context = (
+            analysis_payload.get("static_sr")
+            or analysis_context.get("static_sr")
+            or entry_context.get("static_sr")
+            or {}
+        )
         counter_trend = bool(entry_context.get("counter_trend"))
         reversal_ok = bool(entry_context.get("reversal_ok"))
         countertrend_min_rr = self.settings.get("COUNTERTREND_MIN_RR")
@@ -1778,6 +1877,117 @@ class ScalpingRiskManager:
                 trend_ok=entry_context.get("trend_ok"),
             )
         )
+
+        ct_ok, ct_reason = self._counter_trend_confirmation(
+            signal=signal,
+            signal_context=signal_context,
+            entry_context=entry_context,
+        )
+        if not ct_ok:
+            decision_notes.append(f"Counter-trend blocked: {ct_reason}")
+            self._logger.info(
+                "[NDS][CTGATE_STRICT] allow=false signal=%s bias=%s trend=%s reason=%s",
+                signal,
+                signal_context.get("bias"),
+                self._resolve_directional_trend(signal_context),
+                ct_reason,
+            )
+            return _finalize(
+                signal=signal,
+                order_type='NONE',
+                entry_price=entry_price,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason="Counter-trend reversal confirmation missing.",
+            )
+
+        if isinstance(sr_context, dict) and sr_context:
+            nearest_resistance = sr_context.get("nearest_resistance") or {}
+            nearest_support = sr_context.get("nearest_support") or {}
+            decision_notes.append(
+                "SR nearest_resistance={res} dist_pips={dist_pips} dist_atr={dist_atr}".format(
+                    res=nearest_resistance.get("price"),
+                    dist_pips=nearest_resistance.get("dist_pips"),
+                    dist_atr=nearest_resistance.get("dist_atr"),
+                )
+            )
+            decision_notes.append(
+                "SR nearest_support={sup} dist_pips={dist_pips} dist_atr={dist_atr}".format(
+                    sup=nearest_support.get("price"),
+                    dist_pips=nearest_support.get("dist_pips"),
+                    dist_atr=nearest_support.get("dist_atr"),
+                )
+            )
+            if signal == "BUY" and nearest_resistance:
+                band_top = nearest_resistance.get("band_top")
+                band_bottom = nearest_resistance.get("band_bottom")
+                if band_top is not None and band_bottom is not None and band_bottom <= entry_price <= band_top:
+                    sr_ok, sr_reason = self._sr_break_confirmation(
+                        signal=signal,
+                        signal_context=signal_context,
+                        entry_context=entry_context,
+                    )
+                    if not sr_ok:
+                        decision_notes.append(f"Static SR blocked: resistance_band {sr_reason}")
+                        self._logger.info(
+                            "[NDS][SR_GATE] allow=false signal=%s band=[%s-%s] reason=%s",
+                            signal,
+                            band_bottom,
+                            band_top,
+                            sr_reason,
+                        )
+                        return _finalize(
+                            signal=signal,
+                            order_type='NONE',
+                            entry_price=entry_price,
+                            stop_loss=stop_loss or 0.0,
+                            take_profit=take_profit or 0.0,
+                            lot_size=0.0,
+                            risk_amount_usd=0.0,
+                            rr_ratio=0.0,
+                            deviation_pips=deviation_pips,
+                            decision_notes=decision_notes,
+                            is_trade_allowed=False,
+                            reject_reason="Entry inside static resistance without confirmation.",
+                        )
+            if signal == "SELL" and nearest_support:
+                band_top = nearest_support.get("band_top")
+                band_bottom = nearest_support.get("band_bottom")
+                if band_top is not None and band_bottom is not None and band_bottom <= entry_price <= band_top:
+                    sr_ok, sr_reason = self._sr_break_confirmation(
+                        signal=signal,
+                        signal_context=signal_context,
+                        entry_context=entry_context,
+                    )
+                    if not sr_ok:
+                        decision_notes.append(f"Static SR blocked: support_band {sr_reason}")
+                        self._logger.info(
+                            "[NDS][SR_GATE] allow=false signal=%s band=[%s-%s] reason=%s",
+                            signal,
+                            band_bottom,
+                            band_top,
+                            sr_reason,
+                        )
+                        return _finalize(
+                            signal=signal,
+                            order_type='NONE',
+                            entry_price=entry_price,
+                            stop_loss=stop_loss or 0.0,
+                            take_profit=take_profit or 0.0,
+                            lot_size=0.0,
+                            risk_amount_usd=0.0,
+                            rr_ratio=0.0,
+                            deviation_pips=deviation_pips,
+                            decision_notes=decision_notes,
+                            is_trade_allowed=False,
+                            reject_reason="Entry inside static support without confirmation.",
+                        )
         if tp1_target_source or tp1_target_zone_type:
             decision_notes.append(
                 f"TP1 target source={tp1_target_source} zone_type={tp1_target_zone_type} direction={tp1_target_zone_direction}"
@@ -2521,6 +2731,14 @@ class ScalpingRiskManager:
             is_trade_allowed=True,
             reject_reason=None,
             take_profit2=tp2_price,
+            rr_tp1=rr_ratio,
+            rr_tp2=rr_ratio_tp2,
+            rr_checked=rr_checked,
+            min_rr_effective=min_rr_effective,
+            min_rr_source=min_rr_source,
+            sl_pips=sl_pips,
+            tp1_pips=tp_pips,
+            tp2_pips=tp2_pips_target,
         )
 
 

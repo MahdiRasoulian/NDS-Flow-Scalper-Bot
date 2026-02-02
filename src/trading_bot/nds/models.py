@@ -229,6 +229,14 @@ class FinalizedOrderParams:
     final_sl: Optional[float] = None
     final_tp: Optional[float] = None
     lot: Optional[float] = None
+    rr_tp1: Optional[float] = None
+    rr_tp2: Optional[float] = None
+    rr_checked: Optional[str] = None
+    min_rr_effective: Optional[float] = None
+    min_rr_source: Optional[str] = None
+    sl_pips: Optional[float] = None
+    tp1_pips: Optional[float] = None
+    tp2_pips: Optional[float] = None
 
     def to_standard_payload(self) -> Dict[str, Any]:
         return {
