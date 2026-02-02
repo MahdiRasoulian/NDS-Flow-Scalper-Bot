@@ -3493,8 +3493,10 @@ class GoldNDSAnalyzer:
                 return None
             return min(levels, key=lambda x: abs(ref_price - x["price"]))
 
-        nearest_support = _nearest(supports)
-        nearest_resistance = _nearest(resistances)
+        supports_below = [lvl for lvl in supports if lvl["price"] <= ref_price]
+        resistances_above = [lvl for lvl in resistances if lvl["price"] >= ref_price]
+        nearest_support = _nearest(supports_below)
+        nearest_resistance = _nearest(resistances_above)
 
         if max_levels > 0:
             supports = sorted(supports, key=lambda x: x["dist_pips"])[:max_levels]

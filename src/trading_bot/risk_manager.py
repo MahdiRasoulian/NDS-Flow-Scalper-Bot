@@ -1910,6 +1910,22 @@ class ScalpingRiskManager:
         if isinstance(sr_context, dict) and sr_context:
             nearest_resistance = sr_context.get("nearest_resistance") or {}
             nearest_support = sr_context.get("nearest_support") or {}
+            res_price = nearest_resistance.get("price")
+            sup_price = nearest_support.get("price")
+            res_band_top = nearest_resistance.get("band_top")
+            res_band_bottom = nearest_resistance.get("band_bottom")
+            sup_band_top = nearest_support.get("band_top")
+            sup_band_bottom = nearest_support.get("band_bottom")
+            inside_res_band = (
+                res_band_top is not None
+                and res_band_bottom is not None
+                and res_band_bottom <= entry_price <= res_band_top
+            )
+            inside_sup_band = (
+                sup_band_top is not None
+                and sup_band_bottom is not None
+                and sup_band_bottom <= entry_price <= sup_band_top
+            )
             decision_notes.append(
                 "SR nearest_resistance={res} dist_pips={dist_pips} dist_atr={dist_atr}".format(
                     res=nearest_resistance.get("price"),
@@ -1924,70 +1940,86 @@ class ScalpingRiskManager:
                     dist_atr=nearest_support.get("dist_atr"),
                 )
             )
-            if signal == "BUY" and nearest_resistance:
-                band_top = nearest_resistance.get("band_top")
-                band_bottom = nearest_resistance.get("band_bottom")
-                if band_top is not None and band_bottom is not None and band_bottom <= entry_price <= band_top:
-                    sr_ok, sr_reason = self._sr_break_confirmation(
-                        signal=signal,
-                        signal_context=signal_context,
-                        entry_context=entry_context,
+            sr_override = False
+            sr_reason = "not_in_band"
+            if signal == "BUY" and inside_res_band:
+                sr_ok, sr_break_reason = self._sr_break_confirmation(
+                    signal=signal,
+                    signal_context=signal_context,
+                    entry_context=entry_context,
+                )
+                sr_override = bool(reversal_ok and sr_ok)
+                sr_reason = f"override={sr_override} reversal_ok={reversal_ok} {sr_break_reason}"
+                if not sr_override:
+                    decision_notes.append(f"Static SR blocked: resistance_band {sr_break_reason}")
+                    self._logger.info(
+                        "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s "
+                        "nearest_resistance=%s nearest_support=%s override=%s reason=%s",
+                        inside_res_band,
+                        inside_sup_band,
+                        res_price,
+                        sup_price,
+                        sr_override,
+                        sr_reason,
                     )
-                    if not sr_ok:
-                        decision_notes.append(f"Static SR blocked: resistance_band {sr_reason}")
-                        self._logger.info(
-                            "[NDS][SR_GATE] allow=false signal=%s band=[%s-%s] reason=%s",
-                            signal,
-                            band_bottom,
-                            band_top,
-                            sr_reason,
-                        )
-                        return _finalize(
-                            signal=signal,
-                            order_type='NONE',
-                            entry_price=entry_price,
-                            stop_loss=stop_loss or 0.0,
-                            take_profit=take_profit or 0.0,
-                            lot_size=0.0,
-                            risk_amount_usd=0.0,
-                            rr_ratio=0.0,
-                            deviation_pips=deviation_pips,
-                            decision_notes=decision_notes,
-                            is_trade_allowed=False,
-                            reject_reason="Entry inside static resistance without confirmation.",
-                        )
-            if signal == "SELL" and nearest_support:
-                band_top = nearest_support.get("band_top")
-                band_bottom = nearest_support.get("band_bottom")
-                if band_top is not None and band_bottom is not None and band_bottom <= entry_price <= band_top:
-                    sr_ok, sr_reason = self._sr_break_confirmation(
+                    return _finalize(
                         signal=signal,
-                        signal_context=signal_context,
-                        entry_context=entry_context,
+                        order_type='NONE',
+                        entry_price=entry_price,
+                        stop_loss=stop_loss or 0.0,
+                        take_profit=take_profit or 0.0,
+                        lot_size=0.0,
+                        risk_amount_usd=0.0,
+                        rr_ratio=0.0,
+                        deviation_pips=deviation_pips,
+                        decision_notes=decision_notes,
+                        is_trade_allowed=False,
+                        reject_reason="Entry inside static resistance without confirmation.",
                     )
-                    if not sr_ok:
-                        decision_notes.append(f"Static SR blocked: support_band {sr_reason}")
-                        self._logger.info(
-                            "[NDS][SR_GATE] allow=false signal=%s band=[%s-%s] reason=%s",
-                            signal,
-                            band_bottom,
-                            band_top,
-                            sr_reason,
-                        )
-                        return _finalize(
-                            signal=signal,
-                            order_type='NONE',
-                            entry_price=entry_price,
-                            stop_loss=stop_loss or 0.0,
-                            take_profit=take_profit or 0.0,
-                            lot_size=0.0,
-                            risk_amount_usd=0.0,
-                            rr_ratio=0.0,
-                            deviation_pips=deviation_pips,
-                            decision_notes=decision_notes,
-                            is_trade_allowed=False,
-                            reject_reason="Entry inside static support without confirmation.",
-                        )
+            elif signal == "SELL" and inside_sup_band:
+                sr_ok, sr_break_reason = self._sr_break_confirmation(
+                    signal=signal,
+                    signal_context=signal_context,
+                    entry_context=entry_context,
+                )
+                sr_override = bool(reversal_ok and sr_ok)
+                sr_reason = f"override={sr_override} reversal_ok={reversal_ok} {sr_break_reason}"
+                if not sr_override:
+                    decision_notes.append(f"Static SR blocked: support_band {sr_break_reason}")
+                    self._logger.info(
+                        "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s "
+                        "nearest_resistance=%s nearest_support=%s override=%s reason=%s",
+                        inside_res_band,
+                        inside_sup_band,
+                        res_price,
+                        sup_price,
+                        sr_override,
+                        sr_reason,
+                    )
+                    return _finalize(
+                        signal=signal,
+                        order_type='NONE',
+                        entry_price=entry_price,
+                        stop_loss=stop_loss or 0.0,
+                        take_profit=take_profit or 0.0,
+                        lot_size=0.0,
+                        risk_amount_usd=0.0,
+                        rr_ratio=0.0,
+                        deviation_pips=deviation_pips,
+                        decision_notes=decision_notes,
+                        is_trade_allowed=False,
+                        reject_reason="Entry inside static support without confirmation.",
+                    )
+            self._logger.info(
+                "[NDS][SR_GATE] action=ALLOW inside_res_band=%s inside_sup_band=%s "
+                "nearest_resistance=%s nearest_support=%s override=%s reason=%s",
+                inside_res_band,
+                inside_sup_band,
+                res_price,
+                sup_price,
+                sr_override,
+                sr_reason,
+            )
         if tp1_target_source or tp1_target_zone_type:
             decision_notes.append(
                 f"TP1 target source={tp1_target_source} zone_type={tp1_target_zone_type} direction={tp1_target_zone_direction}"
