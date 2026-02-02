@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import logging
 
 import pytest
 
@@ -59,6 +60,65 @@ def test_countertrend_sell_rejected_without_reversal_confirmation():
 
     assert not finalized.is_trade_allowed
     assert finalized.reject_reason == "Counter-trend reversal confirmation missing."
+
+
+def test_ctgate_blocks_before_sr_gate(caplog):
+    risk_manager = create_scalping_risk_manager()
+    analysis_payload = {
+        "signal": "SELL",
+        "confidence": 80.0,
+        "entry_level": 2000.0,
+        "entry_model": "MARKET",
+        "entry_idea": {
+            "entry_level": 2000.0,
+            "entry_model": "MARKET",
+            "entry_type": "FLOW",
+        },
+        "market_metrics": {"atr": 5.0},
+        "analysis_signal_context": {
+            "bias": "BULLISH",
+            "directional_bias": "UPTREND",
+            "choch": "NONE",
+            "bos": "NONE",
+            "sweeps_count": 0,
+        },
+        "entry_context": {
+            "counter_trend": True,
+            "reversal_ok": False,
+            "disp_atr": 0.1,
+            "liquidity_ok": True,
+            "trend_ok": True,
+        },
+        "static_sr": {
+            "nearest_resistance": {
+                "price": 2005.0,
+                "band_bottom": 1998.0,
+                "band_top": 2006.0,
+                "dist_pips": 10.0,
+                "dist_atr": 0.2,
+            },
+            "nearest_support": {
+                "price": 1980.0,
+                "band_bottom": 1975.0,
+                "band_top": 1985.0,
+                "dist_pips": 20.0,
+                "dist_atr": 0.5,
+            },
+        },
+    }
+    cfg = _build_config_payload()
+    live_snapshot = LivePriceSnapshot(bid=2000.0, ask=2000.01, timestamp=datetime.utcnow().isoformat())
+
+    with caplog.at_level(logging.INFO):
+        finalized = risk_manager.finalize_order(
+            analysis=analysis_payload,
+            live=live_snapshot,
+            symbol="XAUUSD",
+            config=cfg,
+        )
+
+    assert not finalized.is_trade_allowed
+    assert "SR_GATE" not in caplog.text
 
 
 def test_static_resistance_blocks_buy_without_break_confirmation():

@@ -930,6 +930,24 @@ class GoldNDSAnalyzer:
             result_payload["entry_reason"] = entry_reason
             result_payload["entry_level"] = entry_price
             result_payload["entry_price"] = entry_price
+            signal_timeline = self._build_signal_timeline(
+                pre_signal=pre_filter_signal,
+                post_filter_signal=post_filter_signal,
+                entry_idea=entry_idea,
+                signal_context=analysis_signal_context,
+            )
+            result_payload["signal_timeline"] = signal_timeline
+            result_payload.setdefault("context", {})
+            result_payload["context"]["signal_timeline"] = signal_timeline
+            self._log_info(
+                "[NDS][SIGNAL_TIMELINE] pre=%s post=%s override=%s final=%s reasons=%s bypassed_gates=%s",
+                signal_timeline.get("pre_signal"),
+                signal_timeline.get("post_filter_signal"),
+                signal_timeline.get("override_signal"),
+                signal_timeline.get("final_signal"),
+                signal_timeline.get("override_reason") or "-",
+                signal_timeline.get("bypassed_gates") or "-",
+            )
 
             if signal in {"BUY", "SELL"} and entry_price is not None:
                 min_rvol = float(self.GOLD_SETTINGS.get("MIN_RVOL_SCALPING", 0.35))
@@ -1064,6 +1082,48 @@ class GoldNDSAnalyzer:
         except Exception as e:
             logger.error("[NDS][RESULT] analysis failed: %s", str(e), exc_info=True)
             return self._create_error_result(str(e), timeframe, current_close=None)
+
+    def _build_signal_timeline(
+        self,
+        pre_signal: str,
+        post_filter_signal: str,
+        entry_idea: Dict[str, Any],
+        signal_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        entry_signal = str(entry_idea.get("signal") or "NONE")
+        metrics = entry_idea.get("metrics") if isinstance(entry_idea, dict) else {}
+        metrics = metrics or {}
+        override_bypassed = metrics.get("override_bypassed_gates") or []
+        override_reason = metrics.get("override_reason") or metrics.get("flow_promoted_reason") or entry_idea.get("reason")
+        has_override_flag = bool(
+            metrics.get("override")
+            or metrics.get("flow_promoted_no_base")
+            or metrics.get("flow_promoted_base_signal")
+        )
+        override_signal = None
+        if entry_signal in {"BUY", "SELL"} and entry_signal != post_filter_signal:
+            override_signal = entry_signal
+
+        bias = str(signal_context.get("bias", "") or "")
+        strong_trend = bool(signal_context.get("strong_trend"))
+        counter_trend_flag = (bias == "BULLISH" and entry_signal == "SELL") or (
+            bias == "BEARISH" and entry_signal == "BUY"
+        )
+        required_reversal_confirmation = bool(counter_trend_flag and strong_trend)
+        reversal_ok = bool(signal_context.get("reversal_ok"))
+
+        return {
+            "pre_signal": pre_signal,
+            "post_filter_signal": post_filter_signal,
+            "override_signal": override_signal,
+            "override_reason": override_reason if override_signal else None,
+            "override_flag": has_override_flag,
+            "final_signal": entry_signal,
+            "counter_trend_flag": counter_trend_flag,
+            "required_reversal_confirmation": required_reversal_confirmation,
+            "reversal_ok": reversal_ok,
+            "bypassed_gates": override_bypassed,
+        }
 
 
     def _calculate_recent_range(self, scalping_mode: bool) -> float:
