@@ -291,6 +291,9 @@ class ScalpingRiskManager:
                 'RR_REPAIR_MAX_TP_ATR_MULT': 'RR_REPAIR_MAX_TP_ATR_MULT',
                 'RR_REPAIR_MODE': 'RR_REPAIR_MODE',
                 'RR_REPAIR_TP1_CAP_PIPS': 'RR_REPAIR_TP1_CAP_PIPS',
+                'RR_TP2_AUTOGEN_ENABLED': 'RR_TP2_AUTOGEN_ENABLED',
+                'RR_TP2_AUTOGEN_MAX_PIPS': 'RR_TP2_AUTOGEN_MAX_PIPS',
+                'RR_TP2_AUTOGEN_MAX_ATR_MULT': 'RR_TP2_AUTOGEN_MAX_ATR_MULT',
                 'SCALP_RR_MODE': 'SCALP_RR_MODE',
                 'SCALP_TP1_ONLY_MIN_RR': 'SCALP_TP1_ONLY_MIN_RR',
                 'RR_EPSILON': 'RR_EPSILON',
@@ -1886,13 +1889,36 @@ class ScalpingRiskManager:
             preserve_tp1 = True
         rr_mode_setting = str(risk_manager_config.get("SCALP_RR_MODE", "AUTO") or "AUTO").upper()
         rr_validate_mode = "TP1"
+        rr_mode_reason = "default_tp1"
         if scalping_mode:
             if rr_mode_setting == "TP2_ONLY":
                 rr_validate_mode = "TP2_ONLY"
+                rr_mode_reason = "config:SCALP_RR_MODE=TP2_ONLY"
             elif rr_mode_setting == "TP1":
                 rr_validate_mode = "TP1"
+                rr_mode_reason = "config:SCALP_RR_MODE=TP1"
             elif preserve_tp1:
                 rr_validate_mode = "TP2_ONLY"
+                rr_mode_reason = "tp1_sacred"
+        else:
+            rr_mode_reason = "non_scalp"
+
+        rr_tp1_only_min = float(risk_manager_config.get("SCALP_TP1_ONLY_MIN_RR", 0.4))
+        tp2_autogen_enabled = bool(risk_manager_config.get("RR_TP2_AUTOGEN_ENABLED", False))
+        self._logger.info(
+            "[NDS][RR_MODE] mode=%s reason=%s inputs={scalping_mode=%s rr_mode_setting=%s tp1_sacred=%s "
+            "trail_after_tp1=%s tp1_pips=%.2f tp2_pips=%.2f min_rr=%.2f sl_pips=%.2f}",
+            rr_validate_mode,
+            rr_mode_reason,
+            scalping_mode,
+            rr_mode_setting,
+            preserve_tp1,
+            trail_after_tp1,
+            tp_pips,
+            tp2_pips_target,
+            rr_tp1_only_min if rr_validate_mode == "TP2_ONLY" else float(min_rr_ratio),
+            sl_pips,
+        )
 
         decision_notes.append(
             "RR_CONTEXT mode=SCALP tp1_pips={tp1_pips:.1f} tp2_pips={tp2_pips:.1f} rr_tp1={rr_tp1:.2f} "
@@ -1995,29 +2021,123 @@ class ScalpingRiskManager:
         if preserve_tp1 and rr_repair_mode == "LEGACY":
             rr_repair_mode = "TP2_ONLY"
 
-        rr_tp1_only_min = float(risk_manager_config.get("SCALP_TP1_ONLY_MIN_RR", 0.4))
         tp2_available = tp2_price is not None or (trail_after_tp1 and tp2_pips_target > 0)
         rr_eval = rr_ratio
         if rr_validate_mode == "TP2_ONLY":
             if not tp2_available:
-                decision_notes.append(
-                    f"RR_TP1_ONLY min_rr={rr_tp1_only_min:.2f} tp2_missing=true"
-                )
-                if rr_ratio + rr_epsilon < rr_tp1_only_min:
-                    return _finalize(
-                        signal=signal,
-                        order_type='NONE',
-                        entry_price=entry_price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        lot_size=0.0,
-                        risk_amount_usd=0.0,
-                        rr_ratio=rr_ratio,
-                        deviation_pips=deviation_pips,
-                        decision_notes=decision_notes,
-                        is_trade_allowed=False,
-                        reject_reason="TP2 required for RR-min under TP1-scaling policy.",
+                if tp2_autogen_enabled and sl_pips > 0:
+                    desired_tp2_pips_raw = sl_pips * rr_tp1_only_min
+                    desired_tp2_pips = math.ceil(desired_tp2_pips_raw)
+                    desired_tp2_distance = pips_to_price(desired_tp2_pips, point_size)
+                    max_tp_pips = float(
+                        risk_manager_config.get(
+                            "RR_TP2_AUTOGEN_MAX_PIPS",
+                            risk_manager_config.get(
+                                "RR_REPAIR_MAX_TP_PIPS",
+                                max(tp_pips, float(self.settings.get("TP2_PIPS", tp_pips))),
+                            ),
+                        )
                     )
+                    max_tp_atr_mult = float(
+                        risk_manager_config.get(
+                            "RR_TP2_AUTOGEN_MAX_ATR_MULT",
+                            risk_manager_config.get("RR_REPAIR_MAX_TP_ATR_MULT", 2.0),
+                        )
+                    )
+                    max_tp_price_atr = None
+                    if atr_value and float(atr_value) > 0:
+                        max_tp_price_atr = float(atr_value) * max_tp_atr_mult
+                    cap_reasons = []
+                    if desired_tp2_pips > max_tp_pips:
+                        cap_reasons.append(
+                            f"tp_pips_cap {desired_tp2_pips:.1f}>{max_tp_pips:.1f}"
+                        )
+                    if max_tp_price_atr is not None and desired_tp2_distance > max_tp_price_atr:
+                        cap_reasons.append(
+                            f"tp_atr_cap {desired_tp2_distance:.2f}>{max_tp_price_atr:.2f}"
+                        )
+                    if cap_reasons:
+                        decision_notes.append(
+                            f"RR_TP2_AUTOGEN_REJECT caps_exceeded={'|'.join(cap_reasons)}"
+                        )
+                        self._logger.info(
+                            "[NDS][RR_TP2_AUTOGEN] result=REJECT sl_pips=%.2f min_rr=%.2f target_tp2_pips=%.2f "
+                            "max_tp_pips=%.2f max_tp_atr_mult=%.2f caps=%s",
+                            sl_pips,
+                            rr_tp1_only_min,
+                            desired_tp2_pips,
+                            max_tp_pips,
+                            max_tp_atr_mult,
+                            "|".join(cap_reasons),
+                        )
+                        return _finalize(
+                            signal=signal,
+                            order_type='NONE',
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            lot_size=0.0,
+                            risk_amount_usd=0.0,
+                            rr_ratio=rr_ratio,
+                            deviation_pips=deviation_pips,
+                            decision_notes=decision_notes,
+                            is_trade_allowed=False,
+                            reject_reason="TP2 cap exceeded for RR autogen.",
+                        )
+                    tp2_price = (
+                        entry_price + desired_tp2_distance
+                        if signal == "BUY"
+                        else entry_price - desired_tp2_distance
+                    )
+                    tp2_metrics = calculate_distance_metrics(
+                        entry_price=entry_price,
+                        current_price=tp2_price,
+                        point_size=point_size,
+                    )
+                    tp2_distance = float(tp2_metrics.get("dist_price") or 0.0)
+                    tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+                    tp2_pips_target = tp2_pips
+                    rr_ratio_tp2 = tp2_distance / sl_distance if sl_distance > 0 else None
+                    rr_eval = rr_ratio_tp2 if rr_ratio_tp2 is not None else rr_eval
+                    tp2_available = True
+                    decision_notes.append(
+                        "RR_TP2_AUTOGEN sl_pips={sl_pips:.1f} target_tp2_pips={target_pips:.1f} "
+                        "tp2_pips_final={final_pips:.1f} min_rr={min_rr:.2f}".format(
+                            sl_pips=sl_pips,
+                            target_pips=desired_tp2_pips,
+                            final_pips=tp2_pips,
+                            min_rr=rr_tp1_only_min,
+                        )
+                    )
+                    self._logger.info(
+                        "[NDS][RR_TP2_AUTOGEN] result=ALLOW sl_pips=%.2f min_rr=%.2f target_tp2_pips=%.2f "
+                        "tp2_pips_final=%.2f max_tp_pips=%.2f max_tp_atr_mult=%.2f",
+                        sl_pips,
+                        rr_tp1_only_min,
+                        desired_tp2_pips,
+                        tp2_pips,
+                        max_tp_pips,
+                        max_tp_atr_mult,
+                    )
+                if not tp2_available:
+                    decision_notes.append(
+                        f"RR_TP1_ONLY min_rr={rr_tp1_only_min:.2f} tp2_missing=true"
+                    )
+                    if rr_ratio + rr_epsilon < rr_tp1_only_min:
+                        return _finalize(
+                            signal=signal,
+                            order_type='NONE',
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            lot_size=0.0,
+                            risk_amount_usd=0.0,
+                            rr_ratio=rr_ratio,
+                            deviation_pips=deviation_pips,
+                            decision_notes=decision_notes,
+                            is_trade_allowed=False,
+                            reject_reason="TP2 required for RR-min under TP1-scaling policy.",
+                        )
             else:
                 rr_eval = rr_ratio_tp2 if rr_ratio_tp2 is not None else rr_ratio
 
