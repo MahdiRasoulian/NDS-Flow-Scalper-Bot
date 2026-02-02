@@ -920,6 +920,11 @@ class GoldNDSAnalyzer:
             if entry_reason:
                 reasons.append(entry_reason)
 
+            if isinstance(entry_source, dict):
+                entry_context = dict(entry_context)
+                if entry_context.get("disp_atr") is None:
+                    entry_context["disp_atr"] = entry_source.get("disp_atr")
+
             signal = entry_idea.get("signal", "NONE") or "NONE"
             result_payload["signal"] = signal
             result_payload["entry_reason"] = entry_reason
@@ -952,6 +957,30 @@ class GoldNDSAnalyzer:
                 entry_context["tp1_target_zone_type"] = tp1_target.get("zone_type")
                 entry_context["tp1_target_zone_direction"] = tp1_target.get("zone_direction")
                 entry_context["tp1_target_reason"] = tp1_target.get("reason")
+
+            sr_reference_price = entry_price if entry_price is not None else current_close
+            sr_context = self._compute_static_sr_context(
+                reference_price=sr_reference_price,
+                atr_value=atr_short_value or atr_v,
+            )
+            if sr_context:
+                result_payload["static_sr"] = sr_context
+                result_payload.setdefault("context", {})
+                result_payload["context"]["static_sr"] = sr_context
+                entry_context = dict(entry_context)
+                entry_context["static_sr"] = sr_context
+                nearest_resistance = sr_context.get("nearest_resistance") or {}
+                nearest_support = sr_context.get("nearest_support") or {}
+                self._log_info(
+                    "[NDS][STATIC_SR] ref=%.2f res=%s res_dist_pips=%s res_dist_atr=%s sup=%s sup_dist_pips=%s sup_dist_atr=%s",
+                    float(sr_reference_price),
+                    nearest_resistance.get("price"),
+                    nearest_resistance.get("dist_pips"),
+                    nearest_resistance.get("dist_atr"),
+                    nearest_support.get("price"),
+                    nearest_support.get("dist_pips"),
+                    nearest_support.get("dist_atr"),
+                )
 
             entry_signal_context = {
                 "signal": signal,
@@ -3347,6 +3376,140 @@ class GoldNDSAnalyzer:
             "bos": structure.bos if structure else "NONE",
             "choch": structure.choch if structure else "NONE",
             "volatility_state": volatility_state,
+        }
+
+    def _compute_static_sr_context(
+        self,
+        reference_price: Optional[float],
+        atr_value: Optional[float],
+    ) -> Dict[str, Any]:
+        """Compute static support/resistance context using swing clustering."""
+        if reference_price is None:
+            return {}
+        try:
+            ref_price = float(reference_price)
+        except (TypeError, ValueError):
+            return {}
+        if atr_value is None:
+            return {}
+        try:
+            atr_val = float(atr_value)
+        except (TypeError, ValueError):
+            return {}
+        if atr_val <= 0:
+            return {}
+
+        settings = self.GOLD_SETTINGS
+        lookback = int(settings.get("STATIC_SR_LOOKBACK", 200))
+        swing_window = int(settings.get("STATIC_SR_SWING_WINDOW", 3))
+        cluster_pips = float(settings.get("STATIC_SR_CLUSTER_PIPS", 15.0))
+        max_levels = int(settings.get("STATIC_SR_MAX_LEVELS", 10))
+        band_atr = float(settings.get("STATIC_SR_BAND_ATR", 0.2))
+        min_band_pips = float(settings.get("STATIC_SR_MIN_BAND_PIPS", 6.0))
+
+        if "high" not in self.df.columns or "low" not in self.df.columns:
+            return {}
+
+        start_idx = max(0, len(self.df) - max(lookback, swing_window * 3))
+        highs = self.df["high"].astype(float).iloc[start_idx:].reset_index(drop=True)
+        lows = self.df["low"].astype(float).iloc[start_idx:].reset_index(drop=True)
+        if highs.empty or lows.empty:
+            return {}
+
+        window = max(1, swing_window)
+        raw_levels: List[Dict[str, Any]] = []
+        for idx in range(window, len(highs) - window):
+            pivot_high = highs.iloc[idx]
+            window_high = highs.iloc[idx - window: idx + window + 1]
+            if pivot_high >= window_high.max():
+                raw_levels.append({"type": "resistance", "price": float(pivot_high)})
+            pivot_low = lows.iloc[idx]
+            window_low = lows.iloc[idx - window: idx + window + 1]
+            if pivot_low <= window_low.min():
+                raw_levels.append({"type": "support", "price": float(pivot_low)})
+
+        if not raw_levels:
+            return {}
+
+        point_size = self._get_point_size()
+        cluster_price = pips_to_price(cluster_pips, point_size)
+        band_half = max(atr_val * band_atr, pips_to_price(min_band_pips, point_size))
+
+        def _cluster(levels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            if not levels:
+                return []
+            levels_sorted = sorted(levels, key=lambda x: x["price"])
+            clustered: List[Dict[str, Any]] = []
+            bucket = [levels_sorted[0]]
+            for item in levels_sorted[1:]:
+                if abs(item["price"] - bucket[-1]["price"]) <= cluster_price:
+                    bucket.append(item)
+                    continue
+                clustered.append(bucket)
+                bucket = [item]
+            clustered.append(bucket)
+
+            result = []
+            for group in clustered:
+                avg_price = sum(item["price"] for item in group) / len(group)
+                result.append(
+                    {
+                        "type": group[0]["type"],
+                        "price": float(avg_price),
+                        "touches": len(group),
+                    }
+                )
+            return result
+
+        supports = _cluster([lvl for lvl in raw_levels if lvl["type"] == "support"])
+        resistances = _cluster([lvl for lvl in raw_levels if lvl["type"] == "resistance"])
+
+        def _decorate(levels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            decorated = []
+            for lvl in levels:
+                price = float(lvl["price"])
+                metrics = calculate_distance_metrics(
+                    entry_price=ref_price,
+                    current_price=price,
+                    point_size=point_size,
+                    atr_value=atr_val,
+                )
+                decorated.append(
+                    {
+                        **lvl,
+                        "band_top": price + band_half,
+                        "band_bottom": price - band_half,
+                        "dist_pips": float(metrics.get("dist_pips") or 0.0),
+                        "dist_atr": float(metrics.get("dist_atr") or 0.0),
+                    }
+                )
+            return decorated
+
+        supports = _decorate(supports)
+        resistances = _decorate(resistances)
+
+        def _nearest(levels: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if not levels:
+                return None
+            return min(levels, key=lambda x: abs(ref_price - x["price"]))
+
+        supports_below = [lvl for lvl in supports if lvl["price"] <= ref_price]
+        resistances_above = [lvl for lvl in resistances if lvl["price"] >= ref_price]
+        nearest_support = _nearest(supports_below)
+        nearest_resistance = _nearest(resistances_above)
+
+        if max_levels > 0:
+            supports = sorted(supports, key=lambda x: x["dist_pips"])[:max_levels]
+            resistances = sorted(resistances, key=lambda x: x["dist_pips"])[:max_levels]
+
+        return {
+            "reference_price": ref_price,
+            "band_half": band_half,
+            "levels": supports + resistances,
+            "supports": supports,
+            "resistances": resistances,
+            "nearest_support": nearest_support,
+            "nearest_resistance": nearest_resistance,
         }
 
 

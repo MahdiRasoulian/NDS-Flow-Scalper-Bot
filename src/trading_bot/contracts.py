@@ -58,6 +58,7 @@ class ExecutionEvent(TypedDict):
     tp: Optional[float]
     profit: Optional[float]
     pips: Optional[float]
+    pips_abs: Optional[float]
     reason: Optional[str]
     metadata: Dict[str, Any]
 
@@ -123,6 +124,7 @@ def compute_pips(
     symbol: str,
     entry: float,
     exit: float,
+    side: Optional[str] = None,
     config_payload: Optional[Dict[str, Any]] = None,
 ) -> float:
     """Compute pips between entry and exit using centralized distance utilities."""
@@ -147,4 +149,15 @@ def compute_pips(
         current_price=exit,
         point_size=point_size,
     )
-    return float(metrics.get("dist_pips") or 0.0)
+    pips_abs = float(metrics.get("dist_pips") or 0.0)
+    if side is None:
+        return pips_abs
+    side_norm = str(side).upper()
+    pip_size = pips_to_price(1.0, point_size)
+    if not pip_size:
+        return pips_abs
+    if side_norm == "BUY":
+        return (float(exit) - float(entry)) / pip_size
+    if side_norm == "SELL":
+        return (float(entry) - float(exit)) / pip_size
+    return pips_abs

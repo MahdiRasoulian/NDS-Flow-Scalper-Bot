@@ -1133,6 +1133,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
             entry_price = self._coerce_float(event.get("entry_price"))
             sl_price = self._coerce_float(event.get("sl"))
             tp_price = self._coerce_float(event.get("tp"))
+            pips = self._coerce_float(event.get("pips"))
+            pips_abs = self._coerce_float(event.get("pips_abs"))
 
             summary = [
                 "=" * 70,
@@ -1152,6 +1154,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 f"  Take Profit: {self._format_optional_value(tp_price)}",
                 f"  Volume: {float(event.get('volume', 0) or 0):.3f}",
                 f"  PnL: {self._format_optional_value(profit, allow_zero=True)}",
+                f"  Pips: {self._format_optional_value(pips, allow_zero=True)}",
+                f"  Pips (abs): {self._format_optional_value(pips_abs, allow_zero=True)}",
                 "=" * 70,
             ]
 
@@ -1183,6 +1187,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
             "ticket": event.get("position_ticket") or event.get("order_ticket"),
             "side": event.get("side"),
             "profit": self._coerce_float(event.get("profit")),
+            "pips": self._coerce_float(event.get("pips")),
+            "pips_abs": self._coerce_float(event.get("pips_abs")),
             "entry_price": self._coerce_float(event.get("entry_price")),
             "exit_price": self._coerce_float(event.get("exit_price")),
             "reason": event.get("reason"),
@@ -1204,6 +1210,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 "ticket",
                 "side",
                 "profit",
+                "pips",
+                "pips_abs",
                 "entry_price",
                 "exit_price",
                 "reason",
