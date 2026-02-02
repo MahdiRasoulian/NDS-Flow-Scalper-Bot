@@ -201,6 +201,10 @@ class GoldNDSAnalyzer:
             'FLOW_SETUP_WEIGHTS': dict,
             'FLOW_SETUP_TOP_K': int,
             'FLOW_SETUP_DISPLACEMENT_ATR_TARGET': float,
+            'FLOW_MOMENTUM_MAX_DIST_ATR': float,
+            'FLOW_MOMENTUM_MAX_DIST_PIPS': float,
+            'FLOW_ALLOW_MOMO_WITHOUT_BASE_SIGNAL': bool,
+            'ADX_STRONG_TREND_MIN': float,
             'MOMO_SESSION_ALLOWLIST': list,
             'MIN_SL_PIPS': float,
             'SMC_MIN_CANDLES': int,
@@ -1476,6 +1480,13 @@ class GoldNDSAnalyzer:
         flow_requires_base_signal = bool(settings.get("FLOW_REQUIRES_BASE_SIGNAL", strict_quality_mode))
         if strict_quality_mode:
             flow_requires_base_signal = True
+        allow_momo_no_base = bool(settings.get("FLOW_ALLOW_MOMO_WITHOUT_BASE_SIGNAL", False))
+        adx_strong_min = float(
+            settings.get(
+                "ADX_STRONG_TREND_MIN",
+                settings.get("ADX_THRESHOLD_STRONG", 30.0),
+            )
+        )
         base_signal = str(market_metrics.get("signal", "NONE") or "NONE")
         if base_signal not in {"BUY", "SELL"}:
             if flow_requires_base_signal:
@@ -1489,6 +1500,73 @@ class GoldNDSAnalyzer:
                 )
                 if override_entry.get("signal") in {"BUY", "SELL"}:
                     return override_entry
+                momo_candidate = None
+                if allow_momo_no_base:
+                    momo_candidate = self._select_flow_entry(
+                        signal="SELL",
+                        structure=structure,
+                        current_price=float(market_metrics.get("current_price", 0.0) or 0.0),
+                        atr_value=float(market_metrics.get("atr_short") or market_metrics.get("atr") or 0.0),
+                        adx_value=float(market_metrics.get("adx") or 0.0),
+                        session_analysis=session_analysis,
+                        volume_analysis=volume_analysis,
+                        scalping_mode=scalping_mode,
+                        signal_context=signal_context,
+                        log_decisions=False,
+                    )
+
+                    trend_ok = str(signal_context.get("trend", "") or "") == "DOWNTREND"
+                    bias_ok = str(signal_context.get("bias", "") or "") == "BEARISH"
+                    adx_ok = float(signal_context.get("adx", 0.0)) >= adx_strong_min
+                    market_status = str(volume_analysis.get("market_status", "") or "").upper()
+                    min_rvol = float(settings.get("MIN_RVOL_SCALPING", 0.35))
+                    session_active = bool(getattr(session_analysis, "is_active_session", True))
+                    session_tradable = getattr(session_analysis, "is_tradable", True)
+                    session_ok = session_active and (True if session_tradable is None else bool(session_tradable))
+                    liquidity_ok = (
+                        market_status not in {"CLOSED", "HALTED"}
+                        and float(volume_analysis.get("rvol", 1.0)) >= min_rvol
+                        and session_active
+                    )
+                    momo_ok = (
+                        momo_candidate.get("signal") == "SELL"
+                        and momo_candidate.get("entry_type") == "MOMENTUM"
+                        and momo_candidate.get("entry_level") is not None
+                    )
+                    prox_ok = bool((momo_candidate.get("metrics") or {}).get("momo_proximity_ok", momo_ok))
+                    self._log_info(
+                        "[NDS][FLOW][MOMO_GATES] base_signal_ok=%s trend_ok=%s adx_ok=%s bias_ok=%s liquidity_ok=%s "
+                        "session_ok=%s momo_ok=%s prox_ok=%s",
+                        False,
+                        trend_ok,
+                        adx_ok,
+                        bias_ok,
+                        liquidity_ok,
+                        session_ok,
+                        momo_ok,
+                        prox_ok,
+                    )
+                    allow_promo = trend_ok and adx_ok and bias_ok and liquidity_ok and session_ok and momo_ok and prox_ok
+                    if allow_promo:
+                        momo_candidate.setdefault("metrics", {})
+                        momo_candidate["metrics"]["flow_promoted_no_base"] = True
+                        momo_candidate["metrics"]["flow_promoted_reason"] = "strong_trend_sell"
+                        momo_candidate["reason"] = (
+                            f"{momo_candidate.get('reason', 'strong_trend_sell')} | promote_no_base"
+                        )
+                        self._log_info(
+                            "[NDS][FLOW][PROMOTE_NO_BASE] allow=true reason=strong_trend_sell signal=%s tier=%s type=%s",
+                            momo_candidate.get("signal"),
+                            momo_candidate.get("tier"),
+                            momo_candidate.get("entry_type"),
+                        )
+                        return momo_candidate
+                    self._log_info(
+                        "[NDS][FLOW][PROMOTE_NO_BASE] allow=false reason=gate_blocked signal=%s entry_type=%s reject=%s",
+                        momo_candidate.get("signal") if momo_candidate else "NONE",
+                        momo_candidate.get("entry_type") if momo_candidate else "NONE",
+                        momo_candidate.get("reject_reason") if momo_candidate else "no_candidate",
+                    )
                 self._log_info(
                     "[NDS][FLOW_DECISION] tier=NONE type=NONE allowed=false reject=BASE_SIGNAL_NONE reason=no_base_signal",
                 )
@@ -1668,6 +1746,7 @@ class GoldNDSAnalyzer:
                 volume_analysis=volume_analysis,
                 scalping_mode=scalping_mode,
                 signal_context=signal_context,
+                log_decisions=False,
             )
             if entry.get("signal") not in {"BUY", "SELL"}:
                 continue
@@ -1841,6 +1920,7 @@ class GoldNDSAnalyzer:
         volume_analysis: Dict[str, Any],
         scalping_mode: bool,
         signal_context: Dict[str, Any],
+        log_decisions: bool = True,
     ) -> Dict[str, Any]:
         """Select entry tier (Breaker/IFVG/Momentum) with strict hierarchy."""
         if signal not in {"BUY", "SELL"}:
@@ -2153,37 +2233,39 @@ class GoldNDSAnalyzer:
             if time_error:
                 momentum_block_reason = "time_parse_failed"
                 momentum_reason = f"time_parse_failed:{time_error}"
-                self._log_info(
-                    "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
-                    momentum_block_reason,
-                )
-                if momentum_block_reason in {"adx_below_min", "bias_mismatch", "liquidity_blocked", "untradable_market"}:
+                if log_decisions:
                     self._log_info(
-                        "[NDS][MOMO_BLOCK] reason=%s session=%s ts_broker=%s",
+                        "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
                         momentum_block_reason,
-                        session_name,
+                    )
+                    if momentum_block_reason in {"adx_below_min", "bias_mismatch", "liquidity_blocked", "untradable_market"}:
+                        self._log_info(
+                            "[NDS][MOMO_BLOCK] reason=%s session=%s ts_broker=%s",
+                            momentum_block_reason,
+                            session_name,
+                            broker_ts,
+                        )
+                    self._log_info(
+                        "[NDS][MOMO_BLOCK] reason=time_parse_failed start=%s end=%s ts_broker=%s",
+                        time_start,
+                        time_end,
                         broker_ts,
                     )
-                self._log_info(
-                    "[NDS][MOMO_BLOCK] reason=time_parse_failed start=%s end=%s ts_broker=%s",
-                    time_start,
-                    time_end,
-                    broker_ts,
-                )
                 in_window = False
             elif not in_window:
                 momentum_block_reason = "time_outside_window"
                 momentum_reason = "time_outside_window"
-                self._log_info(
-                    "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
-                    momentum_block_reason,
-                )
-                self._log_info(
-                    "[NDS][MOMO_BLOCK] reason=time_outside_window start=%s end=%s ts_broker=%s",
-                    time_start,
-                    time_end,
-                    broker_ts,
-                )
+                if log_decisions:
+                    self._log_info(
+                        "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
+                        momentum_block_reason,
+                    )
+                    self._log_info(
+                        "[NDS][MOMO_BLOCK] reason=time_outside_window start=%s end=%s ts_broker=%s",
+                        time_start,
+                        time_end,
+                        broker_ts,
+                    )
 
             session_name = self._normalize_session_name(
                 getattr(session_analysis, "current_session", "OTHER")
@@ -2213,6 +2295,16 @@ class GoldNDSAnalyzer:
             adx_ok = adx_value >= momo_adx_min
             time_ok = in_window
             session_ok = session_ok
+
+            if log_decisions:
+                self._log_info(
+                    "[NDS][FLOW][MOMO_GATES] adx_ok=%s time_ok=%s session_ok=%s liquidity_ok=%s bias_ok=%s",
+                    adx_ok,
+                    time_ok,
+                    session_ok,
+                    liquidity_ok,
+                    bias_ok,
+                )
 
             if adx_ok and time_ok and session_ok and liquidity_ok and bias_ok:
                 buffer_atr = float(settings.get("MOMO_BUFFER_ATR_MULT", 0.1))
@@ -2257,11 +2349,12 @@ class GoldNDSAnalyzer:
                         momentum_block_reason = "adx_below_min"
                     elif not session_ok:
                         momentum_block_reason = "session_blocked"
-                        self._log_info(
-                            "[NDS][MOMO_BLOCK] reason=session_blocked session=%s allowlist=%s",
-                            session_name,
-                            allowlist,
-                        )
+                        if log_decisions:
+                            self._log_info(
+                                "[NDS][MOMO_BLOCK] reason=session_blocked session=%s allowlist=%s",
+                                session_name,
+                                allowlist,
+                            )
                     elif not liquidity_ok:
                         momentum_block_reason = "untradable_market" if market_status in {"CLOSED", "HALTED"} else "liquidity_blocked"
                     elif not bias_ok:
@@ -2269,10 +2362,11 @@ class GoldNDSAnalyzer:
                     else:
                         momentum_block_reason = "time_outside_window"
                 momentum_reason = momentum_block_reason
-                self._log_info(
-                    "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
-                    momentum_block_reason,
-                )
+                if log_decisions:
+                    self._log_info(
+                        "[NDS][FLOW_TIER] tier=C momentum blocked (reason=%s)",
+                        momentum_block_reason,
+                    )
 
         if entry_level is None:
             entry_reason = entry_reason if momentum_reason is None else f"{entry_reason}; momo_block={momentum_reason}"
@@ -2288,18 +2382,42 @@ class GoldNDSAnalyzer:
                     atr_value=atr_value,
                 )
             )
-            self._log_info(
-                "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f point_size=%.4f dist_price=%.3f dist_points=%.2f dist_pips=%.2f dist_usd=%.3f dist_atr=%.2f",
-                entry_type,
-                float(entry_level),
-                float(current_price),
-                float(entry_context.get("point_size") or 0.0),
-                float(entry_context.get("dist_price") or 0.0),
-                float(entry_context.get("dist_points") or 0.0),
-                float(entry_context.get("dist_pips") or 0.0),
-                float(entry_context.get("dist_usd") or 0.0),
-                float(entry_context.get("dist_atr") or 0.0),
-            )
+            if log_decisions:
+                self._log_info(
+                    "[NDS][ENTRY_METRICS] type=%s entry=%.3f cur=%.3f point_size=%.4f dist_price=%.3f dist_points=%.2f dist_pips=%.2f dist_usd=%.3f dist_atr=%.2f",
+                    entry_type,
+                    float(entry_level),
+                    float(current_price),
+                    float(entry_context.get("point_size") or 0.0),
+                    float(entry_context.get("dist_price") or 0.0),
+                    float(entry_context.get("dist_points") or 0.0),
+                    float(entry_context.get("dist_pips") or 0.0),
+                    float(entry_context.get("dist_usd") or 0.0),
+                    float(entry_context.get("dist_atr") or 0.0),
+                )
+            if entry_type == "MOMENTUM" and entry_model == "STOP":
+                max_dist_atr = float(settings.get("FLOW_MOMENTUM_MAX_DIST_ATR", 0.35))
+                max_dist_pips = float(settings.get("FLOW_MOMENTUM_MAX_DIST_PIPS", 60.0))
+                dist_pips = float(entry_context.get("dist_pips") or 0.0)
+                dist_atr = float(entry_context.get("dist_atr") or 0.0)
+                prox_ok = dist_pips <= max_dist_pips and dist_atr <= max_dist_atr
+                entry_context["momo_proximity_ok"] = prox_ok
+                entry_context["momo_proximity_caps"] = {
+                    "max_dist_pips": max_dist_pips,
+                    "max_dist_atr": max_dist_atr,
+                }
+                if not prox_ok:
+                    if log_decisions:
+                        self._log_info(
+                            "[NDS][FLOW][MOMO_PROX_REJECT] dist_pips=%.2f dist_atr=%.2f cap_pips=%.2f cap_atr=%.2f",
+                            dist_pips,
+                            dist_atr,
+                            max_dist_pips,
+                            max_dist_atr,
+                        )
+                    entry_reason = f"{entry_reason}; momo_prox_reject"
+                    reject_reason = "MOMO_ENTRY_TOO_FAR"
+                    entry_level = None
 
         entry_context.update(
             {
@@ -2318,23 +2436,25 @@ class GoldNDSAnalyzer:
 
         allowed = entry_level is not None
         if allowed:
-            self._log_info(
-                "[NDS][FLOW_DECISION] tier=%s type=%s model=%s signal=%s allowed=true reason=%s conf=%.2f",
-                tier,
-                entry_type,
-                entry_model,
-                signal,
-                entry_reason,
-                entry_confidence,
-            )
+            if log_decisions:
+                self._log_info(
+                    "[NDS][FLOW_DECISION] tier=%s type=%s model=%s signal=%s allowed=true reason=%s conf=%.2f",
+                    tier,
+                    entry_type,
+                    entry_model,
+                    signal,
+                    entry_reason,
+                    entry_confidence,
+                )
         else:
-            self._log_info(
-                "[NDS][FLOW_DECISION] tier=%s type=%s allowed=false reject=%s reason=%s",
-                tier,
-                entry_type,
-                reject_reason,
-                entry_reason,
-            )
+            if log_decisions:
+                self._log_info(
+                    "[NDS][FLOW_DECISION] tier=%s type=%s allowed=false reject=%s reason=%s",
+                    tier,
+                    entry_type,
+                    reject_reason,
+                    entry_reason,
+                )
 
         return {
             "signal": signal if entry_level is not None else "NONE",

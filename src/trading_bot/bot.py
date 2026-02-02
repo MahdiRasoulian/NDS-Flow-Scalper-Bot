@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # ایمپورت‌های پروژه
 from config.settings import config
 from src.utils.telegram_notifier import TelegramNotifier
+from src.trading_bot.nds.models import FinalizedOrderParams
 
 # ایمپورت مدیر ریسک اسکلپینگ
 try:
@@ -484,6 +485,28 @@ class NDSBot:
                 details.get("diff"),
                 details.get("min_candles"),
             )
+
+    def _format_decision_value(self, value: Optional[float]) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            if abs(float(value)) < 1e-9:
+                return "N/A"
+        except (TypeError, ValueError):
+            return "N/A"
+        return f"{float(value):.2f}"
+
+    def _format_final_decision_summary(self, finalized: FinalizedOrderParams) -> str:
+        entry_text = self._format_decision_value(finalized.entry_price)
+        sl_text = self._format_decision_value(finalized.stop_loss)
+        tp_text = self._format_decision_value(finalized.take_profit)
+        rr_text = "N/A"
+        try:
+            if finalized.rr_ratio is not None:
+                rr_text = f"{float(finalized.rr_ratio):.2f}"
+        except (TypeError, ValueError):
+            rr_text = "N/A"
+        return f"🧮 تصمیم نهایی (RiskManager): entry={entry_text} sl={sl_text} tp={tp_text} rr={rr_text}"
 
     def _maybe_monitor_trades(self, force: bool = False):
         """مانیتورینگ معاملات با throttle برای جلوگیری از فشار"""
@@ -1388,15 +1411,9 @@ class NDSBot:
                 finalized.reject_reason,
                 finalized.decision_notes[-3:],
             )
-            print(
-                "🧮 تصمیم نهایی (RiskManager): entry=%.2f sl=%.2f tp=%.2f rr=%.2f"
-                % (
-                    float(finalized.entry_price),
-                    float(finalized.stop_loss),
-                    float(finalized.take_profit),
-                    float(finalized.rr_ratio),
-                )
-            )
+            decision_line = self._format_final_decision_summary(finalized)
+            logger.info(decision_line)
+            print(decision_line)
             # ------------------------------------------------------------------
 
             if not finalized.is_trade_allowed:
