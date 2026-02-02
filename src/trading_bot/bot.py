@@ -59,6 +59,7 @@ from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 from src.trading_bot.trade_tracker import TradeTracker
 from src.trading_bot.position_state import PositionStateStore
+from src.trading_bot.position_manager import PositionManager
 from src.trading_bot.cooldown import (
     CooldownDecision,
     evaluate_cooldown,
@@ -120,6 +121,7 @@ class NDSBot:
         self.price_monitor = RealTimePriceMonitor(config=self.config, bot_state=self.bot_state, logger=logger)
         self.trade_tracker = TradeTracker()
         self.user_controls = UserControls(self, logger)
+        self.position_manager = None
 
         self.notifier = TelegramNotifier()
 
@@ -513,6 +515,13 @@ class NDSBot:
             # ------------------------------------------------------------
             if self.mt5_client is None:
                 self.mt5_client = self.MT5Client_cls()
+            if self.position_manager is None:
+                self.position_manager = PositionManager(
+                    self.config,
+                    self.mt5_client,
+                    trade_tracker=self.trade_tracker,
+                    logger=logger,
+                )
 
             # ------------------------------------------------------------
             # 2) اعمال تنظیمات Real-Time از bot_config.json روی MT5Client
@@ -1640,6 +1649,15 @@ class NDSBot:
                 sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
                 tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
                 tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+                flow_settings = config_payload.get("flow_settings", {}) if isinstance(config_payload, dict) else {}
+                risk_settings = config_payload.get("risk_settings", {}) if isinstance(config_payload, dict) else {}
+                trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
+                tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
+                tp_plan = "single_tp"
+                if trail_after_tp1:
+                    tp_plan = "trail_after_tp1"
+                elif tp2_enabled and tp2_price is not None:
+                    tp_plan = "tp1_tp2"
 
                 logger.info(
                     "✅ [TRADE][OPEN] ticket=%s position=%s symbol=%s side=%s entry=%.2f sl=%.2f tp=%.2f vol=%.3f order_type=%s",
@@ -1708,6 +1726,10 @@ class NDSBot:
                         "spread_pips": spread_pips,
                         "point_size": point_size,
                         "tp2_price": tp2_price,
+                        "tp1_price": actual_tp,
+                        "tp_plan": tp_plan,
+                        "tp2_enabled": tp2_enabled,
+                        "trail_after_tp1": trail_after_tp1,
                     },
                 }
                 self.trade_tracker.add_trade_open(open_event)
@@ -1785,6 +1807,15 @@ class NDSBot:
             self.bot_state.active_positions = open_positions
 
             self._log_positions_summary(open_positions)
+            if self.position_manager is not None:
+                try:
+                    self.position_manager.manage_positions(open_positions)
+                except Exception as manager_error:
+                    logger.error(
+                        "⚠️ خطا در PositionManager: %s",
+                        manager_error,
+                        exc_info=True,
+                    )
             exposure_bias = resolve_exposure_bias(open_positions)
             if open_positions or pending_orders:
                 self.bot_state.active_signal_direction = exposure_bias if exposure_bias != "NONE" else None

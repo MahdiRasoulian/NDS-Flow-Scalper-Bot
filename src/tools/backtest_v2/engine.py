@@ -9,7 +9,11 @@ import pandas as pd
 
 from src.trading_bot.nds.analyzer import analyze_gold_market
 from src.trading_bot.nds.models import LivePriceSnapshot
-from src.trading_bot.nds.distance_utils import calculate_distance_metrics, resolve_point_size_from_config
+from src.trading_bot.nds.distance_utils import (
+    calculate_distance_metrics,
+    resolve_point_size_from_config,
+    pips_to_price,
+)
 from src.trading_bot.risk_manager import create_scalping_risk_manager
 from src.trading_bot.config_utils import get_setting
 from src.trading_bot.cooldown import evaluate_cooldown, get_min_candles_between_trades, warn_deprecated_cooldown_settings
@@ -30,6 +34,7 @@ class Position:
     entry_price: float
     stop_loss: float
     take_profit: float
+    tp2_price: Optional[float]
     lot: float
     order_type: str
     confidence: float
@@ -39,6 +44,8 @@ class Position:
     planned_entry: float
     deviation_pips: float
     notes: List[str]
+    entry_atr: Optional[float] = None
+    counter_trend: bool = False
 
     close_time: Optional[pd.Timestamp] = None
     close_bar_index: Optional[int] = None
@@ -46,6 +53,11 @@ class Position:
     exit_reason: Optional[str] = None
     pnl_usd: Optional[float] = None
     duration_bars: Optional[int] = None
+    remaining_lot: Optional[float] = None
+    realized_pnl: float = 0.0
+    tp1_hit: bool = False
+    sl_moved_to_be: bool = False
+    trail_active: bool = False
 
 
 @dataclass
@@ -58,6 +70,7 @@ class PendingOrder:
     planned_entry: float
     stop_loss: float
     take_profit: float
+    take_profit2: Optional[float]
     lot: float
     order_type: str
     confidence: float
@@ -66,6 +79,7 @@ class PendingOrder:
     session: str
     deviation_pips: float
     notes: List[str]
+    counter_trend: bool = False
 
     filled_time: Optional[pd.Timestamp] = None
     filled_bar_index: Optional[int] = None
@@ -81,6 +95,7 @@ class PendingOrder:
             entry_price=float(self.filled_price if self.filled_price is not None else self.planned_entry),
             stop_loss=float(self.stop_loss),
             take_profit=float(self.take_profit),
+            tp2_price=float(self.take_profit2) if self.take_profit2 is not None else None,
             lot=float(self.lot),
             order_type=str(self.order_type),
             confidence=float(self.confidence),
@@ -90,6 +105,9 @@ class PendingOrder:
             planned_entry=float(self.planned_entry),
             deviation_pips=float(self.deviation_pips),
             notes=list(self.notes or []),
+            remaining_lot=float(self.lot),
+            entry_atr=None,
+            counter_trend=bool(self.counter_trend),
         )
 
 
@@ -200,6 +218,8 @@ class BacktestEngine:
         trading_settings = get_setting(config, "trading_settings", {}) or {}
         gold_specs = trading_settings.get("GOLD_SPECIFICATIONS", {}) if isinstance(trading_settings, dict) else {}
         self.contract_size = float(gold_specs.get("CONTRACT_SIZE", gold_specs.get("contract_size", 100.0)) or 100.0)
+        self.flow_settings = get_setting(config, "flow_settings", {}) or {}
+        self.risk_settings = get_setting(config, "risk_settings", {}) or {}
 
     def _normalize_signal(self, signal_value: str) -> str:
         sig = (signal_value or "NONE").upper()
@@ -359,9 +379,10 @@ class BacktestEngine:
         return (exit_price - entry) * direction * self.contract_size * lot
 
     def _apply_exit_checks(self, position: Position, high: float, low: float) -> Optional[Tuple[str, float]]:
+        has_tp = position.take_profit is not None and position.take_profit > 0
         if position.side == "BUY":
             sl_hit = low <= position.stop_loss
-            tp_hit = high >= position.take_profit
+            tp_hit = has_tp and high >= position.take_profit
             if sl_hit and tp_hit:
                 return "SL", position.stop_loss
             if sl_hit:
@@ -370,7 +391,7 @@ class BacktestEngine:
                 return "TP", position.take_profit
         else:
             sl_hit = high >= position.stop_loss
-            tp_hit = low <= position.take_profit
+            tp_hit = has_tp and low <= position.take_profit
             if sl_hit and tp_hit:
                 return "SL", position.stop_loss
             if sl_hit:
@@ -378,6 +399,82 @@ class BacktestEngine:
             if tp_hit:
                 return "TP", position.take_profit
         return None
+
+    def _price_reached(self, side: str, high: float, low: float, price: float) -> bool:
+        if side == "BUY":
+            return high >= price
+        return low <= price
+
+    def _apply_tp1_management(
+        self,
+        position: Position,
+        high: float,
+        low: float,
+        close: float,
+    ) -> None:
+        be_trigger_pips = (
+            self.risk_settings.get("BE_TRIGGER_PIPS_COUNTERTREND")
+            if position.counter_trend
+            else self.risk_settings.get("BE_TRIGGER_PIPS_SCALP")
+        )
+        if not position.sl_moved_to_be and be_trigger_pips is not None:
+            trigger_distance = pips_to_price(float(be_trigger_pips), self.point_size)
+            if position.side == "BUY" and high >= position.entry_price + trigger_distance:
+                position.stop_loss = position.entry_price
+                position.sl_moved_to_be = True
+            elif position.side == "SELL" and low <= position.entry_price - trigger_distance:
+                position.stop_loss = position.entry_price
+                position.sl_moved_to_be = True
+
+        if position.tp1_hit:
+            return
+
+        if self._price_reached(position.side, high, low, position.take_profit):
+            if position.side == "BUY" and low <= position.stop_loss:
+                return
+            if position.side == "SELL" and high >= position.stop_loss:
+                return
+
+            partial_pct = float(self.flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5))
+            close_lot = max(position.remaining_lot * partial_pct, 0.0)
+            if close_lot > 0:
+                position.realized_pnl += self._calculate_pnl(
+                    position.side,
+                    position.entry_price,
+                    position.take_profit,
+                    close_lot,
+                )
+                position.remaining_lot -= close_lot
+
+            position.tp1_hit = True
+
+            if bool(self.flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE", True)):
+                position.stop_loss = position.entry_price
+                position.sl_moved_to_be = True
+
+            if bool(self.flow_settings.get("FLOW_TRAIL_AFTER_TP1", True)):
+                position.take_profit = 0.0
+                position.trail_active = True
+            elif position.tp2_price is not None:
+                position.take_profit = position.tp2_price
+
+        if position.trail_active and position.entry_atr:
+            trail_mult = float(self.flow_settings.get("FLOW_TRAIL_ATR_MULT", 2.0))
+            trail_distance = float(position.entry_atr) * trail_mult
+            if trail_distance <= 0:
+                return
+            if position.side == "BUY":
+                new_sl = close - trail_distance
+                if position.sl_moved_to_be:
+                    new_sl = max(new_sl, position.entry_price)
+                if new_sl > position.stop_loss:
+                    position.stop_loss = new_sl
+            else:
+                new_sl = close + trail_distance
+                if position.sl_moved_to_be:
+                    new_sl = min(new_sl, position.entry_price)
+                if new_sl < position.stop_loss:
+                    position.stop_loss = new_sl
 
     def _pending_should_fill(self, order: PendingOrder, high: float, low: float) -> bool:
         if order.side == "BUY" and order.order_type == "STOP":
@@ -447,14 +544,23 @@ class BacktestEngine:
             closed_positions = 0
             if positions:
                 for position in list(positions):
+                    if position.remaining_lot is None:
+                        position.remaining_lot = position.lot
+                    self._apply_tp1_management(position, high, low, close)
                     exit_info = self._apply_exit_checks(position, high, low)
                     if exit_info:
                         exit_reason, target_price = exit_info
                         slippage = -bt_cfg.slippage if position.side == "BUY" else bt_cfg.slippage
                         exit_price = target_price + slippage
-                        raw_pnl = self._calculate_pnl(position.side, position.entry_price, exit_price, position.lot)
+                        remaining_lot = position.remaining_lot if position.remaining_lot is not None else position.lot
+                        raw_pnl = self._calculate_pnl(
+                            position.side,
+                            position.entry_price,
+                            exit_price,
+                            remaining_lot,
+                        )
                         commission = bt_cfg.commission_per_lot * position.lot * 2
-                        pnl = raw_pnl - commission
+                        pnl = position.realized_pnl + raw_pnl - commission
                         position.close_time = current_time
                         position.close_bar_index = i
                         position.close_price = exit_price
@@ -469,7 +575,8 @@ class BacktestEngine:
             unrealized = 0.0
             if positions:
                 for position in positions:
-                    unrealized += self._calculate_pnl(position.side, position.entry_price, close, position.lot)
+                    remaining_lot = position.remaining_lot if position.remaining_lot is not None else position.lot
+                    unrealized += self._calculate_pnl(position.side, position.entry_price, close, remaining_lot)
             equity = balance + unrealized
             equity_curve.append({"time": current_time, "equity": equity, "balance": balance, "open_pnl": unrealized})
 
@@ -671,6 +778,13 @@ class BacktestEngine:
             cycle_payload["sl_pips"] = float(sl_metrics.get("dist_pips") or 0.0)
             cycle_payload["tp_pips"] = float(tp_metrics.get("dist_pips") or 0.0)
 
+            market_metrics = result.get("market_metrics") or (result.get("context") or {}).get("market_metrics", {})
+            entry_atr = None
+            if isinstance(market_metrics, dict):
+                entry_atr = market_metrics.get("atr_short") or market_metrics.get("atr")
+            entry_context = result.get("entry_context") or (result.get("context") or {}).get("entry_context", {})
+            counter_trend = bool(entry_context.get("counter_trend")) if isinstance(entry_context, dict) else False
+
             order_type = finalized.order_type.upper()
             cycle_payload["entry_model"] = order_type
             position_id = f"T{trade_id_counter:05d}"
@@ -688,6 +802,7 @@ class BacktestEngine:
                     entry_price=entry_price,
                     stop_loss=finalized.stop_loss,
                     take_profit=finalized.take_profit,
+                    tp2_price=finalized.take_profit2,
                     lot=finalized.lot_size,
                     order_type=order_type,
                     confidence=confidence,
@@ -697,6 +812,9 @@ class BacktestEngine:
                     planned_entry=finalized.entry_price,
                     deviation_pips=finalized.deviation_pips,
                     notes=list(finalized.decision_notes),
+                    entry_atr=float(entry_atr) if entry_atr is not None else None,
+                    remaining_lot=float(finalized.lot_size),
+                    counter_trend=counter_trend,
                 )
                 positions.append(position)
             else:
@@ -706,25 +824,27 @@ class BacktestEngine:
                     cycle_log.append(cycle_payload)
                     continue
                 pending_orders.append(
-                    PendingOrder(
-                        id=position_id,
-                        side=final_signal,
-                        symbol=bt_cfg.symbol,
-                        created_time=current_time,
-                        created_bar_index=i,
-                        planned_entry=finalized.entry_price,
-                        stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
-                        lot=finalized.lot_size,
-                        order_type=order_type,
-                        confidence=confidence,
-                        score=score,
+                        PendingOrder(
+                            id=position_id,
+                            side=final_signal,
+                            symbol=bt_cfg.symbol,
+                            created_time=current_time,
+                            created_bar_index=i,
+                            planned_entry=finalized.entry_price,
+                            stop_loss=finalized.stop_loss,
+                            take_profit=finalized.take_profit,
+                            take_profit2=finalized.take_profit2,
+                            lot=finalized.lot_size,
+                            order_type=order_type,
+                            confidence=confidence,
+                            score=score,
                         rr=finalized.rr_ratio,
                         session=session_info["session"],
-                        deviation_pips=finalized.deviation_pips,
-                        notes=list(finalized.decision_notes),
+                            deviation_pips=finalized.deviation_pips,
+                            notes=list(finalized.decision_notes),
+                            counter_trend=counter_trend,
+                        )
                     )
-                )
 
             trades_today += 1
             last_trade_index = i
