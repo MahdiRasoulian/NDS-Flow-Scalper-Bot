@@ -119,3 +119,43 @@ def test_tp2_only_rejects_when_repair_caps_block_tp2():
 
     assert not finalized.is_trade_allowed
     assert finalized.reject_reason == "TP2 cap exceeded for RR repair."
+
+
+def test_tp2_only_allows_large_sl_with_tp2_autogen():
+    cfg = _base_config()
+    cfg["risk_manager_config"]["SCALP_TP1_ONLY_MIN_RR"] = 0.4
+    cfg["risk_settings"]["SL_MIN_PIPS"] = 10.0
+    cfg["risk_settings"]["MIN_SL_PIPS"] = 10.0
+    cfg["risk_settings"]["SL_MAX_PIPS"] = 300.0
+    cfg["risk_settings"]["SL_MAX_PIPS_SCALP"] = 300.0
+    cfg["risk_settings"]["MIN_RISK_REWARD"] = 0.9
+
+    risk_manager = create_scalping_risk_manager(overrides=cfg)
+    analysis_payload = {
+        "signal": "BUY",
+        "confidence": 80.0,
+        "entry_level": 2000.0,
+        "entry_model": "MARKET",
+        "market_metrics": {"atr": 0.0},
+        "entry_context": {
+            "recent_low": 1997.055,
+            "recent_high": 2003.0,
+        },
+        "scalping_mode": True,
+    }
+    live_snapshot = LivePriceSnapshot(bid=2000.0, ask=2000.05, timestamp="2026-02-02T10:07:57")
+    finalized = risk_manager.finalize_order(
+        analysis=analysis_payload,
+        live=live_snapshot,
+        symbol="XAUUSD",
+        config=cfg,
+    )
+
+    assert finalized.is_trade_allowed
+    assert any(
+        "RR_VALIDATE scope=TP2_ONLY rr_checked=TP2" in note for note in finalized.decision_notes
+    )
+    assert any(
+        "source=min_rr:scalp.SCALP_TP1_ONLY_MIN_RR" in note for note in finalized.decision_notes
+    )
+    assert not any("0.90" in note for note in finalized.decision_notes)
