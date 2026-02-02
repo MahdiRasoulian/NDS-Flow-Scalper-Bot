@@ -38,8 +38,10 @@ def _build_config_payload() -> dict:
     cfg = config.get_full_config()
     cfg.setdefault("risk_manager_config", {})
     cfg.setdefault("risk_settings", {})
+    cfg.setdefault("technical_settings", {})
     cfg["risk_manager_config"]["MIN_RR_RATIO"] = 0.1
     cfg["risk_settings"]["MIN_RISK_REWARD"] = 0.1
+    cfg["technical_settings"]["ATR_SL_MULTIPLIER"] = 10.0
     cfg["risk_settings"].setdefault("RISK_AMOUNT_USD", 25.0)
     return cfg
 
