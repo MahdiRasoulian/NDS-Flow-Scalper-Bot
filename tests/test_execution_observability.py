@@ -84,3 +84,60 @@ def test_trade_tracker_fallback_maps_pending_trade_metadata():
     assert 555 in tracker.active_trades
     metadata = tracker.active_trades[555]["open_event"]["metadata"]
     assert metadata.get("tp1_price") == 2005.0
+
+
+def test_close_event_merges_open_metadata_when_missing():
+    tracker = TradeTracker()
+    opened_at = datetime.utcnow()
+    tracker.add_trade_open(
+        {
+            "event_type": "OPEN",
+            "event_time": opened_at,
+            "symbol": "XAUUSD",
+            "order_ticket": 991,
+            "position_ticket": 992,
+            "side": "BUY",
+            "volume": 1.0,
+            "entry_price": 2000.0,
+            "exit_price": None,
+            "sl": 1995.0,
+            "tp": 0.0,
+            "profit": None,
+            "pips": None,
+            "pips_abs": None,
+            "reason": None,
+            "metadata": {
+                "tp1_price": 2005.0,
+                "tp2_price": 2010.0,
+                "tp_execution_mode": "TP1_PARTIAL_MANAGED",
+                "entry_snapshot": {"risk": {"tp1": 2005.0}},
+            },
+        }
+    )
+
+    tracker.close_trade_event(
+        {
+            "event_type": "CLOSE",
+            "event_time": opened_at + timedelta(minutes=2),
+            "symbol": "XAUUSD",
+            "order_ticket": 991,
+            "position_ticket": 992,
+            "side": "BUY",
+            "volume": 1.0,
+            "entry_price": 2000.0,
+            "exit_price": 1995.0,
+            "sl": 1995.0,
+            "tp": 0.0,
+            "profit": -50.0,
+            "pips": -50.0,
+            "pips_abs": 50.0,
+            "reason": "SL",
+            "metadata": {"history": {"reason": "SL"}},
+        }
+    )
+
+    close_event = tracker.closed_trades[-1]["close_event"]
+    assert close_event["metadata"]["tp1_price"] == 2005.0
+    assert close_event["metadata"]["tp2_price"] == 2010.0
+    assert close_event["metadata"]["tp_execution_mode"] == "TP1_PARTIAL_MANAGED"
+    assert close_event["metadata"]["entry_snapshot"] == {"risk": {"tp1": 2005.0}}
