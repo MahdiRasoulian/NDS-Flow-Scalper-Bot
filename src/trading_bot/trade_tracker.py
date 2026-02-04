@@ -85,6 +85,18 @@ class TradeTracker:
         if identity.get("detected_by") != "recovery_scan":
             self.daily_stats['total_trades'] += 1
 
+    def _apply_position_resolution(self, record: Dict, position_ticket: int) -> None:
+        record = self.normalize_trade_record(record)
+        if not record:
+            return
+        record["trade_identity"]["position_ticket"] = position_ticket
+        open_event = record.get("open_event", {})
+        open_event["position_ticket"] = position_ticket
+        metadata = open_event.get("metadata", {}) or {}
+        metadata.setdefault("position_ticket", position_ticket)
+        open_event["metadata"] = metadata
+        record["open_event"] = open_event
+
     def _build_trade_identity(self, event: ExecutionEvent) -> TradeIdentity:
         metadata = event.get("metadata", {}) or {}
         order_ticket = event.get("order_ticket") or metadata.get("order_ticket") or metadata.get("deal_ticket")
@@ -130,6 +142,29 @@ class TradeTracker:
             trade = self.pending_closes[position_ticket].get("record")
         if trade is None:
             return
+
+        event_metadata = event.get("metadata") or {}
+        open_metadata = trade.get("open_event", {}).get("metadata", {}) or {}
+        if open_metadata:
+            for key in (
+                "tp1_price",
+                "tp2_price",
+                "tp_execution_mode",
+                "tp_sent_to_broker",
+                "entry_snapshot",
+                "rr_ratio",
+                "rr_validate_mode",
+                "rr_checked",
+                "min_rr_source",
+                "tp_plan",
+                "tp2_enabled",
+                "trail_after_tp1",
+                "partial_close_count",
+                "remaining_volume_after_tp1",
+            ):
+                if event_metadata.get(key) is None and open_metadata.get(key) is not None:
+                    event_metadata[key] = open_metadata.get(key)
+        event["metadata"] = event_metadata
 
         trade["close_event"] = event
         trade["status"] = "CLOSED"
@@ -372,11 +407,19 @@ class TradeTracker:
                     )
                     continue
                 identity: TradeIdentity = record["trade_identity"]
-                record["trade_identity"]["position_ticket"] = pos_ticket
+                self._apply_position_resolution(record, pos_ticket)
                 self.active_trades[pos_ticket] = record
                 del self.pending_trades_by_order[order_ticket]
                 unmatched_positions.discard(pos_ticket)
                 updated_count += 1
+                order_type = (record.get("open_event", {}).get("metadata", {}) or {}).get("order_type")
+                if str(order_type).lower() == "market":
+                    logger.info(
+                        "[TRADE][OPEN_RESOLVED_POSITION] order=%s position=%s symbol=%s",
+                        order_ticket,
+                        pos_ticket,
+                        identity.get("symbol"),
+                    )
                 logger.info(
                     "[TRADE][PENDING_TO_OPEN] order=%s position=%s symbol=%s side=%s magic=%s comment=%s score=%s match=%s",
                     order_ticket,

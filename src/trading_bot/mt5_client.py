@@ -1074,6 +1074,8 @@ class MT5Client:
                 magic=request.get("magic"),
                 comment=request_comment,
                 opened_after_time=request_time,
+                side=order_type,
+                volume=volume,
                 timeout_sec=5,
             )
 
@@ -1103,6 +1105,8 @@ class MT5Client:
         magic: Optional[int],
         comment: Optional[str],
         opened_after_time: datetime,
+        side: Optional[str] = None,
+        volume: Optional[float] = None,
         timeout_sec: int = 5,
     ) -> Optional[int]:
         """تلاش برای یافتن position_ticket بعد از ارسال سفارش."""
@@ -1111,16 +1115,26 @@ class MT5Client:
 
         deadline = time.time() + timeout_sec
         matched_positions: List[Any] = []
+        target_side = str(side or "").upper() if side else None
+        target_volume = float(volume) if volume is not None else None
 
         while time.time() < deadline:
             try:
                 positions = self._mt5_call(mt5.positions_get, symbol=symbol)
                 if positions:
-                    matched_positions = [
-                        pos for pos in positions
-                        if (magic is None or pos.magic == magic)
-                        and (comment is None or (pos.comment or "").strip() == comment.strip())
-                    ]
+                    candidates: List[Any] = []
+                    for pos in positions:
+                        if magic is not None and pos.magic != magic:
+                            continue
+                        pos_side = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+                        if target_side and pos_side != target_side:
+                            continue
+                        if target_volume is not None and abs(float(pos.volume) - target_volume) > 1e-6:
+                            continue
+                        if comment and (pos.comment or "").strip() and (pos.comment or "").strip() != comment.strip():
+                            continue
+                        candidates.append(pos)
+                    matched_positions = candidates
                     if matched_positions:
                         break
             except Exception:
@@ -1809,6 +1823,8 @@ class MT5Client:
                 magic=request.get("magic"),
                 comment=request.get("comment"),
                 opened_after_time=request_time,
+                side=order_type,
+                volume=volume,
                 timeout_sec=5,
             )
             result["position_ticket"] = position_ticket

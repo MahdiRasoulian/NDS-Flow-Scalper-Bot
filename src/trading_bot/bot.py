@@ -1833,6 +1833,44 @@ class NDSBot:
                         )
                     time.sleep(0.2)
 
+            if (
+                success
+                and order_id
+                and str(order_type).lower() == "market"
+                and not position_ticket
+                and hasattr(self.mt5_client, "resolve_position_ticket")
+            ):
+                request_time = None
+                if isinstance(order_result, dict):
+                    request_time = order_result.get("request_time") or order_result.get("time")
+                request_time = request_time or datetime.utcnow()
+                resolved_position = self.mt5_client.resolve_position_ticket(
+                    symbol=SYMBOL,
+                    magic=resolved_magic,
+                    comment=order_comment,
+                    opened_after_time=request_time,
+                    side=signal_data.get("signal"),
+                    volume=lot_size,
+                    timeout_sec=5,
+                )
+                if resolved_position:
+                    position_ticket = resolved_position
+                    signal_data["position_ticket"] = position_ticket
+                    logger.info(
+                        "[TRADE][OPEN_RESOLVED_POSITION] order=%s position=%s symbol=%s side=%s",
+                        order_id,
+                        position_ticket,
+                        SYMBOL,
+                        signal_data.get("signal"),
+                    )
+                else:
+                    logger.warning(
+                        "[TRADE][OPEN_POSITION_UNRESOLVED] order=%s symbol=%s side=%s",
+                        order_id,
+                        SYMBOL,
+                        signal_data.get("signal"),
+                    )
+
             if success and order_id:
                 if str(order_type).lower() in {"stop", "limit"}:
                     logger.info(
