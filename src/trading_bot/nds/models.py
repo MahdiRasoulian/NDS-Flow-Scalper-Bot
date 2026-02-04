@@ -232,11 +232,13 @@ class FinalizedOrderParams:
     rr_tp1: Optional[float] = None
     rr_tp2: Optional[float] = None
     rr_checked: Optional[str] = None
+    rr_validate_mode: Optional[str] = None
     min_rr_effective: Optional[float] = None
     min_rr_source: Optional[str] = None
     sl_pips: Optional[float] = None
     tp1_pips: Optional[float] = None
     tp2_pips: Optional[float] = None
+    tp_execution_mode: Optional[str] = None
 
     def to_standard_payload(self) -> Dict[str, Any]:
         return {
@@ -258,5 +260,7 @@ class FinalizedOrderParams:
             "lot": self.lot if self.lot is not None else self.lot_size,
             "rr_ratio": self.rr_ratio,
             "deviation_pips": self.deviation_pips,
+            "rr_validate_mode": self.rr_validate_mode,
+            "tp_execution_mode": self.tp_execution_mode,
             "decision_notes": list(self.decision_notes or []),
         }

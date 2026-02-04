@@ -1557,11 +1557,13 @@ class ScalpingRiskManager:
             rr_tp1: Optional[float] = None,
             rr_tp2: Optional[float] = None,
             rr_checked: Optional[str] = None,
+            rr_validate_mode: Optional[str] = None,
             min_rr_effective: Optional[float] = None,
             min_rr_source: Optional[str] = None,
             sl_pips: Optional[float] = None,
             tp1_pips: Optional[float] = None,
             tp2_pips: Optional[float] = None,
+            tp_execution_mode: Optional[str] = None,
         ) -> FinalizedOrderParams:
             return FinalizedOrderParams(
                 signal=signal,
@@ -1588,11 +1590,13 @@ class ScalpingRiskManager:
                 rr_tp1=rr_tp1,
                 rr_tp2=rr_tp2,
                 rr_checked=rr_checked,
+                rr_validate_mode=rr_validate_mode,
                 min_rr_effective=min_rr_effective,
                 min_rr_source=min_rr_source,
                 sl_pips=sl_pips,
                 tp1_pips=tp1_pips,
                 tp2_pips=tp2_pips,
+                tp_execution_mode=tp_execution_mode,
             )
 
         decision_notes: List[str] = []
@@ -2071,7 +2075,12 @@ class ScalpingRiskManager:
         tp1_source = sltp.get("tp1_source", "fixed_pips")
         sl_source = sltp.get("sl_source", "unknown")
         sl_pips = float(sltp.get("sl_pips") or 0.0)
+        raw_sl_pips = float(sltp.get("raw_sl_pips") or 0.0)
         tp1_pips = float(sltp.get("tp1_pips") or 0.0)
+        if raw_sl_pips and abs(raw_sl_pips - sl_pips) > 1e-6:
+            decision_notes.append(
+                f"SL clamp applied: raw={raw_sl_pips:.1f}pips -> clamped={sl_pips:.1f}pips."
+            )
         decision_notes.append(
             f"SL model: {sl_source} sl_pips={sl_pips:.1f} tp1_source={tp1_source} tp1_pips={tp1_pips:.1f}"
         )
@@ -2085,6 +2094,12 @@ class ScalpingRiskManager:
         if tp2_price is not None and tp_plan != "trail_after_tp1":
             tp_plan = "tp1_tp2"
         decision_notes.append(f"TP plan selected: {tp_plan}")
+        tp_execution_mode = "SINGLE_TP"
+        if tp1_partial > 0 and tp_plan != "single_tp":
+            tp_execution_mode = "TP1_PARTIAL_MANAGED"
+        elif tp1_partial > 0 and tp_plan == "single_tp":
+            decision_notes.append("TP1 partial ignored: tp_plan=single_tp (no managed remainder).")
+        decision_notes.append(f"TP execution mode: {tp_execution_mode}")
         if tp2_price is not None:
             self._logger.info("[NDS][TP2_PLAN] tp2=%.2f intent=runner optional=true", float(tp2_price))
         else:
@@ -2766,11 +2781,13 @@ class ScalpingRiskManager:
             rr_tp1=rr_ratio,
             rr_tp2=rr_ratio_tp2,
             rr_checked=rr_checked,
+            rr_validate_mode=rr_validate_mode,
             min_rr_effective=min_rr_effective,
             min_rr_source=min_rr_source,
             sl_pips=sl_pips,
             tp1_pips=tp_pips,
             tp2_pips=tp2_pips_target,
+            tp_execution_mode=tp_execution_mode,
         )
 
 

@@ -211,6 +211,37 @@ class TradeTracker:
         payload["last_attempt"] = attempt_time
         payload["retries"] = int(payload.get("retries") or 0) + 1
 
+    def register_partial_close(
+        self,
+        *,
+        position_ticket: int,
+        volume_closed: float,
+        remaining_volume: float,
+        reason: str,
+    ) -> None:
+        """ثبت رخداد partial close برای معامله فعال."""
+        record = self.active_trades.get(position_ticket)
+        if not record:
+            record = self.pending_closes.get(position_ticket, {}).get("record")
+        if not record:
+            return
+
+        record = self.normalize_trade_record(record)
+        metadata = record.get("open_event", {}).get("metadata", {})
+        partials = metadata.get("partial_closes", [])
+        partials.append(
+            {
+                "time": datetime.utcnow().isoformat(),
+                "volume_closed": float(volume_closed),
+                "remaining_volume": float(remaining_volume),
+                "reason": reason,
+            }
+        )
+        metadata["partial_closes"] = partials
+        metadata["partial_close_count"] = len(partials)
+        metadata["remaining_volume_after_tp1"] = float(remaining_volume)
+        record.get("open_event", {})["metadata"] = metadata
+
     def finalize_unknown_close(self, position_ticket: int, event: ExecutionEvent) -> None:
         """ثبت وضعیت CLOSE_UNKNOWN و خارج کردن از pending."""
         record = None
@@ -262,6 +293,31 @@ class TradeTracker:
                 unmatched_positions.discard(pos_ticket)
                 updated_count += 1
                 break
+
+        # Fallback: attach a single pending trade by symbol+side within a short window
+        if self.pending_trades_by_order and unmatched_positions:
+            pending_candidates: Dict[str, List[Tuple[int, Dict]]] = {}
+            for order_ticket, record in self.pending_trades_by_order.items():
+                identity: TradeIdentity = record["trade_identity"]
+                key = f"{identity.get('symbol')}::{record.get('open_event', {}).get('side')}"
+                pending_candidates.setdefault(key, []).append((order_ticket, record))
+
+            for pos_ticket in list(unmatched_positions):
+                position = open_map[pos_ticket]
+                key = f"{position.get('symbol')}::{position.get('side')}"
+                candidates = pending_candidates.get(key, [])
+                if len(candidates) != 1:
+                    continue
+                order_ticket, record = candidates[0]
+                identity: TradeIdentity = record["trade_identity"]
+                opened_at = identity.get("opened_at", datetime.min)
+                if position["open_time"] < opened_at - timedelta(minutes=5):
+                    continue
+                record["trade_identity"]["position_ticket"] = pos_ticket
+                self.active_trades[pos_ticket] = record
+                del self.pending_trades_by_order[order_ticket]
+                unmatched_positions.discard(pos_ticket)
+                updated_count += 1
 
         # Update active or add recovered positions
         for pos_ticket, position in open_map.items():
