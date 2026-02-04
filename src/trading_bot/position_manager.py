@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import logging
+import time
 
 from src.trading_bot.contracts import PositionContract
 from src.trading_bot.nds.distance_utils import pips_to_price, resolve_point_size_with_source
@@ -68,7 +69,7 @@ class PositionManager:
                 plan = self._build_plan(position)
                 if plan:
                     self._plans[ticket] = plan
-                    metadata = self._get_trade_metadata(ticket)
+                    metadata = self._get_trade_metadata(position)
                     self._logger.info(
                         "[PM][PLAN_META] ticket=%s tp_exec=%s tp1=%s tp2=%s tp_sent=%s partial_count=%s remaining_vol=%s",
                         ticket,
@@ -102,16 +103,19 @@ class PositionManager:
             plan.stop_loss = float(position.get("sl") or plan.stop_loss)
             self._process_position(position, plan)
 
-    def _get_trade_metadata(self, ticket: int) -> Dict[str, Any]:
+    def _get_trade_metadata(self, position: PositionContract) -> Dict[str, Any]:
         if self.trade_tracker is None:
             return {}
-        record = self.trade_tracker.active_trades.get(int(ticket))
-        if not record:
-            return {}
-        return record.get("open_event", {}).get("metadata", {}) or {}
+        ticket = int(position.get("position_ticket") or 0)
+        record = self.trade_tracker.active_trades.get(ticket)
+        if record and record.get("open_event", {}).get("metadata"):
+            return record.get("open_event", {}).get("metadata", {}) or {}
+        if hasattr(self.trade_tracker, "resolve_metadata_for_position"):
+            return self.trade_tracker.resolve_metadata_for_position(position)
+        return {}
 
     def _build_plan(self, position: PositionContract) -> Optional[PositionPlan]:
-        metadata = self._get_trade_metadata(int(position["position_ticket"]))
+        metadata = self._get_trade_metadata(position)
 
         entry_context = {}
         analysis_snapshot = metadata.get("analysis_snapshot") or {}
@@ -131,16 +135,32 @@ class PositionManager:
 
         tp1_price = metadata.get("tp1_price")
         tp1_price = float(tp1_price) if tp1_price else float(position.get("tp") or 0.0)
-        if not tp1_price:
-            self._logger.warning(
-                "[PM][PLAN_SKIP] ticket=%s reason=missing_tp1 broker_tp=%.2f",
-                position.get("position_ticket"),
-                float(position.get("tp") or 0.0),
-            )
-            return None
 
         tp2_price = metadata.get("tp2_price")
         tp2_price = float(tp2_price) if tp2_price else None
+
+        if not tp1_price:
+            tp1_price, tp2_price, reason = self._synthesize_tp_targets(position, metadata)
+            if tp1_price:
+                self._logger.error(
+                    "[PM][PLAN_META_MISSING] ticket=%s reason=%s broker_tp=%.2f entry=%.2f sl=%.2f",
+                    position.get("position_ticket"),
+                    reason,
+                    float(position.get("tp") or 0.0),
+                    float(position.get("entry_price") or 0.0),
+                    float(position.get("sl") or 0.0),
+                )
+                self._persist_fallback_metadata(position, tp1_price, tp2_price, reason)
+            else:
+                self._logger.error(
+                    "[PM][PLAN_META_ERROR] ticket=%s reason=%s broker_tp=%.2f entry=%.2f sl=%.2f",
+                    position.get("position_ticket"),
+                    reason,
+                    float(position.get("tp") or 0.0),
+                    float(position.get("entry_price") or 0.0),
+                    float(position.get("sl") or 0.0),
+                )
+                return None
 
         trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
         tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
@@ -241,10 +261,11 @@ class PositionManager:
             )
             return
 
-        result = self.mt5_client.close_position(
+        result = self._close_with_retry(
             ticket=plan.position_ticket,
             volume=close_volume,
             comment="TP1 partial close",
+            context="TP1_PARTIAL",
         )
         self._logger.info(
             "[PM][PARTIAL_CLOSE] ticket=%s requested_vol=%.3f result=%s retcode=%s",
@@ -288,10 +309,11 @@ class PositionManager:
             return
 
         if plan.trail_after_tp1:
-            result = self.mt5_client.modify_position(
+            result = self._modify_with_retry(
                 ticket=plan.position_ticket,
                 new_sl=None,
                 new_tp=0.0,
+                context="TP_TRAIL_ARM",
             )
             self._logger.info(
                 "[PM][SET_TP2_OR_TRAIL] ticket=%s trailing=true tp2=NONE result=%s retcode=%s",
@@ -314,10 +336,11 @@ class PositionManager:
                     result,
                 )
         elif plan.tp2_price is not None:
-            result = self.mt5_client.modify_position(
+            result = self._modify_with_retry(
                 ticket=plan.position_ticket,
                 new_tp=plan.tp2_price,
                 new_sl=None,
+                context="TP2_SET",
             )
             self._logger.info(
                 "[PM][SET_TP2_OR_TRAIL] ticket=%s trailing=false tp2=%.2f result=%s retcode=%s",
@@ -377,10 +400,11 @@ class PositionManager:
                 new_sl = plan.entry_price + offset
             else:
                 new_sl = plan.entry_price - offset
-        result = self.mt5_client.modify_position(
+        result = self._modify_with_retry(
             ticket=plan.position_ticket,
             new_sl=new_sl,
             new_tp=None,
+            context="MOVE_SL",
         )
         self._logger.info(
             "[PM][MOVE_SL] ticket=%s new_sl=%.2f result=%s retcode=%s",
@@ -427,10 +451,11 @@ class PositionManager:
             if plan.stop_loss and new_sl >= plan.stop_loss:
                 return
 
-        result = self.mt5_client.modify_position(
+        result = self._modify_with_retry(
             ticket=plan.position_ticket,
             new_sl=new_sl,
             new_tp=None,
+            context="TRAIL",
         )
         if result and result.get("success"):
             plan.stop_loss = new_sl
@@ -471,3 +496,144 @@ class PositionManager:
         if step <= 0:
             return volume
         return round(volume / step) * step
+
+    def _synthesize_tp_targets(
+        self, position: PositionContract, metadata: Dict[str, Any]
+    ) -> Tuple[Optional[float], Optional[float], str]:
+        entry_price = float(position.get("entry_price") or 0.0)
+        side = str(position.get("side") or "BUY").upper()
+        if not entry_price:
+            return None, None, "entry_price_missing"
+
+        risk_settings = self.config.get("risk_settings", {}) if isinstance(self.config, dict) else {}
+        analysis_snapshot = metadata.get("analysis_snapshot") or {}
+        entry_context = (
+            analysis_snapshot.get("entry_context")
+            or (analysis_snapshot.get("context") or {}).get("entry_context")
+            or {}
+        )
+        counter_trend = bool(entry_context.get("counter_trend"))
+        tp1_pips = float(
+            risk_settings.get("COUNTERTREND_TP1_PIPS")
+            if counter_trend and risk_settings.get("COUNTERTREND_TP1_PIPS") is not None
+            else risk_settings.get("TP1_PIPS", 35.0)
+        )
+        if tp1_pips <= 0:
+            return None, None, "tp1_pips_missing"
+
+        point_size = self._resolve_point_size()
+        tp1_distance = pips_to_price(tp1_pips, point_size)
+        tp1_price = entry_price + tp1_distance if side == "BUY" else entry_price - tp1_distance
+
+        tp2_price = None
+        if bool(risk_settings.get("TP2_ENABLED", True)):
+            tp2_pips = float(risk_settings.get("TP2_PIPS", tp1_pips * 2.0))
+            if tp2_pips > 0:
+                tp2_distance = pips_to_price(tp2_pips, point_size)
+                tp2_price = entry_price + tp2_distance if side == "BUY" else entry_price - tp2_distance
+
+        return tp1_price, tp2_price, "synthesized_from_config"
+
+    def _persist_fallback_metadata(
+        self,
+        position: PositionContract,
+        tp1_price: float,
+        tp2_price: Optional[float],
+        reason: str,
+    ) -> None:
+        if self.trade_tracker is None:
+            return
+        ticket = int(position.get("position_ticket") or 0)
+        record = self.trade_tracker.active_trades.get(ticket)
+        if not record:
+            return
+        open_event = record.get("open_event") or {}
+        metadata = open_event.get("metadata", {}) or {}
+        metadata.setdefault("tp1_price", tp1_price)
+        if tp2_price is not None:
+            metadata.setdefault("tp2_price", tp2_price)
+        metadata.setdefault("tp_execution_mode", metadata.get("tp_execution_mode") or "TP1_PARTIAL_MANAGED")
+        metadata.setdefault("tp_plan", metadata.get("tp_plan") or "fallback")
+        metadata.setdefault("tp_fallback_reason", reason)
+        open_event["metadata"] = metadata
+        record["open_event"] = open_event
+
+    def _modify_with_retry(
+        self,
+        *,
+        ticket: int,
+        new_sl: Optional[float],
+        new_tp: Optional[float],
+        context: str,
+    ) -> Dict[str, Any]:
+        retries = 2
+        backoff = 0.2
+        last_result: Dict[str, Any] = {}
+        for attempt in range(retries + 1):
+            result = self.mt5_client.modify_position(
+                ticket=ticket,
+                new_sl=new_sl,
+                new_tp=new_tp,
+            )
+            last_result = result or {}
+            if result and result.get("success"):
+                return result
+            if not self._is_retryable(result) or attempt == retries:
+                break
+            self._logger.warning(
+                "[PM][MODIFY_RETRY] ticket=%s context=%s attempt=%s retcode=%s",
+                ticket,
+                context,
+                attempt + 1,
+                last_result.get("retcode"),
+            )
+            time.sleep(backoff)
+        return last_result
+
+    def _close_with_retry(
+        self,
+        *,
+        ticket: int,
+        volume: float,
+        comment: str,
+        context: str,
+    ) -> Dict[str, Any]:
+        retries = 1
+        backoff = 0.2
+        last_result: Dict[str, Any] = {}
+        for attempt in range(retries + 1):
+            result = self.mt5_client.close_position(
+                ticket=ticket,
+                volume=volume,
+                comment=comment,
+            )
+            last_result = result or {}
+            if result and result.get("success"):
+                return result
+            if not self._is_retryable(result) or attempt == retries:
+                break
+            self._logger.warning(
+                "[PM][CLOSE_RETRY] ticket=%s context=%s attempt=%s retcode=%s",
+                ticket,
+                context,
+                attempt + 1,
+                last_result.get("retcode"),
+            )
+            time.sleep(backoff)
+        return last_result
+
+    @staticmethod
+    def _is_retryable(result: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        retcode = result.get("retcode")
+        if isinstance(retcode, str):
+            retryable_tokens = ("requote", "off quotes", "price changed", "timeout", "trade context busy")
+            return any(token in retcode.lower() for token in retryable_tokens)
+        if isinstance(retcode, int):
+            return retcode in {10004, 10006, 10016, 10021, 10025}
+        comment = result.get("comment")
+        if isinstance(comment, str):
+            retryable_tokens = ("requote", "off quotes", "price changed", "timeout", "trade context busy")
+            return any(token in comment.lower() for token in retryable_tokens)
+        return False
