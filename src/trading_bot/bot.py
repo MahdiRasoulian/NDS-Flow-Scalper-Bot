@@ -448,6 +448,15 @@ class NDSBot:
             return orders
         return [order for order in orders if int(order.get("magic", 0) or 0) in allowed_magics]
 
+    @staticmethod
+    def _resolve_order_magic(order_type: str) -> int:
+        order_type = str(order_type or "").lower()
+        if order_type == "market":
+            return 202401
+        if order_type == "stop":
+            return 202403
+        return 202402
+
     def _log_positions_summary(self, positions: List[PositionContract]) -> None:
         total, buy_count, sell_count, tickets = summarize_positions(positions)
         logger.info(
@@ -1691,6 +1700,7 @@ class NDSBot:
 
             order_result = None
             order_comment = f"NDS Scalping - {current_session or 'N/A'}"
+            resolved_magic = self._resolve_order_magic(order_type)
 
             if str(order_type).lower() == "market":
                 if hasattr(self.mt5_client, "send_order_real_time"):
@@ -1824,6 +1834,16 @@ class NDSBot:
                     time.sleep(0.2)
 
             if success and order_id:
+                if str(order_type).lower() in {"stop", "limit"}:
+                    logger.info(
+                        "[TRADE][PENDING_CREATED] order_ticket=%s symbol=%s side=%s entry=%.2f sl=%.2f tp_sent=%.2f",
+                        order_id,
+                        SYMBOL,
+                        signal_data["signal"],
+                        float(finalized.entry_price),
+                        float(finalized.stop_loss),
+                        float(tp_sent_to_broker),
+                    )
                 signal_data["order_ticket"] = order_id
                 signal_data["position_ticket"] = position_ticket
                 entry_idea = signal_data.get("entry_idea") or (signal_data.get("context") or {}).get("entry_idea", {})
@@ -1928,7 +1948,7 @@ class NDSBot:
                     order_id,
                     position_ticket,
                     SYMBOL,
-                    getattr(finalized, "magic", None),
+                    resolved_magic,
                     open_time_utc.isoformat(),
                     float(actual_entry_price),
                     float(actual_sl),
@@ -1960,10 +1980,7 @@ class NDSBot:
                         "risk_amount": getattr(finalized, "risk_amount_usd", None),
                         "session": current_session,
                         "order_type": order_type,
-                        "magic": (
-                            (order_result.get("magic") if isinstance(order_result, dict) else None)
-                            or getattr(finalized, "magic", None)
-                        ),
+                        "magic": resolved_magic,
                         "comment": order_comment,
                         "request_comment": order_comment,
                         "broker_comment": order_result.get("comment") if isinstance(order_result, dict) else None,
@@ -2069,6 +2086,15 @@ class NDSBot:
             self._latest_pending_orders = pending_orders
             self.bot_state.active_positions = open_positions
 
+            pending_tickets = [order.get("ticket") for order in pending_orders if order.get("ticket")]
+            open_tickets = [pos.get("position_ticket") for pos in open_positions if pos.get("position_ticket")]
+            logger.info(
+                "[TRADE][STATE] pending=%s open=%s pending_tickets=%s open_tickets=%s",
+                len(pending_orders),
+                len(open_positions),
+                pending_tickets,
+                open_tickets,
+            )
             self._log_positions_summary(open_positions)
             now = datetime.utcnow()
             added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(
@@ -2080,6 +2106,11 @@ class NDSBot:
                 logger.debug("🔄 Trade reconciliation: added=%s updated=%s", added_count, updated_count)
 
             if self.position_manager is not None:
+                if not open_positions:
+                    logger.info(
+                        "[PM][SKIP] reason=no_open_positions pending=%s",
+                        len(pending_orders),
+                    )
                 try:
                     self.position_manager.manage_positions(open_positions)
                 except Exception as manager_error:

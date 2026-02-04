@@ -20,7 +20,7 @@ class DummyMT5:
         return {"success": True, **payload}
 
 
-def test_pending_trigger_reconciles_metadata_and_manages_tp1():
+def test_pending_trigger_reconciles_metadata_and_manages_tp1(caplog):
     tracker = TradeTracker()
     opened_at = datetime.utcnow() - timedelta(minutes=1)
     open_event = {
@@ -45,6 +45,7 @@ def test_pending_trigger_reconciles_metadata_and_manages_tp1():
             "tp_execution_mode": "TP1_PARTIAL_MANAGED",
             "tp_sent_to_broker": 0.0,
             "request_comment": "NDS Scalping - TEST",
+            "magic": 202402,
         },
     }
     tracker.add_trade_open(open_event)
@@ -67,22 +68,32 @@ def test_pending_trigger_reconciles_metadata_and_manages_tp1():
         }
     ]
 
-    tracker.reconcile_with_open_positions(open_positions)
-    assert 9001 in tracker.active_trades
+    with caplog.at_level("INFO"):
+        tracker.reconcile_with_open_positions([])
+        tracker.reconcile_with_open_positions(open_positions)
+        assert 9001 in tracker.active_trades
 
-    config = {
-        "risk_settings": {"TP2_ENABLED": True},
-        "flow_settings": {
-            "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
-            "FLOW_TP1_MOVE_SL_TO_BE": True,
-            "FLOW_TRAIL_AFTER_TP1": False,
-            "FLOW_TRAIL_ATR_MULT": 2.0,
-        },
-        "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01}},
-    }
-    mt5 = DummyMT5()
-    manager = PositionManager(config, mt5, trade_tracker=tracker)
-    manager.manage_positions(open_positions)
+        config = {
+            "risk_settings": {"TP2_ENABLED": True},
+            "flow_settings": {
+                "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
+                "FLOW_TP1_MOVE_SL_TO_BE": True,
+                "FLOW_TRAIL_AFTER_TP1": False,
+                "FLOW_TRAIL_ATR_MULT": 2.0,
+            },
+            "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01}},
+        }
+        mt5 = DummyMT5()
+        manager = PositionManager(config, mt5, trade_tracker=tracker)
+        manager.manage_positions(open_positions)
 
-    assert mt5.closed, "Expected TP1 partial close after reconcile"
-    assert mt5.closed[0]["volume"] == 0.5
+        assert mt5.closed, "Expected TP1 partial close after reconcile"
+        assert mt5.closed[0]["volume"] == 0.5
+
+    messages = [record.message for record in caplog.records]
+    pending_to_open_idx = next(
+        idx for idx, msg in enumerate(messages) if "[TRADE][PENDING_TO_OPEN]" in msg
+    )
+    plan_meta_idx = next(idx for idx, msg in enumerate(messages) if "[PM][PLAN_META]" in msg)
+    manage_idx = next(idx for idx, msg in enumerate(messages) if "[PM][MANAGE]" in msg)
+    assert pending_to_open_idx < plan_meta_idx < manage_idx

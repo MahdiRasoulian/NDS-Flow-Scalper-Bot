@@ -58,6 +58,16 @@ class TradeTracker:
     def add_trade_open(self, event: ExecutionEvent) -> None:
         """ثبت معامله جدید با رویداد OPEN"""
         identity = self._build_trade_identity(event)
+        if identity.get("detected_by") != "recovery_scan":
+            if identity.get("magic") is None or identity.get("comment") in (None, ""):
+                logger.warning(
+                    "[TRADE][META_MISSING] order=%s position=%s symbol=%s magic=%s comment=%s",
+                    identity.get("order_ticket"),
+                    identity.get("position_ticket"),
+                    identity.get("symbol"),
+                    identity.get("magic"),
+                    identity.get("comment"),
+                )
 
         record = {
             "trade_identity": identity,
@@ -278,7 +288,7 @@ class TradeTracker:
                 return True
             return expected.strip() == actual.strip()
 
-        def _score_candidate(position: PositionContract, record: Dict) -> Optional[int]:
+        def _score_candidate(position: PositionContract, record: Dict) -> Optional[Tuple[int, Dict[str, bool]]]:
             identity: TradeIdentity = record["trade_identity"]
             if position["symbol"] != identity.get("symbol"):
                 return None
@@ -288,7 +298,8 @@ class TradeTracker:
             identity_magic = identity.get("magic")
             if identity_magic is not None and position["magic"] != identity_magic:
                 return None
-            if not _comments_match(identity.get("comment"), position.get("comment")):
+            comment_match = _comments_match(identity.get("comment"), position.get("comment"))
+            if not comment_match:
                 return None
 
             opened_at = identity.get("opened_at", datetime.min)
@@ -296,6 +307,15 @@ class TradeTracker:
                 return None
 
             score = 0
+            match_fields = {
+                "magic": identity_magic is not None and position["magic"] == identity_magic,
+                "comment": comment_match,
+                "side": bool(side and position["side"] == side),
+                "symbol": position["symbol"] == identity.get("symbol"),
+                "time": False,
+                "price": False,
+                "volume": False,
+            }
             if identity_magic is not None:
                 score += 2
             if identity.get("comment") and position.get("comment"):
@@ -304,35 +324,39 @@ class TradeTracker:
             time_delta = abs((position["open_time"] - opened_at).total_seconds())
             if time_delta <= 900:
                 score += 1
+                match_fields["time"] = True
 
             entry_price = record.get("open_event", {}).get("entry_price")
             if entry_price and position.get("entry_price"):
                 if abs(float(position["entry_price"]) - float(entry_price)) <= 0.5:
                     score += 1
+                    match_fields["price"] = True
 
             volume = record.get("open_event", {}).get("volume")
             if volume and position.get("volume"):
                 if abs(float(position["volume"]) - float(volume)) <= 1e-6:
                     score += 1
+                    match_fields["volume"] = True
 
-            return score
+            return score, match_fields
 
         if self.pending_trades_by_order and unmatched_positions:
             pending_items = list(self.pending_trades_by_order.items())
             for pos_ticket in list(unmatched_positions):
                 position = open_map[pos_ticket]
-                candidates: List[Tuple[int, int, Dict]] = []
+                candidates: List[Tuple[int, int, Dict, Dict[str, bool]]] = []
                 for order_ticket, record in pending_items:
                     if order_ticket not in self.pending_trades_by_order:
                         continue
-                    score = _score_candidate(position, record)
-                    if score is None:
+                    scored = _score_candidate(position, record)
+                    if scored is None:
                         continue
-                    candidates.append((score, order_ticket, record))
+                    score, match_fields = scored
+                    candidates.append((score, order_ticket, record, match_fields))
                 if not candidates:
                     continue
                 candidates.sort(key=lambda item: item[0], reverse=True)
-                best_score, order_ticket, record = candidates[0]
+                best_score, order_ticket, record, match_fields = candidates[0]
                 if len(candidates) > 1 and candidates[1][0] == best_score:
                     logger.warning(
                         "[TRADE][RECONCILE_SKIP] position=%s reason=score_tie best_score=%s",
@@ -354,7 +378,7 @@ class TradeTracker:
                 unmatched_positions.discard(pos_ticket)
                 updated_count += 1
                 logger.info(
-                    "[TRADE][PENDING_TO_OPEN] order=%s position=%s symbol=%s side=%s magic=%s comment=%s score=%s",
+                    "[TRADE][PENDING_TO_OPEN] order=%s position=%s symbol=%s side=%s magic=%s comment=%s score=%s match=%s",
                     order_ticket,
                     pos_ticket,
                     identity.get("symbol"),
@@ -362,6 +386,7 @@ class TradeTracker:
                     identity.get("magic"),
                     identity.get("comment"),
                     best_score,
+                    match_fields,
                 )
 
         # Update active or add recovered positions
