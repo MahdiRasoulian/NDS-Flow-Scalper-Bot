@@ -174,6 +174,15 @@ class PositionManager:
         current_price = float(position.get("current_price") or 0.0)
         if not current_price:
             return
+        self._logger.info(
+            "[PM][MANAGE] ticket=%s mode=%s price=%.2f tp1=%.2f hit_tp1=%s partial_done=%s",
+            plan.position_ticket,
+            plan.tp_plan,
+            current_price,
+            plan.tp1_price,
+            plan.tp1_hit,
+            plan.partial_closed,
+        )
 
         if not plan.tp1_hit and self._price_reached_tp1(plan, current_price):
             plan.tp1_hit = True
@@ -214,6 +223,13 @@ class PositionManager:
             ticket=plan.position_ticket,
             volume=close_volume,
             comment="TP1 partial close",
+        )
+        self._logger.info(
+            "[PM][PARTIAL_CLOSE] ticket=%s requested_vol=%.3f result=%s retcode=%s",
+            plan.position_ticket,
+            close_volume,
+            result,
+            result.get("retcode") if isinstance(result, dict) else None,
         )
         if result and result.get("success"):
             plan.partial_closed = True
@@ -257,6 +273,12 @@ class PositionManager:
                 new_tp=0.0,
             )
             self._logger.info(
+                "[PM][SET_TP2_OR_TRAIL] ticket=%s trailing=true tp2=NONE result=%s retcode=%s",
+                plan.position_ticket,
+                result,
+                result.get("retcode") if isinstance(result, dict) else None,
+            )
+            self._logger.info(
                 "[NDS][TP_TRAIL_ARM] ticket=%s result=%s",
                 plan.position_ticket,
                 result,
@@ -266,6 +288,13 @@ class PositionManager:
                 ticket=plan.position_ticket,
                 new_tp=plan.tp2_price,
                 new_sl=None,
+            )
+            self._logger.info(
+                "[PM][SET_TP2_OR_TRAIL] ticket=%s trailing=false tp2=%.2f result=%s retcode=%s",
+                plan.position_ticket,
+                float(plan.tp2_price),
+                result,
+                result.get("retcode") if isinstance(result, dict) else None,
             )
             self._logger.info(
                 "[NDS][TP2_SET] ticket=%s tp2=%.2f result=%s",
@@ -314,6 +343,13 @@ class PositionManager:
             ticket=plan.position_ticket,
             new_sl=new_sl,
             new_tp=None,
+        )
+        self._logger.info(
+            "[PM][MOVE_SL] ticket=%s new_sl=%.2f result=%s retcode=%s",
+            plan.position_ticket,
+            new_sl,
+            result,
+            result.get("retcode") if isinstance(result, dict) else None,
         )
         if result and result.get("success"):
             plan.sl_moved = True

@@ -513,6 +513,15 @@ class NDSBot:
         )
 
     @staticmethod
+    def _compute_tp_pips(entry_price: float, tp_price: float, point_size: float) -> float:
+        metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=tp_price,
+            point_size=point_size,
+        )
+        return float(metrics.get("dist_pips") or 0.0)
+
+    @staticmethod
     def _resolve_broker_tp(
         finalized: FinalizedOrderParams,
         flow_settings: Dict[str, Any],
@@ -566,6 +575,27 @@ class NDSBot:
         if "tp" in reason_lower or "take" in reason_lower:
             return "TP"
         return "UNKNOWN"
+
+    @staticmethod
+    def _build_close_metadata(
+        *,
+        open_metadata: Dict[str, Any],
+        entry_snapshot: Optional[Dict[str, Any]],
+        tp_level_hit: str,
+    ) -> Dict[str, Any]:
+        entry_risk = (entry_snapshot or {}).get("risk", {}) if isinstance(entry_snapshot, dict) else {}
+        return {
+            "tp_level_hit": tp_level_hit,
+            "tp_execution_mode": open_metadata.get("tp_execution_mode") or entry_risk.get("tp_execution_mode"),
+            "tp_sent_to_broker": open_metadata.get("tp_sent_to_broker") or entry_risk.get("tp_sent_to_broker"),
+            "tp1_price": open_metadata.get("tp1_price") or entry_risk.get("tp1"),
+            "tp2_price": open_metadata.get("tp2_price") or entry_risk.get("tp2"),
+            "partial_close_count": open_metadata.get("partial_close_count"),
+            "remaining_volume_after_tp1": open_metadata.get("remaining_volume_after_tp1"),
+            "rr_validate_mode": open_metadata.get("rr_validate_mode") or entry_risk.get("rr_validate_mode"),
+            "rr_checked": open_metadata.get("rr_checked") or entry_risk.get("rr_checked"),
+            "min_rr_source": open_metadata.get("min_rr_source") or entry_risk.get("min_rr_source"),
+        }
 
     def _build_entry_snapshot(
         self,
@@ -1644,6 +1674,17 @@ class NDSBot:
                 float(tp_sent_to_broker),
                 tp_send_reason,
             )
+            logger.info(
+                "[EXEC][ORDER_SEND] mode=%s tp_sent=%.2f tp1=%.2f tp2=%s sl=%.2f entry=%.2f",
+                getattr(finalized, "tp_execution_mode", None),
+                float(tp_sent_to_broker),
+                float(finalized.take_profit),
+                f"{float(getattr(finalized, 'tp2', None) or getattr(finalized, 'take_profit2', None)):.2f}"
+                if (getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None))
+                else "NONE",
+                float(finalized.stop_loss),
+                float(finalized.entry_price),
+            )
 
             logger.info(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر: {signal_data['signal']} {lot_size:.3f} لات")
             print(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر...")
@@ -1836,7 +1877,11 @@ class NDSBot:
                     else {}
                 )
                 sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
-                tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
+                tp1_pips = self._compute_tp_pips(
+                    float(actual_entry_price),
+                    float(finalized.take_profit),
+                    float(point_size),
+                )
                 tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
                 trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
                 tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
@@ -2210,13 +2255,6 @@ class NDSBot:
                 open_metadata = record.get("open_event", {}).get("metadata", {}) or {}
                 tp1_price = open_metadata.get("tp1_price")
                 tp2_price = open_metadata.get("tp2_price")
-                tp_execution_mode = open_metadata.get("tp_execution_mode")
-                tp_sent_to_broker = open_metadata.get("tp_sent_to_broker")
-                partial_close_count = open_metadata.get("partial_close_count")
-                remaining_volume_after_tp1 = open_metadata.get("remaining_volume_after_tp1")
-                rr_validate_mode = open_metadata.get("rr_validate_mode")
-                rr_checked = open_metadata.get("rr_checked")
-                min_rr_source = open_metadata.get("min_rr_source")
                 point_size = open_metadata.get("point_size") or point_size
                 tp_level_hit = self._resolve_tp_level_hit(
                     exit_price=exit_price,
@@ -2225,6 +2263,18 @@ class NDSBot:
                     tp2_price=tp2_price,
                     sl_price=record.get("open_event", {}).get("sl"),
                     point_size=float(point_size or 0.01),
+                )
+                close_metadata = self._build_close_metadata(
+                    open_metadata=open_metadata,
+                    entry_snapshot=entry_snapshot,
+                    tp_level_hit=tp_level_hit,
+                )
+                logger.info(
+                    "[REPORT][CLOSE_ATTRIB] tp_level_hit=%s mode=%s partial_count=%s remaining_vol=%s",
+                    tp_level_hit,
+                    close_metadata.get("tp_execution_mode"),
+                    close_metadata.get("partial_close_count"),
+                    close_metadata.get("remaining_volume_after_tp1"),
                 )
 
                 close_event: ExecutionEvent = {
@@ -2247,16 +2297,7 @@ class NDSBot:
                         "history": history,
                         "duration_sec": duration_sec,
                         "entry_snapshot": entry_snapshot,
-                        "tp_level_hit": tp_level_hit,
-                        "tp_execution_mode": tp_execution_mode,
-                        "tp_sent_to_broker": tp_sent_to_broker,
-                        "tp1_price": tp1_price,
-                        "tp2_price": tp2_price,
-                        "partial_close_count": partial_close_count,
-                        "remaining_volume_after_tp1": remaining_volume_after_tp1,
-                        "rr_validate_mode": rr_validate_mode,
-                        "rr_checked": rr_checked,
-                        "min_rr_source": min_rr_source,
+                        **close_metadata,
                     },
                 }
 
