@@ -25,6 +25,9 @@ class DummyTradeTracker:
             101: {"open_event": {"metadata": metadata}},
         }
 
+    def register_partial_close(self, **_kwargs):
+        return None
+
 
 def test_tp1_partial_close_and_tp2_set():
     config = {
@@ -38,6 +41,7 @@ def test_tp1_partial_close_and_tp2_set():
         "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01}},
     }
     metadata = {
+        "tp1_price": 2005.0,
         "tp2_price": 2010.0,
         "analysis_snapshot": {
             "entry_context": {"counter_trend": False},
@@ -54,7 +58,7 @@ def test_tp1_partial_close_and_tp2_set():
             "entry_price": 2000.0,
             "current_price": 2005.0,
             "sl": 1995.0,
-            "tp": 2005.0,
+            "tp": 0.0,
             "profit": 0.0,
             "magic": 0,
             "comment": "",
@@ -69,3 +73,45 @@ def test_tp1_partial_close_and_tp2_set():
     assert mt5.closed[0]["volume"] == 0.5
     assert any(call["new_tp"] == 2010.0 for call in mt5.modified)
     assert any(call["new_sl"] == 2000.0 for call in mt5.modified)
+
+
+def test_tp1_partial_close_only_once():
+    config = {
+        "risk_settings": {"TP2_ENABLED": False},
+        "flow_settings": {
+            "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
+            "FLOW_TP1_MOVE_SL_TO_BE": True,
+            "FLOW_TRAIL_AFTER_TP1": True,
+        },
+        "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01}},
+    }
+    metadata = {
+        "tp1_price": 2005.0,
+        "analysis_snapshot": {
+            "entry_context": {"counter_trend": False},
+        },
+    }
+    mt5 = DummyMT5()
+    manager = PositionManager(config, mt5, trade_tracker=DummyTradeTracker(metadata))
+    open_positions = [
+        {
+            "position_ticket": 101,
+            "symbol": "XAUUSD",
+            "side": "BUY",
+            "volume": 1.0,
+            "entry_price": 2000.0,
+            "current_price": 2005.0,
+            "sl": 1995.0,
+            "tp": 0.0,
+            "profit": 0.0,
+            "magic": 0,
+            "comment": "",
+            "open_time": datetime.utcnow(),
+            "update_time": datetime.utcnow(),
+        }
+    ]
+
+    manager.manage_positions(open_positions)
+    manager.manage_positions(open_positions)
+
+    assert len(mt5.closed) == 1

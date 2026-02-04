@@ -506,7 +506,66 @@ class NDSBot:
                 rr_text = f"{float(finalized.rr_ratio):.2f}"
         except (TypeError, ValueError):
             rr_text = "N/A"
-        return f"🧮 تصمیم نهایی (RiskManager): entry={entry_text} sl={sl_text} tp={tp_text} rr={rr_text}"
+        tp_execution_mode = getattr(finalized, "tp_execution_mode", None) or "N/A"
+        return (
+            f"🧮 تصمیم نهایی (RiskManager): entry={entry_text} sl={sl_text} "
+            f"tp={tp_text} rr={rr_text} tp_exec={tp_execution_mode}"
+        )
+
+    @staticmethod
+    def _resolve_broker_tp(
+        finalized: FinalizedOrderParams,
+        flow_settings: Dict[str, Any],
+        risk_settings: Dict[str, Any],
+    ) -> Tuple[float, str]:
+        tp_execution_mode = getattr(finalized, "tp_execution_mode", None)
+        if not tp_execution_mode:
+            tp1_partial = float(flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.0) or 0.0)
+            trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
+            tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
+            tp_execution_mode = (
+                "TP1_PARTIAL_MANAGED"
+                if tp1_partial > 0 and (trail_after_tp1 or tp2_enabled)
+                else "SINGLE_TP"
+            )
+
+        tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
+        if tp_execution_mode == "TP1_PARTIAL_MANAGED":
+            if bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True)):
+                return 0.0, "trail_after_tp1"
+            if bool(risk_settings.get("TP2_ENABLED", True)) and tp2_price:
+                return float(tp2_price), "tp2_runner"
+            return 0.0, "no_tp2_runner"
+
+        return float(finalized.take_profit), "single_tp"
+
+    @staticmethod
+    def _resolve_tp_level_hit(
+        *,
+        exit_price: Optional[float],
+        reason: Optional[str],
+        tp1_price: Optional[float],
+        tp2_price: Optional[float],
+        sl_price: Optional[float],
+        point_size: float,
+    ) -> str:
+        if exit_price is None:
+            return "UNKNOWN"
+        reason_lower = str(reason or "").lower()
+        if "trail" in reason_lower:
+            return "TRAIL"
+        if "sl" in reason_lower or "stop" in reason_lower:
+            return "SL"
+        tolerance = max(point_size * 2.0, 0.01)
+        if tp2_price and abs(exit_price - tp2_price) <= tolerance:
+            return "TP2"
+        if tp1_price and abs(exit_price - tp1_price) <= tolerance:
+            return "TP1"
+        if sl_price and abs(exit_price - sl_price) <= tolerance:
+            return "SL"
+        if "tp" in reason_lower or "take" in reason_lower:
+            return "TP"
+        return "UNKNOWN"
 
     def _build_entry_snapshot(
         self,
@@ -521,6 +580,7 @@ class NDSBot:
         stop_loss: float,
         take_profit: float,
         tp2_price: Optional[float],
+        tp_sent_to_broker: Optional[float],
         sl_pips: float,
         tp1_pips: float,
         tp2_pips: float,
@@ -567,12 +627,15 @@ class NDSBot:
                 "sl": stop_loss,
                 "tp1": take_profit,
                 "tp2": tp2_price,
+                "tp_sent_to_broker": tp_sent_to_broker,
+                "tp_execution_mode": getattr(finalized, "tp_execution_mode", None),
                 "sl_pips": sl_pips,
                 "tp1_pips": tp1_pips,
                 "tp2_pips": tp2_pips,
                 "rr_tp1": getattr(finalized, "rr_tp1", None),
                 "rr_tp2": getattr(finalized, "rr_tp2", None),
                 "rr_checked": getattr(finalized, "rr_checked", None),
+                "rr_validate_mode": getattr(finalized, "rr_validate_mode", None),
                 "min_rr_effective": getattr(finalized, "min_rr_effective", None),
                 "min_rr_source": getattr(finalized, "min_rr_source", None),
             },
@@ -1564,6 +1627,24 @@ class NDSBot:
                 logger.info(f"Decision Notes: {notes_text}")
                 print(f"📝 {notes_text}")
 
+            flow_settings = config_payload.get("flow_settings", {}) if isinstance(config_payload, dict) else {}
+            risk_settings = config_payload.get("risk_settings", {}) if isinstance(config_payload, dict) else {}
+            tp_sent_to_broker, tp_send_reason = self._resolve_broker_tp(
+                finalized,
+                flow_settings,
+                risk_settings,
+            )
+            logger.info(
+                "[NDS][TP_EXEC] mode=%s tp1=%.2f tp2=%s tp_sent=%.2f reason=%s",
+                getattr(finalized, "tp_execution_mode", None),
+                float(finalized.take_profit),
+                f"{float(getattr(finalized, 'tp2', None) or getattr(finalized, 'take_profit2', None)):.2f}"
+                if (getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None))
+                else "NONE",
+                float(tp_sent_to_broker),
+                tp_send_reason,
+            )
+
             logger.info(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر: {signal_data['signal']} {lot_size:.3f} لات")
             print(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر...")
 
@@ -1576,7 +1657,7 @@ class NDSBot:
                         order_type=signal_data["signal"],
                         volume=lot_size,
                         sl_price=finalized.stop_loss,
-                        tp_price=finalized.take_profit,
+                        tp_price=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
                 else:
@@ -1585,7 +1666,7 @@ class NDSBot:
                         order_type=signal_data["signal"],
                         volume=lot_size,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
             elif str(order_type).lower() == "stop":
@@ -1597,7 +1678,7 @@ class NDSBot:
                         volume=lot_size,
                         stop_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
                 elif hasattr(self.mt5_client, "send_pending_order"):
@@ -1607,7 +1688,7 @@ class NDSBot:
                         volume=lot_size,
                         pending_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
                 else:
@@ -1617,7 +1698,7 @@ class NDSBot:
                         volume=lot_size,
                         price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
             else:
@@ -1631,7 +1712,7 @@ class NDSBot:
                         volume=lot_size,
                         limit_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
                 elif hasattr(self.mt5_client, "send_pending_order"):
@@ -1641,7 +1722,7 @@ class NDSBot:
                         volume=lot_size,
                         pending_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                     )
                 else:
@@ -1650,7 +1731,7 @@ class NDSBot:
                         order_type=limit_order_type,
                         volume=lot_size,
                         stop_loss=finalized.stop_loss,
-                        take_profit=finalized.take_profit,
+                        take_profit=tp_sent_to_broker,
                         comment=f"NDS Scalping - {current_session or 'N/A'}",
                         order_action="LIMIT",
                     )
@@ -1661,7 +1742,7 @@ class NDSBot:
             position_ticket = None
             actual_entry_price = finalized.entry_price
             actual_sl = finalized.stop_loss
-            actual_tp = finalized.take_profit
+            actual_tp = tp_sent_to_broker
 
             if isinstance(order_result, dict):
                 success = bool(order_result.get("success"))
@@ -1757,8 +1838,6 @@ class NDSBot:
                 sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
                 tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
                 tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
-                flow_settings = config_payload.get("flow_settings", {}) if isinstance(config_payload, dict) else {}
-                risk_settings = config_payload.get("risk_settings", {}) if isinstance(config_payload, dict) else {}
                 trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
                 tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
                 tp_plan = "single_tp"
@@ -1789,8 +1868,9 @@ class NDSBot:
                     session=current_session,
                     entry_price=float(actual_entry_price),
                     stop_loss=float(actual_sl),
-                    take_profit=float(actual_tp),
+                    take_profit=float(finalized.take_profit),
                     tp2_price=tp2_price,
+                    tp_sent_to_broker=tp_sent_to_broker,
                     sl_pips=sl_pips,
                     tp1_pips=tp1_pips,
                     tp2_pips=tp2_pips,
@@ -1841,6 +1921,9 @@ class NDSBot:
                         "decision_notes": finalized.decision_notes,
                         "analysis_snapshot": signal_data,
                         "rr_ratio": getattr(finalized, "rr_ratio", None),
+                        "rr_validate_mode": getattr(finalized, "rr_validate_mode", None),
+                        "rr_checked": getattr(finalized, "rr_checked", None),
+                        "min_rr_source": getattr(finalized, "min_rr_source", None),
                         "entry_type": entry_type,
                         "tier": entry_tier,
                         "retest_reason": retest_reason,
@@ -1852,10 +1935,12 @@ class NDSBot:
                         "spread_pips": spread_pips,
                         "point_size": point_size,
                         "tp2_price": tp2_price,
-                        "tp1_price": actual_tp,
+                        "tp1_price": float(finalized.take_profit),
                         "tp_plan": tp_plan,
                         "tp2_enabled": tp2_enabled,
                         "trail_after_tp1": trail_after_tp1,
+                        "tp_execution_mode": getattr(finalized, "tp_execution_mode", None),
+                        "tp_sent_to_broker": tp_sent_to_broker,
                         "entry_snapshot": entry_snapshot,
                     },
                 }
@@ -2122,6 +2207,25 @@ class NDSBot:
                     .get("metadata", {})
                     .get("entry_snapshot")
                 )
+                open_metadata = record.get("open_event", {}).get("metadata", {}) or {}
+                tp1_price = open_metadata.get("tp1_price")
+                tp2_price = open_metadata.get("tp2_price")
+                tp_execution_mode = open_metadata.get("tp_execution_mode")
+                tp_sent_to_broker = open_metadata.get("tp_sent_to_broker")
+                partial_close_count = open_metadata.get("partial_close_count")
+                remaining_volume_after_tp1 = open_metadata.get("remaining_volume_after_tp1")
+                rr_validate_mode = open_metadata.get("rr_validate_mode")
+                rr_checked = open_metadata.get("rr_checked")
+                min_rr_source = open_metadata.get("min_rr_source")
+                point_size = open_metadata.get("point_size") or point_size
+                tp_level_hit = self._resolve_tp_level_hit(
+                    exit_price=exit_price,
+                    reason=reason,
+                    tp1_price=tp1_price,
+                    tp2_price=tp2_price,
+                    sl_price=record.get("open_event", {}).get("sl"),
+                    point_size=float(point_size or 0.01),
+                )
 
                 close_event: ExecutionEvent = {
                     "event_type": "CLOSE",
@@ -2143,6 +2247,16 @@ class NDSBot:
                         "history": history,
                         "duration_sec": duration_sec,
                         "entry_snapshot": entry_snapshot,
+                        "tp_level_hit": tp_level_hit,
+                        "tp_execution_mode": tp_execution_mode,
+                        "tp_sent_to_broker": tp_sent_to_broker,
+                        "tp1_price": tp1_price,
+                        "tp2_price": tp2_price,
+                        "partial_close_count": partial_close_count,
+                        "remaining_volume_after_tp1": remaining_volume_after_tp1,
+                        "rr_validate_mode": rr_validate_mode,
+                        "rr_checked": rr_checked,
+                        "min_rr_source": min_rr_source,
                     },
                 }
 

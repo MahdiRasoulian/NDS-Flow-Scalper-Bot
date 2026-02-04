@@ -1194,6 +1194,14 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
             "reason": event.get("reason"),
             "close_time": event.get("event_time").isoformat() if event.get("event_time") else None,
             "status": event.get("event_type"),
+            "tp_level_hit": (event.get("metadata") or {}).get("tp_level_hit"),
+            "partial_close_count": (event.get("metadata") or {}).get("partial_close_count"),
+            "remaining_volume_after_tp1": (event.get("metadata") or {}).get("remaining_volume_after_tp1"),
+            "rr_mode": (event.get("metadata") or {}).get("rr_validate_mode"),
+            "rr_checked": (event.get("metadata") or {}).get("rr_checked"),
+            "min_rr_source": (event.get("metadata") or {}).get("min_rr_source"),
+            "tp_execution_mode": (event.get("metadata") or {}).get("tp_execution_mode"),
+            "tp_sent_to_broker": (event.get("metadata") or {}).get("tp_sent_to_broker"),
         }
 
         payload.setdefault("trades", []).append(trade_entry)
@@ -1217,6 +1225,14 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
                 "reason",
                 "close_time",
                 "status",
+                "tp_level_hit",
+                "partial_close_count",
+                "remaining_volume_after_tp1",
+                "rr_mode",
+                "rr_checked",
+                "min_rr_source",
+                "tp_execution_mode",
+                "tp_sent_to_broker",
             ]
             with daily_csv.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)

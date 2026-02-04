@@ -34,6 +34,8 @@ def test_rr_repair_tp2_preserves_tp1():
     cfg["risk_manager_config"].update(
         {
             "MIN_RR_RATIO": 0.9,
+            "SCALP_RR_MODE": "TP2_ONLY",
+            "SCALP_TP1_ONLY_MIN_RR": 0.9,
             "RR_REPAIR_ENABLED": True,
             "RR_REPAIR_MODE": "TP2_ONLY",
             "RR_REPAIR_MAX_TP_PIPS": 200.0,
@@ -90,8 +92,10 @@ def test_rr_repair_tp2_preserves_tp1():
     rr_tp1 = float(tp1_metrics.get("dist_price") or 0.0) / float(sl_metrics.get("dist_price") or 1.0)
     rr_tp2 = float(tp2_metrics.get("dist_price") or 0.0) / float(sl_metrics.get("dist_price") or 1.0)
 
-    assert rr_tp1 < cfg["risk_manager_config"]["MIN_RR_RATIO"]
-    assert rr_tp2 + 1e-6 >= cfg["risk_manager_config"]["MIN_RR_RATIO"]
+    assert finalized.rr_checked == "TP2"
+    assert finalized.rr_validate_mode == "TP2_ONLY"
+    assert rr_tp1 < cfg["risk_manager_config"]["SCALP_TP1_ONLY_MIN_RR"]
+    assert rr_tp2 + 1e-6 >= cfg["risk_manager_config"]["SCALP_TP1_ONLY_MIN_RR"]
 
 
 def test_tp2_only_rr_allows_large_sl_and_preserves_tp1():
@@ -106,7 +110,8 @@ def test_tp2_only_rr_allows_large_sl_and_preserves_tp1():
             "RR_REPAIR_ENABLED": True,
             "RR_REPAIR_MODE": "LEGACY",
             "RR_REPAIR_MAX_TP_PIPS": 300.0,
-            "SCALP_RR_MODE": "AUTO",
+            "SCALP_RR_MODE": "TP2_ONLY",
+            "SCALP_TP1_ONLY_MIN_RR": 0.9,
         }
     )
     cfg["risk_settings"].update(
@@ -174,4 +179,4 @@ def test_tp2_only_rr_allows_large_sl_and_preserves_tp1():
     sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
 
     assert abs(tp1_pips - cfg["risk_settings"]["TP1_PIPS"]) < 0.5
-    assert tp2_pips >= sl_pips * cfg["risk_manager_config"]["MIN_RR_RATIO"]
+    assert tp2_pips >= sl_pips * cfg["risk_manager_config"]["SCALP_TP1_ONLY_MIN_RR"]
