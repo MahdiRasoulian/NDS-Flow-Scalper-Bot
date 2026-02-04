@@ -97,3 +97,56 @@ def test_pending_trigger_reconciles_metadata_and_manages_tp1(caplog):
     plan_meta_idx = next(idx for idx, msg in enumerate(messages) if "[PM][PLAN_META]" in msg)
     manage_idx = next(idx for idx, msg in enumerate(messages) if "[PM][MANAGE]" in msg)
     assert pending_to_open_idx < plan_meta_idx < manage_idx
+
+
+def test_pending_direct_ticket_resolution():
+    tracker = TradeTracker()
+    opened_at = datetime.utcnow() - timedelta(minutes=1)
+    open_event = {
+        "event_type": "OPEN",
+        "event_time": opened_at,
+        "symbol": "XAUUSD",
+        "order_ticket": 9001,
+        "position_ticket": None,
+        "side": "BUY",
+        "volume": 1.0,
+        "entry_price": 2000.0,
+        "exit_price": None,
+        "sl": 1995.0,
+        "tp": 0.0,
+        "profit": None,
+        "pips": None,
+        "pips_abs": None,
+        "reason": None,
+        "metadata": {
+            "tp1_price": 2005.0,
+            "tp2_price": 2010.0,
+            "request_comment": "NDS Scalping - DIRECT",
+            "magic": 202402,
+        },
+    }
+    tracker.add_trade_open(open_event)
+
+    open_positions = [
+        {
+            "position_ticket": 9001,
+            "symbol": "XAUUSD",
+            "side": "BUY",
+            "volume": 1.0,
+            "entry_price": 2000.0,
+            "current_price": 2000.0,
+            "sl": 1995.0,
+            "tp": 0.0,
+            "profit": 0.0,
+            "magic": 202402,
+            "comment": "NDS Scalping - DIRECT",
+            "open_time": datetime.utcnow(),
+            "update_time": datetime.utcnow(),
+        }
+    ]
+
+    tracker.reconcile_with_open_positions(open_positions)
+
+    assert 9001 in tracker.active_trades
+    metadata = tracker.active_trades[9001]["open_event"]["metadata"]
+    assert metadata["tp1_price"] == 2005.0

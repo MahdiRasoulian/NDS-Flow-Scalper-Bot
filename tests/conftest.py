@@ -11,6 +11,29 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+if "MetaTrader5" not in sys.modules:
+    mt5_stub = types.ModuleType("MetaTrader5")
+    mt5_stub.TRADE_RETCODE_DONE = 10009
+    mt5_stub.TRADE_ACTION_DEAL = 1
+    mt5_stub.TRADE_ACTION_PENDING = 5
+    mt5_stub.ORDER_TIME_GTC = 0
+    mt5_stub.ORDER_FILLING_IOC = 1
+    mt5_stub.ORDER_FILLING_RETURN = 2
+    mt5_stub.ORDER_TYPE_BUY = 0
+    mt5_stub.ORDER_TYPE_SELL = 1
+    mt5_stub.ORDER_TYPE_BUY_LIMIT = 2
+    mt5_stub.ORDER_TYPE_SELL_LIMIT = 3
+    mt5_stub.ORDER_TYPE_BUY_STOP = 4
+    mt5_stub.ORDER_TYPE_SELL_STOP = 5
+    mt5_stub.ORDER_TYPE_BUY_STOP_LIMIT = 6
+    mt5_stub.ORDER_TYPE_SELL_STOP_LIMIT = 7
+    mt5_stub.positions_get = lambda *args, **kwargs: []
+    mt5_stub.order_send = lambda *args, **kwargs: None
+    mt5_stub.order_check = lambda *args, **kwargs: None
+    mt5_stub.symbol_info = lambda *args, **kwargs: None
+    mt5_stub.symbol_info_tick = lambda *args, **kwargs: None
+    sys.modules["MetaTrader5"] = mt5_stub
+
 try:
     import requests  # noqa: F401
 except Exception:
