@@ -68,6 +68,17 @@ class PositionManager:
                 plan = self._build_plan(position)
                 if plan:
                     self._plans[ticket] = plan
+                    metadata = self._get_trade_metadata(ticket)
+                    self._logger.info(
+                        "[PM][PLAN_META] ticket=%s tp_exec=%s tp1=%s tp2=%s tp_sent=%s partial_count=%s remaining_vol=%s",
+                        ticket,
+                        metadata.get("tp_execution_mode"),
+                        metadata.get("tp1_price"),
+                        metadata.get("tp2_price"),
+                        metadata.get("tp_sent_to_broker"),
+                        metadata.get("partial_close_count"),
+                        metadata.get("remaining_volume_after_tp1"),
+                    )
                     self._logger.info(
                         "[NDS][TP_PLAN] ticket=%s tp_plan=%s tp1=%.2f tp2=%s trail=%s be_trigger=%s",
                         ticket,
@@ -91,12 +102,16 @@ class PositionManager:
             plan.stop_loss = float(position.get("sl") or plan.stop_loss)
             self._process_position(position, plan)
 
+    def _get_trade_metadata(self, ticket: int) -> Dict[str, Any]:
+        if self.trade_tracker is None:
+            return {}
+        record = self.trade_tracker.active_trades.get(int(ticket))
+        if not record:
+            return {}
+        return record.get("open_event", {}).get("metadata", {}) or {}
+
     def _build_plan(self, position: PositionContract) -> Optional[PositionPlan]:
-        metadata = {}
-        if self.trade_tracker is not None:
-            record = self.trade_tracker.active_trades.get(int(position["position_ticket"]))
-            if record:
-                metadata = record.get("open_event", {}).get("metadata", {}) or {}
+        metadata = self._get_trade_metadata(int(position["position_ticket"]))
 
         entry_context = {}
         analysis_snapshot = metadata.get("analysis_snapshot") or {}
@@ -117,6 +132,11 @@ class PositionManager:
         tp1_price = metadata.get("tp1_price")
         tp1_price = float(tp1_price) if tp1_price else float(position.get("tp") or 0.0)
         if not tp1_price:
+            self._logger.warning(
+                "[PM][PLAN_SKIP] ticket=%s reason=missing_tp1 broker_tp=%.2f",
+                position.get("position_ticket"),
+                float(position.get("tp") or 0.0),
+            )
             return None
 
         tp2_price = metadata.get("tp2_price")
@@ -192,6 +212,8 @@ class PositionManager:
                 current_price,
                 plan.tp1_price,
             )
+
+        if plan.tp1_hit:
             self._execute_tp1_partial_close(position, plan)
             self._configure_post_tp1(position, plan)
 
@@ -266,7 +288,6 @@ class PositionManager:
             return
 
         if plan.trail_after_tp1:
-            plan.trail_active = True
             result = self.mt5_client.modify_position(
                 ticket=plan.position_ticket,
                 new_sl=None,
@@ -283,6 +304,15 @@ class PositionManager:
                 plan.position_ticket,
                 result,
             )
+            if result and result.get("success"):
+                plan.trail_active = True
+                plan.post_tp1_configured = True
+            else:
+                self._logger.warning(
+                    "[NDS][TP_TRAIL_FAIL] ticket=%s result=%s",
+                    plan.position_ticket,
+                    result,
+                )
         elif plan.tp2_price is not None:
             result = self.mt5_client.modify_position(
                 ticket=plan.position_ticket,
@@ -302,13 +332,21 @@ class PositionManager:
                 float(plan.tp2_price),
                 result,
             )
+            if result and result.get("success"):
+                plan.post_tp1_configured = True
+            else:
+                self._logger.warning(
+                    "[NDS][TP2_SET_FAIL] ticket=%s tp2=%.2f result=%s",
+                    plan.position_ticket,
+                    float(plan.tp2_price),
+                    result,
+                )
         else:
             self._logger.info(
                 "[NDS][TP2_SKIP] ticket=%s reason=no_tp2_config",
                 plan.position_ticket,
             )
-
-        plan.post_tp1_configured = True
+            plan.post_tp1_configured = True
 
     def _maybe_move_sl_to_be(
         self, position: PositionContract, plan: PositionPlan, current_price: float
