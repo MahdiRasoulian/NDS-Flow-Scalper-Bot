@@ -27,6 +27,7 @@ class PositionPlan:
     atr_value: Optional[float]
     counter_trend: bool
     be_trigger_pips: Optional[float]
+    be_plus_pips: float
     tp_plan: str
     tp1_hit: bool = False
     partial_closed: bool = False
@@ -113,7 +114,8 @@ class PositionManager:
         flow_settings = self.config.get("flow_settings", {}) if isinstance(self.config, dict) else {}
         risk_settings = self.config.get("risk_settings", {}) if isinstance(self.config, dict) else {}
 
-        tp1_price = float(position.get("tp") or 0.0)
+        tp1_price = metadata.get("tp1_price")
+        tp1_price = float(tp1_price) if tp1_price else float(position.get("tp") or 0.0)
         if not tp1_price:
             return None
 
@@ -125,18 +127,28 @@ class PositionManager:
         if not tp2_enabled:
             tp2_price = None
 
-        tp_plan = "single_tp"
-        if trail_after_tp1:
-            tp_plan = "trail_after_tp1"
-        elif tp2_price is not None:
-            tp_plan = "tp1_tp2"
-
         be_trigger_pips = (
             risk_settings.get("BE_TRIGGER_PIPS_COUNTERTREND")
             if counter_trend
             else risk_settings.get("BE_TRIGGER_PIPS_SCALP")
         )
         be_trigger_pips = float(be_trigger_pips) if be_trigger_pips is not None else None
+        be_plus_pips = float(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE_PLUS_PIPS", 0.0) or 0.0)
+
+        tp_execution_mode = metadata.get("tp_execution_mode")
+        partial_close_pct = float(flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5))
+        move_sl_to_be = bool(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE", True))
+        if tp_execution_mode == "SINGLE_TP":
+            partial_close_pct = 0.0
+            move_sl_to_be = False
+            trail_after_tp1 = False
+            tp2_price = None
+
+        tp_plan = "single_tp"
+        if trail_after_tp1:
+            tp_plan = "trail_after_tp1"
+        elif tp2_price is not None:
+            tp_plan = "tp1_tp2"
 
         return PositionPlan(
             position_ticket=int(position["position_ticket"]),
@@ -147,13 +159,14 @@ class PositionManager:
             tp2_price=tp2_price,
             stop_loss=float(position.get("sl") or 0.0),
             volume=float(position.get("volume") or 0.0),
-            partial_close_pct=float(flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5)),
-            move_sl_to_be=bool(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE", True)),
+            partial_close_pct=partial_close_pct,
+            move_sl_to_be=move_sl_to_be,
             trail_after_tp1=trail_after_tp1,
             trail_atr_mult=float(flow_settings.get("FLOW_TRAIL_ATR_MULT", 2.0)),
             atr_value=float(atr_value) if atr_value else None,
             counter_trend=counter_trend,
             be_trigger_pips=be_trigger_pips,
+            be_plus_pips=be_plus_pips,
             tp_plan=tp_plan,
         )
 
@@ -204,6 +217,21 @@ class PositionManager:
         )
         if result and result.get("success"):
             plan.partial_closed = True
+            if self.trade_tracker is not None:
+                try:
+                    remaining_volume = max(plan.volume - close_volume, 0.0)
+                    self.trade_tracker.register_partial_close(
+                        position_ticket=plan.position_ticket,
+                        volume_closed=close_volume,
+                        remaining_volume=remaining_volume,
+                        reason="TP1",
+                    )
+                except Exception as exc:
+                    self._logger.warning(
+                        "[NDS][TP1_PARTIAL_TRACK_FAIL] ticket=%s error=%s",
+                        plan.position_ticket,
+                        exc,
+                    )
             self._logger.info(
                 "[NDS][TP1_PARTIAL_CLOSE] ticket=%s volume=%.3f price=%.2f",
                 plan.position_ticket,
@@ -275,6 +303,13 @@ class PositionManager:
             return
 
         new_sl = plan.entry_price
+        if plan.be_plus_pips > 0:
+            point_size = self._resolve_point_size()
+            offset = pips_to_price(plan.be_plus_pips, point_size)
+            if plan.side == "BUY":
+                new_sl = plan.entry_price + offset
+            else:
+                new_sl = plan.entry_price - offset
         result = self.mt5_client.modify_position(
             ticket=plan.position_ticket,
             new_sl=new_sl,

@@ -211,6 +211,37 @@ class TradeTracker:
         payload["last_attempt"] = attempt_time
         payload["retries"] = int(payload.get("retries") or 0) + 1
 
+    def register_partial_close(
+        self,
+        *,
+        position_ticket: int,
+        volume_closed: float,
+        remaining_volume: float,
+        reason: str,
+    ) -> None:
+        """ثبت رخداد partial close برای معامله فعال."""
+        record = self.active_trades.get(position_ticket)
+        if not record:
+            record = self.pending_closes.get(position_ticket, {}).get("record")
+        if not record:
+            return
+
+        record = self.normalize_trade_record(record)
+        metadata = record.get("open_event", {}).get("metadata", {})
+        partials = metadata.get("partial_closes", [])
+        partials.append(
+            {
+                "time": datetime.utcnow().isoformat(),
+                "volume_closed": float(volume_closed),
+                "remaining_volume": float(remaining_volume),
+                "reason": reason,
+            }
+        )
+        metadata["partial_closes"] = partials
+        metadata["partial_close_count"] = len(partials)
+        metadata["remaining_volume_after_tp1"] = float(remaining_volume)
+        record.get("open_event", {})["metadata"] = metadata
+
     def finalize_unknown_close(self, position_ticket: int, event: ExecutionEvent) -> None:
         """ثبت وضعیت CLOSE_UNKNOWN و خارج کردن از pending."""
         record = None

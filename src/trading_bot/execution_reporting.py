@@ -123,6 +123,8 @@ def _build_trade_report(event: ExecutionEvent, df=None) -> Optional[Dict[str, An
         'tp1_pips': metadata.get("tp1_pips"),
         'tp2_pips': metadata.get("tp2_pips"),
         'spread_pips': metadata.get("spread_pips"),
+        'tp_execution_mode': metadata.get("tp_execution_mode"),
+        'tp_sent_to_broker': metadata.get("tp_sent_to_broker"),
     }
 
 
