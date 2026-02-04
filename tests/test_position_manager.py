@@ -29,6 +29,22 @@ class DummyTradeTracker:
         return None
 
 
+class FailingMT5:
+    def __init__(self):
+        self.modified = []
+        self.closed = []
+
+    def modify_position(self, ticket: int, new_sl: float = None, new_tp: float = None):
+        payload = {"ticket": ticket, "new_sl": new_sl, "new_tp": new_tp, "retcode": "REJECT"}
+        self.modified.append(payload)
+        return {"success": False, **payload}
+
+    def close_position(self, ticket: int, volume: float = None, comment: str = ""):
+        payload = {"ticket": ticket, "volume": volume, "comment": comment, "retcode": "REJECT"}
+        self.closed.append(payload)
+        return {"success": False, **payload}
+
+
 def test_tp1_partial_close_and_tp2_set():
     config = {
         "risk_settings": {"TP2_ENABLED": True},
@@ -115,3 +131,49 @@ def test_tp1_partial_close_only_once():
     manager.manage_positions(open_positions)
 
     assert len(mt5.closed) == 1
+
+
+def test_tp1_failure_logs_and_keeps_retryable_state(caplog):
+    config = {
+        "risk_settings": {"TP2_ENABLED": True},
+        "flow_settings": {
+            "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
+            "FLOW_TP1_MOVE_SL_TO_BE": True,
+            "FLOW_TRAIL_AFTER_TP1": False,
+        },
+        "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01}},
+    }
+    metadata = {
+        "tp1_price": 2005.0,
+        "tp2_price": 2010.0,
+        "analysis_snapshot": {
+            "entry_context": {"counter_trend": False},
+        },
+    }
+    mt5 = FailingMT5()
+    manager = PositionManager(config, mt5, trade_tracker=DummyTradeTracker(metadata))
+    open_positions = [
+        {
+            "position_ticket": 101,
+            "symbol": "XAUUSD",
+            "side": "BUY",
+            "volume": 1.0,
+            "entry_price": 2000.0,
+            "current_price": 2005.0,
+            "sl": 1995.0,
+            "tp": 0.0,
+            "profit": 0.0,
+            "magic": 0,
+            "comment": "",
+            "open_time": datetime.utcnow(),
+            "update_time": datetime.utcnow(),
+        }
+    ]
+
+    with caplog.at_level("WARNING"):
+        manager.manage_positions(open_positions)
+
+    assert mt5.closed, "Expected partial close attempt even on failure"
+    assert mt5.modified, "Expected modify attempt for TP2 or SL move"
+    assert any("[NDS][TP1_PARTIAL_FAIL]" in record.message for record in caplog.records)
+    assert any("[NDS][SL_BE_FAIL]" in record.message for record in caplog.records)

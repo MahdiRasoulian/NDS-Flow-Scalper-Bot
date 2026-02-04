@@ -1690,6 +1690,7 @@ class NDSBot:
             print(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر...")
 
             order_result = None
+            order_comment = f"NDS Scalping - {current_session or 'N/A'}"
 
             if str(order_type).lower() == "market":
                 if hasattr(self.mt5_client, "send_order_real_time"):
@@ -1699,7 +1700,7 @@ class NDSBot:
                         volume=lot_size,
                         sl_price=finalized.stop_loss,
                         tp_price=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
                 else:
                     order_result = self.mt5_client.send_order(
@@ -1708,7 +1709,7 @@ class NDSBot:
                         volume=lot_size,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
             elif str(order_type).lower() == "stop":
                 stop_order_type = f"{signal_data['signal']}_STOP"
@@ -1720,7 +1721,7 @@ class NDSBot:
                         stop_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
                 elif hasattr(self.mt5_client, "send_pending_order"):
                     order_result = self.mt5_client.send_pending_order(
@@ -1730,7 +1731,7 @@ class NDSBot:
                         pending_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
                 else:
                     order_result = self.mt5_client.send_order_with_type(
@@ -1740,7 +1741,7 @@ class NDSBot:
                         price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
             else:
                 # Limit/Pending
@@ -1754,7 +1755,7 @@ class NDSBot:
                         limit_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
                 elif hasattr(self.mt5_client, "send_pending_order"):
                     order_result = self.mt5_client.send_pending_order(
@@ -1764,7 +1765,7 @@ class NDSBot:
                         pending_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                     )
                 else:
                     order_result = self.mt5_client.send_order(
@@ -1773,7 +1774,7 @@ class NDSBot:
                         volume=lot_size,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
-                        comment=f"NDS Scalping - {current_session or 'N/A'}",
+                        comment=order_comment,
                         order_action="LIMIT",
                     )
 
@@ -1959,8 +1960,13 @@ class NDSBot:
                         "risk_amount": getattr(finalized, "risk_amount_usd", None),
                         "session": current_session,
                         "order_type": order_type,
-                        "magic": getattr(finalized, "magic", None),
-                        "comment": order_result.get("comment") if isinstance(order_result, dict) else None,
+                        "magic": (
+                            (order_result.get("magic") if isinstance(order_result, dict) else None)
+                            or getattr(finalized, "magic", None)
+                        ),
+                        "comment": order_comment,
+                        "request_comment": order_comment,
+                        "broker_comment": order_result.get("comment") if isinstance(order_result, dict) else None,
                         "price_deviation_pips": price_deviation_pips,
                         "market_metrics": market_metrics,
                         "decision_notes": finalized.decision_notes,
@@ -2064,6 +2070,15 @@ class NDSBot:
             self.bot_state.active_positions = open_positions
 
             self._log_positions_summary(open_positions)
+            now = datetime.utcnow()
+            added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(
+                open_positions,
+                reconcile_time=now,
+            )
+            state_result = self.position_state_store.reconcile(open_positions, now)
+            if added_count or updated_count:
+                logger.debug("🔄 Trade reconciliation: added=%s updated=%s", added_count, updated_count)
+
             if self.position_manager is not None:
                 try:
                     self.position_manager.manage_positions(open_positions)
@@ -2079,16 +2094,6 @@ class NDSBot:
             else:
                 self.bot_state.active_signal_direction = None
             self._log_signal_state(bias=exposure_bias, pending_count=len(pending_orders))
-
-            now = datetime.utcnow()
-            added_count, updated_count, closed_candidates = self.trade_tracker.reconcile_with_open_positions(
-                open_positions,
-                reconcile_time=now,
-            )
-            state_result = self.position_state_store.reconcile(open_positions, now)
-
-            if added_count or updated_count:
-                logger.debug("🔄 Trade reconciliation: added=%s updated=%s", added_count, updated_count)
 
             closed_records = {
                 record.get("trade_identity", {}).get("position_ticket"): record
