@@ -547,13 +547,8 @@ class NDSBot:
                 else "SINGLE_TP"
             )
 
-        tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
         if tp_execution_mode == "TP1_PARTIAL_MANAGED":
-            if bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True)):
-                return 0.0, "trail_after_tp1"
-            if bool(risk_settings.get("TP2_ENABLED", True)) and tp2_price:
-                return float(tp2_price), "tp2_runner"
-            return 0.0, "no_tp2_runner"
+            return float(finalized.take_profit), "tp1_broker_only"
 
         return float(finalized.take_profit), "single_tp"
 
