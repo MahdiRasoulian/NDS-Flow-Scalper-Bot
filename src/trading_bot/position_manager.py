@@ -30,6 +30,7 @@ class PositionPlan:
     be_trigger_pips: Optional[float]
     be_plus_pips: float
     tp_plan: str
+    tp1_virtual_trigger: bool = False
     tp1_hit: bool = False
     partial_closed: bool = False
     sl_moved: bool = False
@@ -205,6 +206,29 @@ class PositionManager:
             trail_after_tp1 = False
             tp2_price = None
 
+        min_lot = self._get_gold_spec("MIN_LOT", 0.01)
+        lot_step = self._get_gold_spec("LOT_STEP", 0.01)
+        entry_volume = float(position.get("volume") or 0.0)
+        tp1_virtual_trigger = bool(risk_plan.get("tp1_virtual_trigger"))
+        if not tp1_virtual_trigger and entry_volume and partial_close_pct > 0:
+            close_volume = self._round_volume(entry_volume * partial_close_pct, lot_step)
+            remaining_volume = entry_volume - close_volume
+            if close_volume < min_lot or remaining_volume < min_lot:
+                tp1_virtual_trigger = True
+
+        notes: List[str] = []
+        if tp1_virtual_trigger:
+            partial_close_pct = 0.0
+            move_sl_to_be = True
+            if be_plus_pips <= 0:
+                be_plus_pips = 1.0
+            trail_after_tp1 = False
+            if tp2_price is not None:
+                tp_plan = "tp1_tp2"
+            else:
+                tp_plan = "single_tp"
+            notes.append("TP1 virtual trigger: min lot size, move SL to BE instead of partial close.")
+
         if not tp_plan:
             tp_plan = "single_tp"
             if trail_after_tp1:
@@ -230,6 +254,8 @@ class PositionManager:
             be_trigger_pips=be_trigger_pips,
             be_plus_pips=be_plus_pips,
             tp_plan=tp_plan,
+            tp1_virtual_trigger=tp1_virtual_trigger,
+            notes=notes,
         )
 
     def _process_position(self, position: PositionContract, plan: PositionPlan) -> None:
@@ -274,13 +300,24 @@ class PositionManager:
         min_lot = self._get_gold_spec("MIN_LOT", 0.01)
         lot_step = self._get_gold_spec("LOT_STEP", 0.01)
         close_volume = self._round_volume(close_volume, lot_step)
-        if close_volume < float(min_lot):
+        remaining_volume = plan.volume - close_volume
+        if close_volume < float(min_lot) or remaining_volume < float(min_lot):
             self._logger.warning(
-                "[NDS][TP1_PARTIAL_SKIP] ticket=%s reason=volume_below_min volume=%.3f min=%.3f",
+                "[PM][PARTIAL_SKIP] Volume too small (%.2f), moving SL to BE instead. "
+                "ticket=%s close=%.3f remaining=%.3f min=%.3f",
+                plan.volume,
                 plan.position_ticket,
                 close_volume,
+                remaining_volume,
                 float(min_lot),
             )
+            plan.partial_closed = True
+            plan.move_sl_to_be = True
+            if plan.be_plus_pips <= 0:
+                plan.be_plus_pips = 1.0
+            plan.tp1_virtual_trigger = True
+            if "TP1 virtual trigger: min lot size, move SL to BE instead of partial close." not in plan.notes:
+                plan.notes.append("TP1 virtual trigger: min lot size, move SL to BE instead of partial close.")
             return
 
         result = self._close_with_retry(

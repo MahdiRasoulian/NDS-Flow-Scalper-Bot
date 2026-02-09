@@ -239,6 +239,7 @@ class FinalizedOrderParams:
     tp1_pips: Optional[float] = None
     tp2_pips: Optional[float] = None
     tp_execution_mode: Optional[str] = None
+    tp1_virtual_trigger: Optional[bool] = None
 
     def to_standard_payload(self) -> Dict[str, Any]:
         return {
