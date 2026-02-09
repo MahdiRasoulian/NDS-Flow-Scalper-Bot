@@ -1671,17 +1671,21 @@ class NDSBot:
             tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
             trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
             tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
+            tp1_virtual_trigger = bool(getattr(finalized, "tp1_virtual_trigger", False))
             tp_plan = "single_tp"
             if trail_after_tp1:
                 tp_plan = "trail_after_tp1"
             elif tp2_enabled and tp2_price is not None:
                 tp_plan = "tp1_tp2"
+            if tp1_virtual_trigger:
+                tp_plan = "tp1_tp2" if tp2_price is not None else "single_tp"
 
             risk_plan = {
                 "entry_price": float(finalized.entry_price),
                 "stop_loss": float(finalized.stop_loss),
                 "tp1_price": float(finalized.take_profit),
                 "tp2_price": float(tp2_price) if tp2_price is not None else None,
+                "tp1_virtual_trigger": tp1_virtual_trigger,
                 "tp_execution_mode": getattr(finalized, "tp_execution_mode", None),
                 "tp_plan": tp_plan,
                 "sl_pips": getattr(finalized, "sl_pips", None),

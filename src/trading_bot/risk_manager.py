@@ -136,6 +136,12 @@ class ScalpingRiskManager:
         self.GOLD_SPECS.setdefault("max_lot", 50.0)
         self.GOLD_SPECS.setdefault("lot_step", 0.01)
 
+    @staticmethod
+    def _round_volume(volume: float, step: float) -> float:
+        if step <= 0:
+            return volume
+        return round(volume / step) * step
+
     def __init__(self, overrides: Optional[Dict[str, Any]] = None, logger: logging.Logger = None):
         """
         مقداردهی مدیر ریسک اسکلپینگ با ساختار یکپارچه و حرفه‌ای.
@@ -1564,6 +1570,7 @@ class ScalpingRiskManager:
             tp1_pips: Optional[float] = None,
             tp2_pips: Optional[float] = None,
             tp_execution_mode: Optional[str] = None,
+            tp1_virtual_trigger: Optional[bool] = None,
         ) -> FinalizedOrderParams:
             return FinalizedOrderParams(
                 signal=signal,
@@ -1597,6 +1604,7 @@ class ScalpingRiskManager:
                 tp1_pips=tp1_pips,
                 tp2_pips=tp2_pips,
                 tp_execution_mode=tp_execution_mode,
+                tp1_virtual_trigger=tp1_virtual_trigger,
             )
 
         decision_notes: List[str] = []
@@ -2797,6 +2805,16 @@ class ScalpingRiskManager:
                 decision_notes.append(f"Lot clamped to max {max_lot}.")
                 lot_size = max_lot
 
+        tp1_virtual_trigger = False
+        if min_lot is not None and lot_step is not None and tp1_partial > 0:
+            close_volume = self._round_volume(lot_size * tp1_partial, float(lot_step))
+            remaining_volume = lot_size - close_volume
+            if close_volume < float(min_lot) or remaining_volume < float(min_lot):
+                tp1_virtual_trigger = True
+                decision_notes.append(
+                    "TP1 partial close skipped: min lot size; TP1 acts as a virtual trigger for moving SL to BE."
+                )
+
         self._logger.info(
             "[NDS][EXECUTION_READY] entry=%.2f sl=%.2f tp1=%.2f tp2=%s risk_usd=%.2f",
             float(entry_price),
@@ -2834,6 +2852,7 @@ class ScalpingRiskManager:
             tp1_pips=tp_pips,
             tp2_pips=tp2_pips_target,
             tp_execution_mode=tp_execution_mode,
+            tp1_virtual_trigger=tp1_virtual_trigger,
         )
 
 
