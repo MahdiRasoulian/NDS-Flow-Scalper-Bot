@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 import time
+from datetime import datetime
 
 from src.trading_bot.contracts import PositionContract
 from src.trading_bot.nds.distance_utils import pips_to_price, resolve_point_size_with_source
@@ -66,6 +67,30 @@ class PositionManager:
 
         for position in open_positions:
             ticket = int(position["position_ticket"])
+            if self.trade_tracker is not None and ticket not in self.trade_tracker.active_trades:
+                open_time = position.get("open_time") or datetime.utcnow()
+                open_event = {
+                    "event_type": "OPEN",
+                    "event_time": open_time,
+                    "symbol": position.get("symbol"),
+                    "order_ticket": None,
+                    "position_ticket": ticket,
+                    "side": position.get("side"),
+                    "volume": position.get("volume"),
+                    "entry_price": position.get("entry_price"),
+                    "exit_price": None,
+                    "sl": position.get("sl"),
+                    "tp": position.get("tp"),
+                    "profit": position.get("profit"),
+                    "pips": None,
+                    "pips_abs": None,
+                    "reason": None,
+                    "metadata": {
+                        "detected_by": "position_manager",
+                        "current_price": position.get("current_price"),
+                    },
+                }
+                self.trade_tracker.add_trade_open(open_event)
             if ticket not in self._plans:
                 plan = self._build_plan(position)
                 if plan:

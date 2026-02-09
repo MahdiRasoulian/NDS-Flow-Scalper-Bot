@@ -132,7 +132,7 @@ class ScalpingRiskManager:
         self.GOLD_SPECS.setdefault("digits", 2)
         self.GOLD_SPECS.setdefault("contract_size", 100.0)
         self.GOLD_SPECS.setdefault("tick_value_per_lot", 1.0)
-        self.GOLD_SPECS.setdefault("min_lot", 0.01)
+        self.GOLD_SPECS.setdefault("min_lot", 0.02)
         self.GOLD_SPECS.setdefault("max_lot", 50.0)
         self.GOLD_SPECS.setdefault("lot_step", 0.01)
 
@@ -1013,6 +1013,30 @@ class ScalpingRiskManager:
             point_size=point_size,
         )
         tp1_pips = float(tp_metrics.get("dist_pips") or 0.0)
+
+        if tp2_price is not None:
+            tp2_metrics = calculate_distance_metrics(
+                entry_price=float(entry_price),
+                current_price=float(tp2_price),
+                point_size=point_size,
+            )
+            tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+            min_gap_pips = float(settings.get("TP2_MIN_GAP_PIPS", 5.0))
+            min_tp2_pips = max(tp2_pips, tp1_pips + min_gap_pips)
+            if min_tp2_pips > tp2_pips:
+                tp2_pips = min_tp2_pips
+                tp2_price = (
+                    float(entry_price) + pips_to_price(tp2_pips, point_size)
+                    if signal == "BUY"
+                    else float(entry_price) - pips_to_price(tp2_pips, point_size)
+                )
+                self._logger.warning(
+                    "[NDS][TP2_FIX] signal=%s tp1_pips=%.2f tp2_pips=%.2f min_gap=%.2f",
+                    signal,
+                    tp1_pips,
+                    tp2_pips,
+                    min_gap_pips,
+                )
 
         if bool(settings.get("FLOW_TRAIL_AFTER_TP1", True)):
             tp2_price = None
@@ -3040,7 +3064,8 @@ class ScalpingRiskManager:
                                     risk_amount: float, sl_distance: float) -> float:
         """محاسبه حجم اسکلپینگ با دقت بالا (SAFE SPECS)"""
         tick_value_per_lot = float(self._get_gold_spec('TICK_VALUE_PER_LOT', 1.0))
-        min_lot = float(self._get_gold_spec('MIN_LOT', 0.01))
+        min_lot = float(self._get_gold_spec('MIN_LOT', 0.02))
+        min_lot = max(min_lot, 0.02)
         max_lot_spec = float(self._get_gold_spec('MAX_LOT', 50.0))
         lot_step = float(self._get_gold_spec('LOT_STEP', 0.01))
 

@@ -1660,6 +1660,15 @@ class NDSBot:
 
             order_type = finalized.order_type
             lot_size = finalized.lot_size
+            min_lot = float(self.risk_manager._get_gold_spec("MIN_LOT", 0.02))
+            lot_step = float(self.risk_manager._get_gold_spec("LOT_STEP", 0.01))
+            if lot_size < min_lot:
+                lot_size = round(min_lot / lot_step) * lot_step if lot_step > 0 else min_lot
+                logger.warning(
+                    "[RISK][LOT_CLAMP] lot_size raised to min_lot=%.2f step=%.2f",
+                    min_lot,
+                    lot_step,
+                )
             price_deviation_pips = finalized.deviation_pips
             current_session = None
             scalping_grade = signal_data.get("quality", "N/A")
@@ -1914,6 +1923,35 @@ class NDSBot:
                         order_id,
                         SYMBOL,
                         signal_data.get("signal"),
+                    )
+            if success and order_id and not position_ticket:
+                try:
+                    positions = self.mt5_client.get_open_positions(symbol=SYMBOL)
+                    matched = next(
+                        (
+                            pos
+                            for pos in positions
+                            if pos.get("magic") == resolved_magic
+                            and pos.get("comment") == order_comment
+                            and pos.get("side") == signal_data.get("signal")
+                            and abs(float(pos.get("volume") or 0.0) - float(lot_size)) <= 1e-6
+                        ),
+                        None,
+                    )
+                    if matched:
+                        position_ticket = matched.get("position_ticket")
+                        signal_data["position_ticket"] = position_ticket
+                        logger.info(
+                            "[TRADE][OPEN_POSITION_MATCH] order=%s position=%s symbol=%s side=%s",
+                            order_id,
+                            position_ticket,
+                            SYMBOL,
+                            signal_data.get("signal"),
+                        )
+                except Exception as resolve_error:
+                    logger.debug(
+                        "⚠️ Post-send position resolve failed: %s",
+                        resolve_error,
                     )
 
             if success and order_id:
