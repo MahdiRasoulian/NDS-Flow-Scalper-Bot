@@ -9,7 +9,11 @@ import time
 from datetime import datetime
 
 from src.trading_bot.contracts import PositionContract
-from src.trading_bot.nds.distance_utils import pips_to_price, resolve_point_size_with_source
+from src.trading_bot.nds.distance_utils import (
+    calculate_distance_metrics,
+    pips_to_price,
+    resolve_point_size_with_source,
+)
 
 
 @dataclass
@@ -33,11 +37,14 @@ class PositionPlan:
     tp_plan: str
     tp1_virtual_trigger: bool = False
     tp1_hit: bool = False
+    monitoring_for_tp2: bool = False
+    tp2_hit: bool = False
     partial_closed: bool = False
     sl_moved: bool = False
     trail_active: bool = False
     post_tp1_configured: bool = False
     last_trail_sl: Optional[float] = None
+    trail_distance_pips: float = 25.0
     notes: List[str] = field(default_factory=list)
 
 
@@ -63,6 +70,14 @@ class PositionManager:
         for ticket in list(self._plans.keys()):
             if ticket not in active_tickets:
                 self._logger.info("[NDS][TP_MANAGER] position=%s removed from plan cache", ticket)
+                if self.trade_tracker is not None and ticket in self.trade_tracker.active_trades:
+                    record = self.trade_tracker.active_trades.get(ticket)
+                    if record:
+                        self.trade_tracker.register_pending_close(
+                            ticket,
+                            record,
+                            datetime.utcnow(),
+                        )
                 self._plans.pop(ticket, None)
 
         for position in open_positions:
@@ -210,6 +225,36 @@ class PositionManager:
         if not tp2_enabled:
             tp2_price = None
 
+        if tp2_price is not None and tp1_price:
+            point_size = self._resolve_point_size()
+            tp1_metrics = calculate_distance_metrics(
+                entry_price=float(position.get("entry_price") or 0.0),
+                current_price=float(tp1_price),
+                point_size=point_size,
+            )
+            tp2_metrics = calculate_distance_metrics(
+                entry_price=float(position.get("entry_price") or 0.0),
+                current_price=float(tp2_price),
+                point_size=point_size,
+            )
+            tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
+            tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+            min_tp2_pips = max(tp1_pips + 15.0, tp1_pips * 1.2)
+            if tp2_pips + 1e-6 < min_tp2_pips:
+                tp2_distance = pips_to_price(min_tp2_pips, point_size)
+                entry_price = float(position.get("entry_price") or 0.0)
+                if str(position.get("side") or "BUY").upper() == "BUY":
+                    tp2_price = entry_price + tp2_distance
+                else:
+                    tp2_price = entry_price - tp2_distance
+                self._logger.warning(
+                    "[PM][TP2_SANITY] ticket=%s tp1_pips=%.2f tp2_pips=%.2f adjusted=%.2f",
+                    position.get("position_ticket"),
+                    tp1_pips,
+                    tp2_pips,
+                    min_tp2_pips,
+                )
+
         be_trigger_pips = (
             risk_settings.get("BE_TRIGGER_PIPS_COUNTERTREND")
             if counter_trend
@@ -217,6 +262,7 @@ class PositionManager:
         )
         be_trigger_pips = float(be_trigger_pips) if be_trigger_pips is not None else None
         be_plus_pips = float(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE_PLUS_PIPS", 0.0) or 0.0)
+        trail_distance_pips = float(flow_settings.get("FLOW_TRAIL_RUNNER_PIPS", 25.0) or 25.0)
 
         tp_execution_mode = (
             risk_plan.get("tp_execution_mode")
@@ -280,6 +326,7 @@ class PositionManager:
             be_plus_pips=be_plus_pips,
             tp_plan=tp_plan,
             tp1_virtual_trigger=tp1_virtual_trigger,
+            trail_distance_pips=trail_distance_pips,
             notes=notes,
         )
 
@@ -310,6 +357,18 @@ class PositionManager:
             self._execute_tp1_partial_close(position, plan)
             self._configure_post_tp1(position, plan)
 
+        if plan.monitoring_for_tp2 and not plan.tp2_hit and plan.tp2_price:
+            if self._price_reached_tp2(plan, current_price):
+                plan.tp2_hit = True
+                plan.trail_active = True
+                self._logger.info(
+                    "[NDS][TP2_TRIGGER] ticket=%s price=%.2f tp2=%.2f trail_pips=%.2f",
+                    plan.position_ticket,
+                    current_price,
+                    float(plan.tp2_price),
+                    plan.trail_distance_pips,
+                )
+
         self._maybe_move_sl_to_be(position, plan, current_price)
         self._maybe_update_trailing(position, plan, current_price)
 
@@ -317,6 +376,11 @@ class PositionManager:
         if plan.side == "BUY":
             return price >= plan.tp1_price
         return price <= plan.tp1_price
+
+    def _price_reached_tp2(self, plan: PositionPlan, price: float) -> bool:
+        if plan.side == "BUY":
+            return price >= plan.tp2_price
+        return price <= plan.tp2_price
 
     def _execute_tp1_partial_close(self, position: PositionContract, plan: PositionPlan) -> None:
         if plan.partial_closed or plan.partial_close_pct <= 0:
@@ -391,69 +455,34 @@ class PositionManager:
     def _configure_post_tp1(self, position: PositionContract, plan: PositionPlan) -> None:
         if plan.post_tp1_configured:
             return
-
-        if plan.trail_after_tp1:
-            result = self._modify_with_retry(
-                ticket=plan.position_ticket,
-                new_sl=None,
-                new_tp=0.0,
-                context="TP_TRAIL_ARM",
-            )
-            self._logger.info(
-                "[PM][SET_TP2_OR_TRAIL] ticket=%s trailing=true tp2=NONE result=%s retcode=%s",
-                plan.position_ticket,
-                result,
-                result.get("retcode") if isinstance(result, dict) else None,
-            )
-            self._logger.info(
-                "[NDS][TP_TRAIL_ARM] ticket=%s result=%s",
-                plan.position_ticket,
-                result,
-            )
-            if result and result.get("success"):
-                plan.trail_active = True
-                plan.post_tp1_configured = True
-            else:
-                self._logger.warning(
-                    "[NDS][TP_TRAIL_FAIL] ticket=%s result=%s",
-                    plan.position_ticket,
-                    result,
-                )
-        elif plan.tp2_price is not None:
-            result = self._modify_with_retry(
-                ticket=plan.position_ticket,
-                new_tp=plan.tp2_price,
-                new_sl=None,
-                context="TP2_SET",
-            )
-            self._logger.info(
-                "[PM][SET_TP2_OR_TRAIL] ticket=%s trailing=false tp2=%.2f result=%s retcode=%s",
-                plan.position_ticket,
-                float(plan.tp2_price),
-                result,
-                result.get("retcode") if isinstance(result, dict) else None,
-            )
-            self._logger.info(
-                "[NDS][TP2_SET] ticket=%s tp2=%.2f result=%s",
-                plan.position_ticket,
-                float(plan.tp2_price),
-                result,
-            )
-            if result and result.get("success"):
-                plan.post_tp1_configured = True
-            else:
-                self._logger.warning(
-                    "[NDS][TP2_SET_FAIL] ticket=%s tp2=%.2f result=%s",
-                    plan.position_ticket,
-                    float(plan.tp2_price),
-                    result,
-                )
+        if plan.tp2_price is not None:
+            plan.monitoring_for_tp2 = True
         else:
             self._logger.info(
                 "[NDS][TP2_SKIP] ticket=%s reason=no_tp2_config",
                 plan.position_ticket,
             )
-            plan.post_tp1_configured = True
+
+        result = self._modify_with_retry(
+            ticket=plan.position_ticket,
+            new_sl=None,
+            new_tp=0.0,
+            context="TP_CLEAR_AFTER_TP1",
+        )
+        self._logger.info(
+            "[PM][TP_CLEAR] ticket=%s result=%s retcode=%s",
+            plan.position_ticket,
+            result,
+            result.get("retcode") if isinstance(result, dict) else None,
+        )
+        if not result or not result.get("success"):
+            self._logger.warning(
+                "[NDS][TP_CLEAR_FAIL] ticket=%s result=%s",
+                plan.position_ticket,
+                result,
+            )
+
+        plan.post_tp1_configured = True
 
     def _maybe_move_sl_to_be(
         self, position: PositionContract, plan: PositionPlan, current_price: float
@@ -515,10 +544,14 @@ class PositionManager:
     def _maybe_update_trailing(
         self, position: PositionContract, plan: PositionPlan, current_price: float
     ) -> None:
-        if not plan.trail_active or not plan.tp1_hit or not plan.atr_value:
+        if not plan.trail_active or not plan.tp1_hit:
             return
-
-        trail_distance = float(plan.atr_value) * float(plan.trail_atr_mult)
+        point_size = self._resolve_point_size()
+        trail_distance = 0.0
+        if plan.trail_distance_pips:
+            trail_distance = pips_to_price(plan.trail_distance_pips, point_size)
+        elif plan.atr_value:
+            trail_distance = float(plan.atr_value) * float(plan.trail_atr_mult)
         if trail_distance <= 0:
             return
 
@@ -613,6 +646,7 @@ class PositionManager:
         if bool(risk_settings.get("TP2_ENABLED", True)):
             tp2_pips = float(risk_settings.get("TP2_PIPS", tp1_pips * 2.0))
             if tp2_pips > 0:
+                tp2_pips = max(tp2_pips, tp1_pips * 1.2, tp1_pips + 15.0)
                 tp2_distance = pips_to_price(tp2_pips, point_size)
                 tp2_price = entry_price + tp2_distance if side == "BUY" else entry_price - tp2_distance
 
@@ -682,8 +716,8 @@ class PositionManager:
         comment: str,
         context: str,
     ) -> Dict[str, Any]:
-        retries = 1
-        backoff = 0.2
+        retries = 3
+        backoff = 0.25
         last_result: Dict[str, Any] = {}
         for attempt in range(retries + 1):
             result = self.mt5_client.close_position(
@@ -704,6 +738,7 @@ class PositionManager:
                 last_result.get("retcode"),
             )
             time.sleep(backoff)
+            backoff *= 1.5
         return last_result
 
     @staticmethod

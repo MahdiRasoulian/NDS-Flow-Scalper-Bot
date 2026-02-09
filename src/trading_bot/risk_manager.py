@@ -1021,8 +1021,8 @@ class ScalpingRiskManager:
                 point_size=point_size,
             )
             tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
-            min_gap_pips = float(settings.get("TP2_MIN_GAP_PIPS", 5.0))
-            min_tp2_pips = max(tp2_pips, tp1_pips + min_gap_pips)
+            min_gap_pips = max(15.0, float(settings.get("TP2_MIN_GAP_PIPS", 5.0)))
+            min_tp2_pips = max(tp2_pips, tp1_pips + min_gap_pips, tp1_pips * 1.2)
             if min_tp2_pips > tp2_pips:
                 tp2_pips = min_tp2_pips
                 tp2_price = (
@@ -1453,13 +1453,23 @@ class ScalpingRiskManager:
         tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
         tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
 
+        if sl_distance <= 0 or tp1_distance <= 0:
+            return None, None, "RR repair skipped: invalid SL/TP1 distance."
+
         rr_tp1 = tp1_distance / sl_distance if sl_distance > 0 else 0.0
         rr_tp2 = tp2_distance / sl_distance if sl_distance > 0 and tp2_distance > 0 else 0.0
         if rr_tp2 + rr_epsilon >= min_rr_ratio:
             return None, None, None
 
         desired_rr = min_rr_ratio + rr_target_buffer
-        desired_tp2_distance = sl_distance * desired_rr
+        min_gap_pips = max(15.0, float(self.settings.get("TP2_MIN_GAP_PIPS", 5.0)))
+        min_tp2_pips = max(tp1_pips * 1.2, tp1_pips + min_gap_pips)
+        min_tp2_distance = pips_to_price(min_tp2_pips, point_size)
+        if rr_tp1 + rr_epsilon >= min_rr_ratio:
+            runner_tp2_pips = max(tp1_pips * 2.0, tp1_pips + min_gap_pips)
+            desired_tp2_distance = pips_to_price(runner_tp2_pips, point_size)
+        else:
+            desired_tp2_distance = max(sl_distance * desired_rr, min_tp2_distance)
 
         max_tp_pips = float(
             risk_manager_config.get(
@@ -1533,7 +1543,7 @@ class ScalpingRiskManager:
 
         decision_notes.append(
             "RR_REPAIR_TP2 "
-            f"tp2_pips={float(tp1_pips):.1f}->{new_tp2_pips:.1f} rr={rr_tp1:.6f}->{rr_after:.6f} "
+            f"tp2_pips={float(tp2_pips):.1f}->{new_tp2_pips:.1f} rr={rr_tp1:.6f}->{rr_after:.6f} "
             f"max_tp_pips={max_tp_pips:.1f} max_tp_atr_mult={max_tp_atr_mult:.2f}"
         )
         self._logger.info(
@@ -2410,8 +2420,12 @@ class ScalpingRiskManager:
         if rr_validate_mode == "TP2_ONLY":
             if not tp2_available:
                 if tp2_autogen_enabled and sl_pips > 0:
-                    desired_tp2_pips_raw = sl_pips * min_rr_effective
-                    desired_tp2_pips = math.ceil(desired_tp2_pips_raw)
+                    min_gap_pips = max(15.0, float(self.settings.get("TP2_MIN_GAP_PIPS", 5.0)))
+                    if rr_ratio + rr_epsilon >= min_rr_effective:
+                        desired_tp2_pips = max(tp_pips * 2.0, tp_pips + min_gap_pips)
+                    else:
+                        desired_tp2_pips_raw = sl_pips * min_rr_effective
+                        desired_tp2_pips = max(math.ceil(desired_tp2_pips_raw), tp_pips + min_gap_pips)
                     desired_tp2_distance = pips_to_price(desired_tp2_pips, point_size)
                     max_tp_pips = float(
                         risk_manager_config.get(
@@ -3081,6 +3095,10 @@ class ScalpingRiskManager:
             calculated_lot = steps * lot_step
         else:
             calculated_lot = raw_lot
+
+        granularity = max(lot_step, 0.02)
+        if granularity > 0:
+            calculated_lot = math.floor(calculated_lot / granularity) * granularity
 
         # استفاده از تنظیمات مپ شده برای حداکثر حجم
         max_lot_limit = self.settings.get('MAX_LOT_SIZE', 2.0)
