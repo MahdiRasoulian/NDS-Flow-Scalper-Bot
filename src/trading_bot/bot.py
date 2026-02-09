@@ -1632,6 +1632,19 @@ class NDSBot:
             except Exception as g2_err:
                 logger.warning(f"⚠️ Post-finalize geometry validation failed unexpectedly: {g2_err}", exc_info=True)
 
+            if any(
+                value in (None, 0, 0.0)
+                for value in (finalized.entry_price, finalized.stop_loss, finalized.take_profit)
+            ):
+                logger.error(
+                    "❌ Missing finalized risk plan levels | entry=%s sl=%s tp1=%s",
+                    finalized.entry_price,
+                    finalized.stop_loss,
+                    finalized.take_profit,
+                )
+                print("❌ برنامه ریسک نامعتبر است؛ معامله متوقف شد.")
+                return False
+
             signal_data.update(
                 {
                     "final_entry": finalized.final_entry or finalized.entry_price,
@@ -1653,6 +1666,36 @@ class NDSBot:
             if hasattr(self.risk_manager, "get_current_scalping_session"):
                 current_session = self.risk_manager.get_current_scalping_session()
 
+            flow_settings = config_payload.get("flow_settings", {}) if isinstance(config_payload, dict) else {}
+            risk_settings = config_payload.get("risk_settings", {}) if isinstance(config_payload, dict) else {}
+            tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
+            trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
+            tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
+            tp_plan = "single_tp"
+            if trail_after_tp1:
+                tp_plan = "trail_after_tp1"
+            elif tp2_enabled and tp2_price is not None:
+                tp_plan = "tp1_tp2"
+
+            risk_plan = {
+                "entry_price": float(finalized.entry_price),
+                "stop_loss": float(finalized.stop_loss),
+                "tp1_price": float(finalized.take_profit),
+                "tp2_price": float(tp2_price) if tp2_price is not None else None,
+                "tp_execution_mode": getattr(finalized, "tp_execution_mode", None),
+                "tp_plan": tp_plan,
+                "sl_pips": getattr(finalized, "sl_pips", None),
+                "tp1_pips": getattr(finalized, "tp1_pips", None),
+                "tp2_pips": getattr(finalized, "tp2_pips", None),
+                "rr_tp1": getattr(finalized, "rr_tp1", None),
+                "rr_tp2": getattr(finalized, "rr_tp2", None),
+                "rr_checked": getattr(finalized, "rr_checked", None),
+                "rr_validate_mode": getattr(finalized, "rr_validate_mode", None),
+                "min_rr_effective": getattr(finalized, "min_rr_effective", None),
+                "min_rr_source": getattr(finalized, "min_rr_source", None),
+            }
+            signal_data["risk_plan"] = risk_plan
+
             decision_summary = (
                 f"Decision Summary | type={order_type} "
                 f"entry={finalized.entry_price:.2f} sl={finalized.stop_loss:.2f} "
@@ -1666,8 +1709,6 @@ class NDSBot:
                 logger.info(f"Decision Notes: {notes_text}")
                 print(f"📝 {notes_text}")
 
-            flow_settings = config_payload.get("flow_settings", {}) if isinstance(config_payload, dict) else {}
-            risk_settings = config_payload.get("risk_settings", {}) if isinstance(config_payload, dict) else {}
             tp_sent_to_broker, tp_send_reason = self._resolve_broker_tp(
                 finalized,
                 flow_settings,
@@ -2047,6 +2088,7 @@ class NDSBot:
                         "trail_after_tp1": trail_after_tp1,
                         "tp_execution_mode": getattr(finalized, "tp_execution_mode", None),
                         "tp_sent_to_broker": tp_sent_to_broker,
+                        "risk_plan": risk_plan,
                         "entry_snapshot": entry_snapshot,
                     },
                 }

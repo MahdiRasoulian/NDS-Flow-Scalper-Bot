@@ -116,6 +116,9 @@ class PositionManager:
 
     def _build_plan(self, position: PositionContract) -> Optional[PositionPlan]:
         metadata = self._get_trade_metadata(position)
+        risk_plan = metadata.get("risk_plan") if isinstance(metadata.get("risk_plan"), dict) else {}
+        entry_snapshot = metadata.get("entry_snapshot") if isinstance(metadata.get("entry_snapshot"), dict) else {}
+        entry_risk = entry_snapshot.get("risk") if isinstance(entry_snapshot, dict) else {}
 
         entry_context = {}
         analysis_snapshot = metadata.get("analysis_snapshot") or {}
@@ -133,10 +136,15 @@ class PositionManager:
         flow_settings = self.config.get("flow_settings", {}) if isinstance(self.config, dict) else {}
         risk_settings = self.config.get("risk_settings", {}) if isinstance(self.config, dict) else {}
 
-        tp1_price = metadata.get("tp1_price")
-        tp1_price = float(tp1_price) if tp1_price else float(position.get("tp") or 0.0)
+        tp1_price = (
+            risk_plan.get("tp1_price")
+            or metadata.get("tp1_price")
+            or entry_risk.get("tp1")
+            or position.get("tp")
+        )
+        tp1_price = float(tp1_price) if tp1_price else 0.0
 
-        tp2_price = metadata.get("tp2_price")
+        tp2_price = risk_plan.get("tp2_price") or metadata.get("tp2_price") or entry_risk.get("tp2")
         tp2_price = float(tp2_price) if tp2_price else None
 
         if not tp1_price:
@@ -160,9 +168,18 @@ class PositionManager:
                     float(position.get("entry_price") or 0.0),
                     float(position.get("sl") or 0.0),
                 )
+                self._logger.warning(
+                    "[PM][PLAN_SKIP] ticket=%s reason=missing_tp1",
+                    position.get("position_ticket"),
+                )
                 return None
 
+        tp_plan = risk_plan.get("tp_plan") or metadata.get("tp_plan")
         trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
+        if tp_plan == "trail_after_tp1":
+            trail_after_tp1 = True
+        elif tp_plan in {"tp1_tp2", "single_tp"}:
+            trail_after_tp1 = False
         tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
         if not tp2_enabled:
             tp2_price = None
@@ -175,7 +192,11 @@ class PositionManager:
         be_trigger_pips = float(be_trigger_pips) if be_trigger_pips is not None else None
         be_plus_pips = float(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE_PLUS_PIPS", 0.0) or 0.0)
 
-        tp_execution_mode = metadata.get("tp_execution_mode")
+        tp_execution_mode = (
+            risk_plan.get("tp_execution_mode")
+            or metadata.get("tp_execution_mode")
+            or entry_risk.get("tp_execution_mode")
+        )
         partial_close_pct = float(flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5))
         move_sl_to_be = bool(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE", True))
         if tp_execution_mode == "SINGLE_TP":
@@ -184,11 +205,12 @@ class PositionManager:
             trail_after_tp1 = False
             tp2_price = None
 
-        tp_plan = "single_tp"
-        if trail_after_tp1:
-            tp_plan = "trail_after_tp1"
-        elif tp2_price is not None:
-            tp_plan = "tp1_tp2"
+        if not tp_plan:
+            tp_plan = "single_tp"
+            if trail_after_tp1:
+                tp_plan = "trail_after_tp1"
+            elif tp2_price is not None:
+                tp_plan = "tp1_tp2"
 
         return PositionPlan(
             position_ticket=int(position["position_ticket"]),
