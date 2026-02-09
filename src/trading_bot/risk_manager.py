@@ -2069,6 +2069,52 @@ class ScalpingRiskManager:
         stop_loss = sltp.get("stop_loss")
         take_profit = sltp.get("take_profit")
         tp2_price = sltp.get("tp2_price")
+        sl_pips = float(sltp.get("sl_pips") or 0.0)
+        raw_sl_pips = float(sltp.get("raw_sl_pips") or 0.0)
+        sl_distance = float(sltp.get("sl_distance") or 0.0)
+
+        sl_min_pips_setting = float(self.settings.get("SL_MIN_PIPS", 10.0))
+        min_sl_pips_setting = float(self.settings.get("MIN_SL_PIPS", sl_min_pips_setting))
+        min_sl_base = max(sl_min_pips_setting, min_sl_pips_setting)
+        noise_buffer_pips = float(
+            self.settings.get("SL_NOISE_BUFFER_PIPS", self.settings.get("MOMO_BUFFER_MIN_PIPS", 1.0) or 1.0)
+        )
+        min_safe_sl_pips = max(min_sl_base, spread_pips + noise_buffer_pips)
+        sl_max_pips_scalp = float(self.settings.get("SL_MAX_PIPS_SCALP", self.settings.get("SL_MAX_PIPS", 40.0)))
+
+        if min_safe_sl_pips > sl_max_pips_scalp:
+            decision_notes.append(
+                "Stop-loss safety check failed: min_safe_sl_pips exceeds SL_MAX_PIPS_SCALP."
+            )
+            return _finalize(
+                signal=signal,
+                order_type='NONE',
+                entry_price=entry_price,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=0.0,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason="Min SL exceeds max after spread buffer.",
+            )
+
+        if sl_pips and sl_pips < min_safe_sl_pips:
+            sl_pips = min_safe_sl_pips
+            sl_distance = pips_to_price(sl_pips, point_size)
+            if signal == "BUY":
+                stop_loss = float(entry_price) - sl_distance
+            else:
+                stop_loss = float(entry_price) + sl_distance
+            sltp["sl_pips"] = sl_pips
+            sltp["sl_distance"] = sl_distance
+            sltp["stop_loss"] = stop_loss
+            decision_notes.append(
+                f"SL safety buffer applied: spread_pips={spread_pips:.2f} "
+                f"noise_buffer_pips={noise_buffer_pips:.2f} min_safe_sl_pips={min_safe_sl_pips:.2f}."
+            )
         if bool(self.settings.get("SCALP_PRESERVE_TP1", False)) or (counter_trend and not reversal_ok):
             decision_notes.append("TP1 preserved: RR repair will not expand TP1 unless configured.")
         decision_notes.append("SL/TP computed by risk manager scalping model.")
