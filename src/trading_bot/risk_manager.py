@@ -1021,7 +1021,7 @@ class ScalpingRiskManager:
                 point_size=point_size,
             )
             tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
-            min_gap_pips = float(settings.get("TP2_MIN_GAP_PIPS", 5.0))
+            min_gap_pips = max(15.0, float(settings.get("TP2_MIN_GAP_PIPS", 5.0)))
             min_tp2_pips = max(tp2_pips, tp1_pips + min_gap_pips, tp1_pips * 1.2)
             if min_tp2_pips > tp2_pips:
                 tp2_pips = min_tp2_pips
@@ -1462,10 +1462,14 @@ class ScalpingRiskManager:
             return None, None, None
 
         desired_rr = min_rr_ratio + rr_target_buffer
-        min_gap_pips = float(self.settings.get("TP2_MIN_GAP_PIPS", 5.0))
+        min_gap_pips = max(15.0, float(self.settings.get("TP2_MIN_GAP_PIPS", 5.0)))
         min_tp2_pips = max(tp1_pips * 1.2, tp1_pips + min_gap_pips)
         min_tp2_distance = pips_to_price(min_tp2_pips, point_size)
-        desired_tp2_distance = max(sl_distance * desired_rr, min_tp2_distance)
+        if rr_tp1 + rr_epsilon >= min_rr_ratio:
+            runner_tp2_pips = max(tp1_pips * 2.0, tp1_pips + min_gap_pips)
+            desired_tp2_distance = pips_to_price(runner_tp2_pips, point_size)
+        else:
+            desired_tp2_distance = max(sl_distance * desired_rr, min_tp2_distance)
 
         max_tp_pips = float(
             risk_manager_config.get(
@@ -2416,8 +2420,12 @@ class ScalpingRiskManager:
         if rr_validate_mode == "TP2_ONLY":
             if not tp2_available:
                 if tp2_autogen_enabled and sl_pips > 0:
-                    desired_tp2_pips_raw = sl_pips * min_rr_effective
-                    desired_tp2_pips = math.ceil(desired_tp2_pips_raw)
+                    min_gap_pips = max(15.0, float(self.settings.get("TP2_MIN_GAP_PIPS", 5.0)))
+                    if rr_ratio + rr_epsilon >= min_rr_effective:
+                        desired_tp2_pips = max(tp_pips * 2.0, tp_pips + min_gap_pips)
+                    else:
+                        desired_tp2_pips_raw = sl_pips * min_rr_effective
+                        desired_tp2_pips = max(math.ceil(desired_tp2_pips_raw), tp_pips + min_gap_pips)
                     desired_tp2_distance = pips_to_price(desired_tp2_pips, point_size)
                     max_tp_pips = float(
                         risk_manager_config.get(

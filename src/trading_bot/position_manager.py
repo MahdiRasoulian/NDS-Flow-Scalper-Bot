@@ -9,7 +9,11 @@ import time
 from datetime import datetime
 
 from src.trading_bot.contracts import PositionContract
-from src.trading_bot.nds.distance_utils import pips_to_price, resolve_point_size_with_source
+from src.trading_bot.nds.distance_utils import (
+    calculate_distance_metrics,
+    pips_to_price,
+    resolve_point_size_with_source,
+)
 
 
 @dataclass
@@ -66,6 +70,14 @@ class PositionManager:
         for ticket in list(self._plans.keys()):
             if ticket not in active_tickets:
                 self._logger.info("[NDS][TP_MANAGER] position=%s removed from plan cache", ticket)
+                if self.trade_tracker is not None and ticket in self.trade_tracker.active_trades:
+                    record = self.trade_tracker.active_trades.get(ticket)
+                    if record:
+                        self.trade_tracker.register_pending_close(
+                            ticket,
+                            record,
+                            datetime.utcnow(),
+                        )
                 self._plans.pop(ticket, None)
 
         for position in open_positions:
@@ -212,6 +224,36 @@ class PositionManager:
         tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
         if not tp2_enabled:
             tp2_price = None
+
+        if tp2_price is not None and tp1_price:
+            point_size = self._resolve_point_size()
+            tp1_metrics = calculate_distance_metrics(
+                entry_price=float(position.get("entry_price") or 0.0),
+                current_price=float(tp1_price),
+                point_size=point_size,
+            )
+            tp2_metrics = calculate_distance_metrics(
+                entry_price=float(position.get("entry_price") or 0.0),
+                current_price=float(tp2_price),
+                point_size=point_size,
+            )
+            tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
+            tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+            min_tp2_pips = max(tp1_pips + 15.0, tp1_pips * 1.2)
+            if tp2_pips + 1e-6 < min_tp2_pips:
+                tp2_distance = pips_to_price(min_tp2_pips, point_size)
+                entry_price = float(position.get("entry_price") or 0.0)
+                if str(position.get("side") or "BUY").upper() == "BUY":
+                    tp2_price = entry_price + tp2_distance
+                else:
+                    tp2_price = entry_price - tp2_distance
+                self._logger.warning(
+                    "[PM][TP2_SANITY] ticket=%s tp1_pips=%.2f tp2_pips=%.2f adjusted=%.2f",
+                    position.get("position_ticket"),
+                    tp1_pips,
+                    tp2_pips,
+                    min_tp2_pips,
+                )
 
         be_trigger_pips = (
             risk_settings.get("BE_TRIGGER_PIPS_COUNTERTREND")
@@ -502,7 +544,7 @@ class PositionManager:
     def _maybe_update_trailing(
         self, position: PositionContract, plan: PositionPlan, current_price: float
     ) -> None:
-        if not plan.trail_active:
+        if not plan.trail_active or not plan.tp1_hit:
             return
         point_size = self._resolve_point_size()
         trail_distance = 0.0
@@ -604,7 +646,7 @@ class PositionManager:
         if bool(risk_settings.get("TP2_ENABLED", True)):
             tp2_pips = float(risk_settings.get("TP2_PIPS", tp1_pips * 2.0))
             if tp2_pips > 0:
-                tp2_pips = max(tp2_pips, tp1_pips * 1.2)
+                tp2_pips = max(tp2_pips, tp1_pips * 1.2, tp1_pips + 15.0)
                 tp2_distance = pips_to_price(tp2_pips, point_size)
                 tp2_price = entry_price + tp2_distance if side == "BUY" else entry_price - tp2_distance
 
