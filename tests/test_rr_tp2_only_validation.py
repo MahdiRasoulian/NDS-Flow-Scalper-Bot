@@ -118,7 +118,7 @@ def test_tp2_only_rejects_when_repair_caps_block_tp2():
     )
 
     assert not finalized.is_trade_allowed
-    assert finalized.reject_reason == "TP2 cap exceeded for RR repair."
+    assert finalized.reject_reason == "INVALID_SETUP: TP2 gap repair exceeds RR repair caps."
 
 
 def test_tp2_only_allows_large_sl_with_tp2_autogen():

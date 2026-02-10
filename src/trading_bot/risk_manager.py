@@ -2823,6 +2823,33 @@ class ScalpingRiskManager:
                 reject_reason="Risk validation failed.",
             )
 
+        invariant_ok, repaired_tp2, invariant_error = self._enforce_trade_invariants(
+            signal=signal,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            tp1_price=take_profit,
+            tp2_price=tp2_price,
+            point_size=point_size,
+            decision_notes=decision_notes,
+        )
+        if not invariant_ok:
+            decision_notes.append("INVARIANT_REJECT reason={}".format(invariant_error))
+            return _finalize(
+                signal=signal,
+                order_type='NONE',
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=risk_params.risk_amount,
+                rr_ratio=rr_ratio,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason=invariant_error,
+            )
+        tp2_price = repaired_tp2
+
         # ===============================
         # ✅ FIX: support both upper/lower keys for MIN/MAX lot
         # ===============================
@@ -2991,6 +3018,82 @@ class ScalpingRiskManager:
             return False
 
         return True
+
+    def _enforce_trade_invariants(
+        self,
+        *,
+        signal: str,
+        entry_price: float,
+        stop_loss: float,
+        tp1_price: float,
+        tp2_price: Optional[float],
+        point_size: float,
+        decision_notes: List[str],
+    ) -> Tuple[bool, Optional[float], Optional[str]]:
+        """Enforce non-negotiable directional and risk invariants before allowing a trade."""
+        side = str(signal or "").upper()
+        if tp2_price is None:
+            return False, None, "INVALID_SETUP: TP2 plan is required."
+
+        if side == "BUY":
+            directional_ok = entry_price < tp1_price < tp2_price
+        elif side == "SELL":
+            directional_ok = entry_price > tp1_price > tp2_price
+        else:
+            return False, None, "INVALID_SETUP: unknown signal side."
+
+        if not directional_ok:
+            return False, None, "INVALID_SETUP: directional TP invariant failed."
+
+        sl_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=stop_loss,
+            point_size=point_size,
+        )
+        tp1_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=tp1_price,
+            point_size=point_size,
+        )
+        tp2_metrics = calculate_distance_metrics(
+            entry_price=entry_price,
+            current_price=tp2_price,
+            point_size=point_size,
+        )
+        sl_pips = float(sl_metrics.get("dist_pips") or 0.0)
+        tp1_pips = float(tp1_metrics.get("dist_pips") or 0.0)
+        tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
+
+        max_sl_pips = float(self.settings.get("SL_MAX_PIPS_SCALP", self.settings.get("SL_MAX_PIPS", 40.0)))
+        if sl_pips > max_sl_pips:
+            return False, None, "INVALID_SETUP: stop-loss exceeds scalping ceiling."
+
+        gap_pips = abs(tp2_pips - tp1_pips)
+        required_gap_pips = max(15.0, 1.2 * tp1_pips)
+        if gap_pips + 1e-6 < required_gap_pips:
+            repaired_tp2_pips = tp1_pips + required_gap_pips
+            max_repair_tp2_pips = float(self.settings.get("RR_REPAIR_MAX_TP_PIPS", repaired_tp2_pips))
+            if repaired_tp2_pips - max_repair_tp2_pips > 1e-6:
+                return False, None, "INVALID_SETUP: TP2 gap repair exceeds RR repair caps."
+            repaired_tp2_price = (
+                entry_price + pips_to_price(repaired_tp2_pips, point_size)
+                if side == "BUY"
+                else entry_price - pips_to_price(repaired_tp2_pips, point_size)
+            )
+            decision_notes.append(
+                "RR_REPAIR_TP2_GAP tp2_pips={old:.1f}->{new:.1f} required_gap={gap:.1f}".format(
+                    old=tp2_pips,
+                    new=repaired_tp2_pips,
+                    gap=required_gap_pips,
+                )
+            )
+            if side == "BUY" and not (entry_price < tp1_price < repaired_tp2_price):
+                return False, None, "INVALID_SETUP: TP2 gap repair violated BUY direction."
+            if side == "SELL" and not (entry_price > tp1_price > repaired_tp2_price):
+                return False, None, "INVALID_SETUP: TP2 gap repair violated SELL direction."
+            tp2_price = repaired_tp2_price
+
+        return True, tp2_price, None
 
     def _get_max_scalping_risk_usd(self, account_equity: float) -> float:
         """دریافت حداکثر ریسک دلاری برای اسکلپینگ"""
