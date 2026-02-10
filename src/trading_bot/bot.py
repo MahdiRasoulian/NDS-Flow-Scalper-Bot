@@ -60,7 +60,7 @@ from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 from src.trading_bot.trade_tracker import TradeTracker
 from src.trading_bot.position_state import PositionStateStore
-from src.trading_bot.position_manager import PositionManager
+from src.trading_bot.position_manager_state_machine import PositionManager
 from src.trading_bot.cooldown import (
     CooldownDecision,
     evaluate_cooldown,
