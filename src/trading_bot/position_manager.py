@@ -46,10 +46,15 @@ class PositionPlan:
     last_trail_sl: Optional[float] = None
     trail_distance_pips: float = 25.0
     notes: List[str] = field(default_factory=list)
+    state: str = "STATE_OPEN"
 
 
 class PositionManager:
     """Manages TP1/TP2 partial close, BE moves, and trailing logic."""
+
+    STATE_OPEN = "STATE_OPEN"
+    STATE_SECURED = "STATE_SECURED"
+    STATE_TRAILING = "STATE_TRAILING"
 
     def __init__(
         self,
@@ -160,6 +165,8 @@ class PositionManager:
         risk_plan = metadata.get("risk_plan") if isinstance(metadata.get("risk_plan"), dict) else {}
         entry_snapshot = metadata.get("entry_snapshot") if isinstance(metadata.get("entry_snapshot"), dict) else {}
         entry_risk = entry_snapshot.get("risk") if isinstance(entry_snapshot, dict) else {}
+        if not isinstance(entry_risk, dict):
+            entry_risk = {}
 
         entry_context = {}
         analysis_snapshot = metadata.get("analysis_snapshot") or {}
@@ -300,12 +307,12 @@ class PositionManager:
                 tp_plan = "single_tp"
             notes.append("TP1 virtual trigger: min lot size, move SL to BE instead of partial close.")
 
+        if tp2_price is None:
+            self._logger.error("[PM][PLAN_SKIP] ticket=%s reason=missing_tp2_plan", position.get("position_ticket"))
+            return None
+
         if not tp_plan:
-            tp_plan = "single_tp"
-            if trail_after_tp1:
-                tp_plan = "trail_after_tp1"
-            elif tp2_price is not None:
-                tp_plan = "tp1_tp2"
+            tp_plan = "tp1_tp2"
 
         return PositionPlan(
             position_ticket=int(position["position_ticket"]),
@@ -334,43 +341,42 @@ class PositionManager:
         current_price = float(position.get("current_price") or 0.0)
         if not current_price:
             return
-        self._logger.info(
-            "[PM][MANAGE] ticket=%s mode=%s price=%.2f tp1=%.2f hit_tp1=%s partial_done=%s",
-            plan.position_ticket,
-            plan.tp_plan,
-            current_price,
-            plan.tp1_price,
-            plan.tp1_hit,
-            plan.partial_closed,
-        )
 
-        if not plan.tp1_hit and self._price_reached_tp1(plan, current_price):
-            plan.tp1_hit = True
-            self._logger.info(
-                "[NDS][TP1_HIT] ticket=%s price=%.2f tp1=%.2f",
-                plan.position_ticket,
-                current_price,
-                plan.tp1_price,
-            )
+        if plan.state == self.STATE_OPEN:
+            if not plan.tp1_hit and self._price_reached_tp1(plan, current_price):
+                plan.tp1_hit = True
+                self._logger.info("[NDS][STATE] ticket=%s transition=%s->%s trigger=TP1_TOUCH", plan.position_ticket, self.STATE_OPEN, self.STATE_SECURED)
+            if plan.tp1_hit and self._attempt_secure_state(position, plan):
+                plan.state = self.STATE_SECURED
 
-        if plan.tp1_hit:
-            self._execute_tp1_partial_close(position, plan)
-            self._configure_post_tp1(position, plan)
-
-        if plan.monitoring_for_tp2 and not plan.tp2_hit and plan.tp2_price:
-            if self._price_reached_tp2(plan, current_price):
+        if plan.state == self.STATE_SECURED and plan.tp2_price is not None:
+            if not plan.tp2_hit and self._price_reached_tp2(plan, current_price):
                 plan.tp2_hit = True
-                plan.trail_active = True
-                self._logger.info(
-                    "[NDS][TP2_TRIGGER] ticket=%s price=%.2f tp2=%.2f trail_pips=%.2f",
-                    plan.position_ticket,
-                    current_price,
-                    float(plan.tp2_price),
-                    plan.trail_distance_pips,
-                )
+                if self._activate_trailing_state(plan):
+                    plan.state = self.STATE_TRAILING
+                    self._logger.info("[NDS][STATE] ticket=%s transition=%s->%s trigger=TP2_CROSS", plan.position_ticket, self.STATE_SECURED, self.STATE_TRAILING)
 
-        self._maybe_move_sl_to_be(position, plan, current_price)
-        self._maybe_update_trailing(position, plan, current_price)
+        if plan.state == self.STATE_TRAILING:
+            self._maybe_update_trailing(position, plan, current_price)
+
+    def _attempt_secure_state(self, position: PositionContract, plan: PositionPlan) -> bool:
+        self._execute_tp1_partial_close(position, plan)
+        self._maybe_move_sl_to_be(position, plan, float(position.get("current_price") or 0.0))
+        tp_ok = self._configure_post_tp1(position, plan)
+        return bool(plan.partial_closed and plan.sl_moved and tp_ok)
+
+    def _activate_trailing_state(self, plan: PositionPlan) -> bool:
+        result = self._modify_with_retry(
+            ticket=plan.position_ticket,
+            new_sl=None,
+            new_tp=0.0,
+            context="ACTIVATE_TRAILING",
+        )
+        if result and result.get("success"):
+            plan.trail_active = True
+            return True
+        self._logger.error("[NDS][TRAIL_ACTIVATE_FAIL] ticket=%s result=%s", plan.position_ticket, result)
+        return False
 
     def _price_reached_tp1(self, plan: PositionPlan, price: float) -> bool:
         if plan.side == "BUY":
@@ -452,22 +458,16 @@ class PositionManager:
                 result,
             )
 
-    def _configure_post_tp1(self, position: PositionContract, plan: PositionPlan) -> None:
+    def _configure_post_tp1(self, position: PositionContract, plan: PositionPlan) -> bool:
         if plan.post_tp1_configured:
-            return
-        if plan.tp2_price is not None:
-            plan.monitoring_for_tp2 = True
-        else:
-            self._logger.info(
-                "[NDS][TP2_SKIP] ticket=%s reason=no_tp2_config",
-                plan.position_ticket,
-            )
+            return True
+        plan.monitoring_for_tp2 = True
 
         result = self._modify_with_retry(
             ticket=plan.position_ticket,
             new_sl=None,
-            new_tp=0.0,
-            context="TP_CLEAR_AFTER_TP1",
+            new_tp=float(plan.tp2_price),
+            context="SET_TP2_AFTER_TP1",
         )
         self._logger.info(
             "[PM][TP_CLEAR] ticket=%s result=%s retcode=%s",
@@ -477,12 +477,14 @@ class PositionManager:
         )
         if not result or not result.get("success"):
             self._logger.warning(
-                "[NDS][TP_CLEAR_FAIL] ticket=%s result=%s",
+                "[NDS][TP2_SET_FAIL] ticket=%s result=%s",
                 plan.position_ticket,
                 result,
             )
+            return False
 
         plan.post_tp1_configured = True
+        return True
 
     def _maybe_move_sl_to_be(
         self, position: PositionContract, plan: PositionPlan, current_price: float
@@ -544,7 +546,7 @@ class PositionManager:
     def _maybe_update_trailing(
         self, position: PositionContract, plan: PositionPlan, current_price: float
     ) -> None:
-        if not plan.trail_active or not plan.tp1_hit:
+        if not plan.trail_active:
             return
         point_size = self._resolve_point_size()
         trail_distance = 0.0

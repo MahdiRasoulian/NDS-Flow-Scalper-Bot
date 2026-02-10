@@ -2483,40 +2483,10 @@ class NDSBot:
                     state_record["status"] = "CLOSED"
                     state_record["close_time"] = close_time or now
 
-            for position_ticket, payload in pending_timeouts:
-                record = payload.get("record", {})
-                identity = record.get("trade_identity", {})
-                open_event = record.get("open_event", {})
-                opened_at = identity.get("opened_at")
-                entry_snapshot = open_event.get("metadata", {}).get("entry_snapshot")
-                close_event: ExecutionEvent = {
-                    "event_type": "CLOSE_UNKNOWN",
-                    "event_time": now,
-                    "symbol": identity.get("symbol") or SYMBOL,
-                    "order_ticket": identity.get("order_ticket"),
-                    "position_ticket": position_ticket,
-                    "side": open_event.get("side"),
-                    "volume": open_event.get("volume"),
-                    "entry_price": open_event.get("entry_price"),
-                    "exit_price": None,
-                    "sl": open_event.get("sl"),
-                    "tp": open_event.get("tp"),
-                    "profit": None,
-                    "pips": None,
-                    "pips_abs": None,
-                    "reason": "history_timeout",
-                    "metadata": {
-                        "duration_sec": (now - opened_at).total_seconds() if opened_at else None,
-                        "entry_snapshot": entry_snapshot,
-                    },
-                }
-                self.trade_tracker.finalize_unknown_close(position_ticket, close_event)
-                generate_execution_report(logger=logger, event=close_event)
+            if pending_timeouts:
                 logger.warning(
-                    "[CLOSE_UNKNOWN] ticket=%s symbol=%s timeout=%.1fs",
-                    position_ticket,
-                    identity.get("symbol"),
-                    timeout_sec,
+                    "[CLOSE_PENDING_KEEP] count=%s reason=history_not_available_yet",
+                    len(pending_timeouts),
                 )
 
             for state_record, volume_delta in state_result.partial_positions:

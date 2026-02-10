@@ -93,7 +93,7 @@ def test_tp1_partial_close_and_tp2_set():
 
 def test_tp1_partial_close_only_once():
     config = {
-        "risk_settings": {"TP2_ENABLED": False},
+        "risk_settings": {"TP2_ENABLED": True},
         "flow_settings": {
             "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
             "FLOW_TP1_MOVE_SL_TO_BE": True,
@@ -103,6 +103,7 @@ def test_tp1_partial_close_only_once():
     }
     metadata = {
         "tp1_price": 2005.0,
+        "tp2_price": 2010.0,
         "analysis_snapshot": {
             "entry_context": {"counter_trend": False},
         },
