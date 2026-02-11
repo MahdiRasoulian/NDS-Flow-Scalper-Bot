@@ -879,6 +879,8 @@ class ScalpingRiskManager:
         tp1_target_price: Optional[float] = None,
         counter_trend: bool = False,
         reversal_ok: bool = True,
+        nearest_support: Optional[Dict[str, Any]] = None,
+        nearest_resistance: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Compute scalping SL/TP with ATR and recent candle extrema reference."""
         settings = self.settings
@@ -914,18 +916,49 @@ class ScalpingRiskManager:
         elif signal == "SELL" and recent_high is not None:
             ref_distance = max(0.0, float(recent_high) - float(entry_price))
 
+        structural_buffer_pips = float(settings.get("STRUCTURAL_SL_BUFFER_PIPS", 2.0))
+        structural_min_atr = float(settings.get("STRUCTURAL_SL_MIN_ATR", 0.15))
+        structural_anchor_distance = 0.0
+        structural_anchor_source = "none"
+        atr_floor_distance = atr_value * structural_min_atr if atr_value and atr_value > 0 else 0.0
+        structural_buffer_distance = max(
+            pips_to_price(structural_buffer_pips, point_size),
+            atr_floor_distance,
+        )
+        if signal == "BUY" and isinstance(nearest_support, dict):
+            support_price = nearest_support.get("price")
+            if support_price is not None:
+                structural_anchor_distance = max(
+                    0.0,
+                    float(entry_price) - (float(support_price) - structural_buffer_distance),
+                )
+                structural_anchor_source = "nearest_support"
+        elif signal == "SELL" and isinstance(nearest_resistance, dict):
+            resistance_price = nearest_resistance.get("price")
+            if resistance_price is not None:
+                structural_anchor_distance = max(
+                    0.0,
+                    (float(resistance_price) + structural_buffer_distance) - float(entry_price),
+                )
+                structural_anchor_source = "nearest_resistance"
+
         sl_source = "none"
         if sl_model == "MIN_OF":
             cap_distance = pips_to_price(sl_max_pips_scalp, point_size)
             candidates = [cap_distance]
+            if structural_anchor_distance > 0:
+                candidates.append(structural_anchor_distance)
             if ref_distance > 0:
                 candidates.append(ref_distance)
             if atr_distance > 0:
                 candidates.append(atr_distance)
             sl_distance = min(candidates)
-            sl_source = "min_of_ref_atr_cap"
+            sl_source = "min_of_struct_ref_atr_cap"
         else:
-            if atr_distance > 0 and ref_distance > 0:
+            if structural_anchor_distance > 0:
+                sl_distance = structural_anchor_distance
+                sl_source = f"structural_anchor:{structural_anchor_source}"
+            elif atr_distance > 0 and ref_distance > 0:
                 sl_distance = min(atr_distance, ref_distance)
                 sl_source = "atr_ref_min"
             elif atr_distance > 0:
@@ -1054,6 +1087,8 @@ class ScalpingRiskManager:
             "sl_distance": sl_distance,
             "atr_distance": atr_distance,
             "ref_distance": ref_distance,
+            "structural_anchor_distance": structural_anchor_distance,
+            "structural_anchor_source": structural_anchor_source,
             "point_size": point_size,
         }
 
@@ -1992,21 +2027,32 @@ class ScalpingRiskManager:
             )
             sr_override = False
             sr_reason = "not_in_band"
-            if signal == "BUY" and inside_res_band:
+            sr_proximity_atr = float(self.settings.get("STATIC_SR_PROXIMITY_BLOCK_ATR", 0.25))
+            sr_strong_touches = int(self.settings.get("STATIC_SR_STRONG_TOUCHES_MIN", 3))
+            res_dist_atr = float(nearest_resistance.get("dist_atr") or 999.0)
+            sup_dist_atr = float(nearest_support.get("dist_atr") or 999.0)
+            res_touches = int(nearest_resistance.get("touches") or 0)
+            sup_touches = int(nearest_support.get("touches") or 0)
+            near_strong_res = res_dist_atr <= sr_proximity_atr and res_touches >= sr_strong_touches
+            near_strong_sup = sup_dist_atr <= sr_proximity_atr and sup_touches >= sr_strong_touches
+            if signal == "BUY" and (inside_res_band or near_strong_res):
                 sr_ok, sr_break_reason = self._sr_break_confirmation(
                     signal=signal,
                     signal_context=signal_context,
                     entry_context=entry_context,
                 )
                 sr_override = bool(reversal_ok and sr_ok)
-                sr_reason = f"override={sr_override} reversal_ok={reversal_ok} {sr_break_reason}"
+                gate_mode = "resistance_band" if inside_res_band else "resistance_proximity"
+                sr_reason = f"override={sr_override} reversal_ok={reversal_ok} {sr_break_reason} mode={gate_mode}"
                 if not sr_override:
-                    decision_notes.append(f"Static SR blocked: resistance_band {sr_break_reason}")
+                    decision_notes.append(f"Static SR blocked: {gate_mode} {sr_break_reason}")
                     self._logger.info(
-                        "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s "
+                        "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s near_res=%s near_sup=%s "
                         "nearest_resistance=%s nearest_support=%s override=%s reason=%s",
                         inside_res_band,
                         inside_sup_band,
+                        near_strong_res,
+                        near_strong_sup,
                         res_price,
                         sup_price,
                         sr_override,
@@ -2024,9 +2070,9 @@ class ScalpingRiskManager:
                         deviation_pips=deviation_pips,
                         decision_notes=decision_notes,
                         is_trade_allowed=False,
-                        reject_reason="Entry inside static resistance without confirmation.",
+                        reject_reason="Entry near static resistance without confirmation.",
                     )
-            elif signal == "SELL" and inside_sup_band:
+            elif signal == "SELL" and (inside_sup_band or near_strong_sup):
                 sr_ok, sr_break_reason = self._sr_break_confirmation(
                     signal=signal,
                     signal_context=signal_context,
@@ -2058,7 +2104,7 @@ class ScalpingRiskManager:
                         deviation_pips=deviation_pips,
                         decision_notes=decision_notes,
                         is_trade_allowed=False,
-                        reject_reason="Entry inside static support without confirmation.",
+                        reject_reason="Entry near static support without confirmation.",
                     )
             self._logger.info(
                 "[NDS][SR_GATE] action=ALLOW inside_res_band=%s inside_sup_band=%s "
@@ -2100,6 +2146,8 @@ class ScalpingRiskManager:
             )
         if "tp1_target_price" in tp1_policy:
             tp1_target_price = tp1_policy.get("tp1_target_price")
+        nearest_support = sr_context.get("nearest_support") if isinstance(sr_context, dict) else None
+        nearest_resistance = sr_context.get("nearest_resistance") if isinstance(sr_context, dict) else None
         sltp = self._compute_scalping_sl_tp(
             signal=signal,
             entry_price=entry_price,
@@ -2111,6 +2159,8 @@ class ScalpingRiskManager:
             tp1_target_price=tp1_target_price,
             counter_trend=counter_trend,
             reversal_ok=reversal_ok,
+            nearest_support=nearest_support,
+            nearest_resistance=nearest_resistance,
         )
         stop_loss = sltp.get("stop_loss")
         take_profit = sltp.get("take_profit")
@@ -2363,6 +2413,28 @@ class ScalpingRiskManager:
             preserve_tp1,
             trail_after_tp1,
         )
+
+        pre_rr_gate_enabled = bool(risk_manager_config.get("PRE_APPROVAL_RR_GATE_ENABLED", False))
+        pre_rr_min = float(risk_manager_config.get("PRE_APPROVAL_MIN_RR", min_rr_effective))
+        rr_for_precheck = rr_ratio_tp2 if rr_validate_mode == "TP2_ONLY" and rr_ratio_tp2 is not None else rr_ratio
+        if pre_rr_gate_enabled and rr_for_precheck + float(risk_manager_config.get("RR_EPSILON", 1e-6)) < pre_rr_min:
+            decision_notes.append(
+                f"RR_PREAPPROVAL_REJECT rr={rr_for_precheck:.2f} min={pre_rr_min:.2f}"
+            )
+            return _finalize(
+                signal=signal,
+                order_type='NONE',
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=rr_ratio,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason="Pre-approval RR below minimum.",
+            )
 
         # ===============================
         # ✅ FIX: inject last signal context for can_scalp session gating

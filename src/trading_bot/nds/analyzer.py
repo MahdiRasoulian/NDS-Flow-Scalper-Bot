@@ -4268,6 +4268,32 @@ class GoldNDSAnalyzer:
                             reversal_ok,
                         )
 
+            if analysis_result.get('signal') in {'BUY', 'SELL'}:
+                signal = str(analysis_result.get("signal") or "NONE")
+                context = analysis_result.get("context") or {}
+                signal_context = context.get("analysis_signal_context", {}) if isinstance(context, dict) else {}
+                entry_context = context.get("entry_context", {}) if isinstance(context, dict) else {}
+                sr_context = (
+                    analysis_result.get("static_sr")
+                    or context.get("static_sr")
+                    or entry_context.get("static_sr")
+                    or {}
+                )
+                blocked, block_reason = self._evaluate_sr_permission_gate(
+                    signal=signal,
+                    signal_context=signal_context,
+                    entry_context=entry_context,
+                    sr_context=sr_context,
+                )
+                if blocked:
+                    analysis_result['signal'] = 'NONE'
+                    self._append_reason(reasons, block_reason)
+                    self._log_info(
+                        "[NDS][SR_PERMISSION_GATE] action=REJECT signal=%s reason=%s",
+                        signal,
+                        block_reason,
+                    )
+
         analysis_result['reasons'] = reasons
         final_signal = analysis_result.get('signal', 'NONE')
 
@@ -4282,6 +4308,80 @@ class GoldNDSAnalyzer:
             self._log_debug("[NDS][FILTER] result signal=%s", final_signal)
 
         return analysis_result
+
+    def _has_sr_break_permission(
+        self,
+        signal_context: Dict[str, Any],
+        entry_context: Dict[str, Any],
+    ) -> bool:
+        """Allow structural S/R overrides only when displacement+structure confirms a real break."""
+        choch = str(signal_context.get("choch", "") or "").upper()
+        bos = str(signal_context.get("bos", "") or "").upper()
+        reversal_ok = bool(signal_context.get("reversal_ok") or entry_context.get("reversal_ok"))
+        try:
+            disp_atr = float(entry_context.get("disp_atr") or 0.0)
+        except (TypeError, ValueError):
+            disp_atr = 0.0
+        min_disp = float(self.GOLD_SETTINGS.get("STATIC_SR_BREAK_DISPLACEMENT_ATR_MIN", 0.5))
+        displacement_ok = disp_atr >= min_disp
+
+        if signal_context.get("break_close_confirmed") or entry_context.get("break_close_confirmed"):
+            return True
+        if signal_context.get("pullback_hold_confirmed") or entry_context.get("pullback_hold_confirmed"):
+            return True
+        if signal_context.get("rejection_confirmed") or entry_context.get("rejection_confirmed"):
+            return True
+
+        if signal_context.get("breakout_retest_confirmed") or entry_context.get("breakout_retest_confirmed"):
+            return True
+
+        if not reversal_ok or not displacement_ok:
+            return False
+        if choch == "BULLISH_CHOCH" or bos == "BULLISH_BOS":
+            return True
+        if choch == "BEARISH_CHOCH" or bos == "BEARISH_BOS":
+            return True
+        return False
+
+    def _evaluate_sr_permission_gate(
+        self,
+        *,
+        signal: str,
+        signal_context: Dict[str, Any],
+        entry_context: Dict[str, Any],
+        sr_context: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Hard permission gate to block late/chasing entries around strong S/R zones."""
+        if not isinstance(sr_context, dict) or not sr_context:
+            return False, "sr_context_missing"
+
+        proximity_block_atr = float(self.GOLD_SETTINGS.get("STATIC_SR_PROXIMITY_BLOCK_ATR", 0.25))
+        min_touches = int(self.GOLD_SETTINGS.get("STATIC_SR_STRONG_TOUCHES_MIN", 3))
+
+        nearest_resistance = sr_context.get("nearest_resistance") or {}
+        nearest_support = sr_context.get("nearest_support") or {}
+
+        if signal == "BUY" and nearest_resistance:
+            dist_atr = float(nearest_resistance.get("dist_atr") or 999.0)
+            touches = int(nearest_resistance.get("touches") or 0)
+            if dist_atr <= proximity_block_atr and touches >= min_touches:
+                if not self._has_sr_break_permission(signal_context, entry_context):
+                    return True, (
+                        f"SR permission gate: BUY near strong resistance "
+                        f"(dist_atr={dist_atr:.2f}, touches={touches}) without break/pullback/rejection confirmation"
+                    )
+
+        if signal == "SELL" and nearest_support:
+            dist_atr = float(nearest_support.get("dist_atr") or 999.0)
+            touches = int(nearest_support.get("touches") or 0)
+            if dist_atr <= proximity_block_atr and touches >= min_touches:
+                if not self._has_sr_break_permission(signal_context, entry_context):
+                    return True, (
+                        f"SR permission gate: SELL near strong support "
+                        f"(dist_atr={dist_atr:.2f}, touches={touches}) without break/pullback/rejection confirmation"
+                    )
+
+        return False, "allowed"
 
     def _select_swing_anchor(self, structure: MarketStructure, signal: str) -> Optional[float]:
         if signal == "BUY" and structure.last_low:
