@@ -987,6 +987,37 @@ class GoldNDSAnalyzer:
                 result_payload["context"]["static_sr"] = sr_context
                 entry_context = dict(entry_context)
                 entry_context["static_sr"] = sr_context
+                try:
+                    last_close = float(self.df["close"].iloc[-1])
+                    last_open = float(self.df["open"].iloc[-1]) if "open" in self.df.columns else None
+                    last_low = float(self.df["low"].iloc[-1]) if "low" in self.df.columns else None
+                    last_high = float(self.df["high"].iloc[-1]) if "high" in self.df.columns else None
+                except Exception:
+                    last_close = None
+                    last_open = None
+                    last_low = None
+                    last_high = None
+                entry_context["last_close"] = last_close
+                entry_context["last_open"] = last_open
+                entry_context["last_low"] = last_low
+                entry_context["last_high"] = last_high
+                entry_context["sr_band_half"] = sr_context.get("band_half")
+                break_close_count = 0
+                try:
+                    min_bars = int(self.GOLD_SETTINGS.get("STATIC_SR_BREAK_CLOSE_MIN_BARS", 1))
+                    lookback = max(1, min_bars)
+                    closes = self.df["close"].astype(float).iloc[-lookback:]
+                    if signal == "BUY":
+                        band_top = (sr_context.get("nearest_resistance") or {}).get("band_top")
+                        if band_top is not None:
+                            break_close_count = int((closes > float(band_top)).sum())
+                    elif signal == "SELL":
+                        band_bottom = (sr_context.get("nearest_support") or {}).get("band_bottom")
+                        if band_bottom is not None:
+                            break_close_count = int((closes < float(band_bottom)).sum())
+                except Exception:
+                    break_close_count = 0
+                entry_context["sr_break_close_count"] = break_close_count
                 nearest_resistance = sr_context.get("nearest_resistance") or {}
                 nearest_support = sr_context.get("nearest_support") or {}
                 self._log_info(
@@ -4268,6 +4299,32 @@ class GoldNDSAnalyzer:
                             reversal_ok,
                         )
 
+            if analysis_result.get('signal') in {'BUY', 'SELL'}:
+                signal = str(analysis_result.get("signal") or "NONE")
+                context = analysis_result.get("context") or {}
+                signal_context = context.get("analysis_signal_context", {}) if isinstance(context, dict) else {}
+                entry_context = context.get("entry_context", {}) if isinstance(context, dict) else {}
+                sr_context = (
+                    analysis_result.get("static_sr")
+                    or context.get("static_sr")
+                    or entry_context.get("static_sr")
+                    or {}
+                )
+                blocked, block_reason = self._evaluate_sr_permission_gate(
+                    signal=signal,
+                    signal_context=signal_context,
+                    entry_context=entry_context,
+                    sr_context=sr_context,
+                )
+                if blocked:
+                    analysis_result['signal'] = 'NONE'
+                    self._append_reason(reasons, block_reason)
+                    self._log_info(
+                        "[NDS][SR_PERMISSION_GATE] action=REJECT signal=%s reason=%s",
+                        signal,
+                        block_reason,
+                    )
+
         analysis_result['reasons'] = reasons
         final_signal = analysis_result.get('signal', 'NONE')
 
@@ -4282,6 +4339,33 @@ class GoldNDSAnalyzer:
             self._log_debug("[NDS][FILTER] result signal=%s", final_signal)
 
         return analysis_result
+
+    def _evaluate_sr_permission_gate(
+        self,
+        *,
+        signal: str,
+        signal_context: Dict[str, Any],
+        entry_context: Dict[str, Any],
+        sr_context: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Hard permission gate with shared settings+formal confirmations."""
+        if not isinstance(sr_context, dict) or not sr_context:
+            return False, "sr_context_missing"
+
+        shared = resolve_sr_gate_settings(self.GOLD_SETTINGS)
+        allow, reason, flags = allow_sr_override(
+            signal=signal,
+            signal_context=signal_context,
+            entry_context=entry_context,
+            sr_context=sr_context,
+            settings=shared,
+        )
+        if isinstance(entry_context, dict):
+            entry_context["sr_confirmations"] = flags
+
+        if allow:
+            return False, f"sr_allowed:{reason}"
+        return True, f"SR permission gate: {signal} blocked ({reason})"
 
     def _select_swing_anchor(self, structure: MarketStructure, signal: str) -> Optional[float]:
         if signal == "BUY" and structure.last_low:

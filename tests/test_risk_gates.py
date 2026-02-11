@@ -175,7 +175,7 @@ def test_static_resistance_blocks_buy_without_break_confirmation():
     )
 
     assert not finalized.is_trade_allowed
-    assert finalized.reject_reason == "Entry inside static resistance without confirmation."
+    assert finalized.reject_reason == "Entry near static resistance without confirmation."
 
 
 def test_support_must_be_below_price():
@@ -275,3 +275,173 @@ def test_sr_gate_applies_to_ifvg_and_breaker():
 
     assert not ifvg_result.is_trade_allowed
     assert not breaker_result.is_trade_allowed
+
+
+def test_analyzer_sr_permission_gate_blocks_buy_near_strong_resistance():
+    data = {
+        'time': [datetime(2025, 1, 1, 0, 0, 0), datetime(2025, 1, 1, 0, 5, 0)],
+        'open': [100.0, 100.1],
+        'high': [100.3, 100.4],
+        'low': [99.8, 99.9],
+        'close': [100.0, 100.2],
+        'volume': [1, 1],
+    }
+    try:
+        df = pd.DataFrame(data)
+    except TypeError:
+        pytest.skip("pandas DataFrame constructor unavailable in this environment")
+    analyzer = GoldNDSAnalyzer(df)
+    analyzer.GOLD_SETTINGS.update(
+        {
+            "STATIC_SR_PROXIMITY_BLOCK_ATR": 0.25,
+            "STATIC_SR_STRONG_TOUCHES_MIN": 3,
+        }
+    )
+    payload = {
+        "signal": "BUY",
+        "reasons": [],
+        "market_metrics": {"current_rvol": 1.2, "adx": 25.0},
+        "session_analysis": {"weight": 1.0},
+        "confidence": 80.0,
+        "structure": {"structure_score": 70.0, "bos": "NONE", "choch": "NONE"},
+        "context": {
+            "analysis_signal_context": {
+                "bias": "BULLISH",
+                "strong_trend": False,
+                "reversal_ok": False,
+                "choch": "NONE",
+                "bos": "NONE",
+            },
+            "entry_context": {
+                "reversal_ok": False,
+                "disp_atr": 0.1,
+            },
+            "static_sr": {
+                "nearest_resistance": {"dist_atr": 0.12, "touches": 5},
+            },
+        },
+        "static_sr": {
+            "nearest_resistance": {"dist_atr": 0.12, "touches": 5},
+        },
+    }
+
+    out = analyzer._apply_final_filters(payload, scalping_mode=True)
+    assert out["signal"] == "NONE"
+    assert any("SR permission gate" in r for r in out["reasons"])
+
+
+def test_structural_sl_anchor_uses_nearest_support_for_buy():
+    risk_manager = create_scalping_risk_manager()
+    sltp = risk_manager._compute_scalping_sl_tp(
+        signal="BUY",
+        entry_price=5060.06,
+        atr_value=6.0,
+        recent_low=5057.0,
+        recent_high=5062.0,
+        config_payload=_build_config_payload(),
+        point_size=0.01,
+        tp1_target_price=None,
+        counter_trend=False,
+        reversal_ok=False,
+        nearest_support={"price": 5053.0},
+        nearest_resistance={"price": 5058.7},
+    )
+    assert sltp["sl_source"].startswith("structural_anchor")
+    assert sltp["stop_loss"] < 5053.0
+
+
+def test_static_resistance_proximity_blocks_buy_without_confirmation():
+    risk_manager = create_scalping_risk_manager()
+    analysis_payload = {
+        "signal": "BUY",
+        "confidence": 80.0,
+        "entry_level": 100.7,
+        "entry_model": "MARKET",
+        "entry_idea": {
+            "entry_level": 100.7,
+            "entry_model": "MARKET",
+            "entry_type": "FLOW",
+        },
+        "market_metrics": {"atr": 2.0},
+        "analysis_signal_context": {
+            "bias": "BULLISH",
+            "directional_bias": "UPTREND",
+            "choch": "NONE",
+            "bos": "NONE",
+            "sweeps_count": 0,
+        },
+        "entry_context": {
+            "counter_trend": False,
+            "reversal_ok": False,
+            "disp_atr": 0.1,
+            "liquidity_ok": True,
+            "trend_ok": True,
+        },
+        "static_sr": {
+            "nearest_resistance": {
+                "price": 100.5,
+                "band_bottom": 99.0,
+                "band_top": 100.6,
+                "dist_pips": 2.0,
+                "dist_atr": 0.12,
+                "touches": 5,
+            },
+            "nearest_support": {
+                "price": 98.0,
+                "band_bottom": 97.0,
+                "band_top": 99.0,
+                "dist_pips": 20.0,
+                "dist_atr": 1.0,
+                "touches": 2,
+            },
+        },
+    }
+    cfg = _build_config_payload()
+    live_snapshot = LivePriceSnapshot(bid=100.7, ask=100.71, timestamp=datetime.utcnow().isoformat())
+    finalized = risk_manager.finalize_order(
+        analysis=analysis_payload,
+        live=live_snapshot,
+        symbol="XAUUSD",
+        config=cfg,
+    )
+
+    assert not finalized.is_trade_allowed
+    assert finalized.reject_reason == "Entry near static resistance without confirmation."
+
+
+def test_structural_sl_exceeds_max_rejects_trade():
+    risk_manager = create_scalping_risk_manager()
+    analysis_payload = {
+        "signal": "BUY",
+        "confidence": 80.0,
+        "entry_level": 100.0,
+        "entry_model": "MARKET",
+        "entry_idea": {"entry_level": 100.0, "entry_model": "MARKET", "entry_type": "FLOW"},
+        "market_metrics": {"atr": 1.0},
+        "analysis_signal_context": {
+            "bias": "BULLISH",
+            "directional_bias": "UPTREND",
+            "choch": "BULLISH_CHOCH",
+            "bos": "BULLISH_BOS",
+            "sweeps_count": 1,
+        },
+        "entry_context": {
+            "counter_trend": False,
+            "reversal_ok": True,
+            "disp_atr": 1.0,
+            "liquidity_ok": True,
+            "trend_ok": True,
+        },
+        "static_sr": {
+            "nearest_resistance": {"price": 110.0, "band_bottom": 109.0, "band_top": 111.0, "dist_atr": 10.0, "touches": 1},
+            "nearest_support": {"price": 80.0, "band_bottom": 79.0, "band_top": 81.0, "dist_atr": 20.0, "touches": 1},
+        },
+    }
+    cfg = _build_config_payload()
+    cfg["risk_settings"].update({"SL_MAX_PIPS_SCALP": 50.0, "SL_MAX_PIPS": 50.0})
+    cfg["risk_manager_config"].update({"MIN_RR_RATIO": 0.1})
+    live_snapshot = LivePriceSnapshot(bid=100.0, ask=100.01, timestamp=datetime.utcnow().isoformat())
+    finalized = risk_manager.finalize_order(analysis=analysis_payload, live=live_snapshot, symbol="XAUUSD", config=cfg)
+    assert not finalized.is_trade_allowed
+    assert finalized.reject_reason in {"Structural SL exceeds max SL cap.", "Pre-approval RR below minimum."}
+
