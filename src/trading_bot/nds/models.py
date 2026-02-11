@@ -240,6 +240,8 @@ class FinalizedOrderParams:
     tp2_pips: Optional[float] = None
     tp_execution_mode: Optional[str] = None
     tp1_virtual_trigger: Optional[bool] = None
+    calculated_take_profit: Optional[float] = None
+    broker_take_profit: Optional[float] = None
 
     def to_standard_payload(self) -> Dict[str, Any]:
         return {
@@ -263,5 +265,7 @@ class FinalizedOrderParams:
             "deviation_pips": self.deviation_pips,
             "rr_validate_mode": self.rr_validate_mode,
             "tp_execution_mode": self.tp_execution_mode,
+            "calculated_take_profit": self.calculated_take_profit,
+            "broker_take_profit": self.broker_take_profit,
             "decision_notes": list(self.decision_notes or []),
         }

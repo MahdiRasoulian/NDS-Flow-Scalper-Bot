@@ -60,7 +60,7 @@ from src.trading_bot.realtime_price import RealTimePriceMonitor
 from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 from src.trading_bot.trade_tracker import TradeTracker
 from src.trading_bot.position_state import PositionStateStore
-from src.trading_bot.position_manager_state_machine import PositionManager
+from src.trading_bot.position_manager import PositionManager
 from src.trading_bot.cooldown import (
     CooldownDecision,
     evaluate_cooldown,
@@ -542,13 +542,17 @@ class NDSBot:
             trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
             tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
             tp_execution_mode = (
-                "TP1_PARTIAL_MANAGED"
+                "VIRTUAL_FSM"
                 if tp1_partial > 0 and (trail_after_tp1 or tp2_enabled)
                 else "SINGLE_TP"
             )
 
-        if tp_execution_mode == "TP1_PARTIAL_MANAGED":
-            return float(finalized.take_profit), "tp1_broker_only"
+        if tp_execution_mode in {"VIRTUAL_FSM", "TP1_PARTIAL_MANAGED"}:
+            return 0.0, "sl_only_fsm_managed"
+
+        broker_tp = getattr(finalized, "broker_take_profit", None)
+        if broker_tp is not None:
+            return float(broker_tp), "risk_manager_override"
 
         return float(finalized.take_profit), "single_tp"
 
