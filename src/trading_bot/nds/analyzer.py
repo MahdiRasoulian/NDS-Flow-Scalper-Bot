@@ -4379,7 +4379,7 @@ class GoldNDSAnalyzer:
 
         _allow_sr_override, _resolve_sr_gate_settings = self._get_sr_permission_helpers()
         if _allow_sr_override is None or _resolve_sr_gate_settings is None:
-            return False, "sr_helpers_unavailable_fallback_allow"
+            return True, "sr_helpers_unavailable_fallback_reject"
         shared = _resolve_sr_gate_settings(self.GOLD_SETTINGS)
         allow, reason, flags = _allow_sr_override(
             signal=signal,
@@ -4388,8 +4388,6 @@ class GoldNDSAnalyzer:
             sr_context=sr_context,
             settings=shared,
         )
-        if isinstance(entry_context, dict):
-            entry_context["sr_confirmations"] = flags
 
         if allow:
             return False, f"sr_allowed:{reason}"

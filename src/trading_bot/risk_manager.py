@@ -867,7 +867,9 @@ class ScalpingRiskManager:
     ) -> Tuple[bool, str]:
         _allow_sr_override, _resolve_sr_gate_settings = self._get_sr_permission_helpers()
         if _allow_sr_override is None or _resolve_sr_gate_settings is None:
-            return True, "sr_helpers_unavailable_fallback_allow"
+            # Fail-closed: if structural permission helpers are unavailable,
+            # do not allow bypassing S/R confirmations.
+            return False, "sr_helpers_unavailable_fallback_reject"
         shared = _resolve_sr_gate_settings(self.settings)
         allow, reason, flags = _allow_sr_override(
             signal=signal,
@@ -876,8 +878,6 @@ class ScalpingRiskManager:
             sr_context=sr_context,
             settings=shared,
         )
-        if isinstance(entry_context, dict):
-            entry_context["sr_confirmations"] = flags
         return allow, reason
 
     def _get_point_size(self, config_payload: Dict[str, Any]) -> float:
@@ -1014,6 +1014,9 @@ class ScalpingRiskManager:
 
         structural_anchor_pips = 0.0
         if structural_anchor_distance > 0:
+            # NOTE: structural_anchor_distance, atr_distance and ref_distance are all
+            # maintained in price units. Pip conversion is canonicalized only via
+            # calculate_distance_metrics/pips_to_price.
             anchor_target = (
                 float(entry_price) - float(structural_anchor_distance)
                 if signal == "BUY"
