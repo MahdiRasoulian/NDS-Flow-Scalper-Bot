@@ -1605,6 +1605,8 @@ class ScalpingRiskManager:
             tp2_pips: Optional[float] = None,
             tp_execution_mode: Optional[str] = None,
             tp1_virtual_trigger: Optional[bool] = None,
+            calculated_take_profit: Optional[float] = None,
+            broker_take_profit: Optional[float] = None,
         ) -> FinalizedOrderParams:
             return FinalizedOrderParams(
                 signal=signal,
@@ -1639,6 +1641,8 @@ class ScalpingRiskManager:
                 tp2_pips=tp2_pips,
                 tp_execution_mode=tp_execution_mode,
                 tp1_virtual_trigger=tp1_virtual_trigger,
+                calculated_take_profit=calculated_take_profit if calculated_take_profit is not None else take_profit,
+                broker_take_profit=broker_take_profit,
             )
 
         decision_notes: List[str] = []
@@ -2184,7 +2188,7 @@ class ScalpingRiskManager:
         decision_notes.append(f"TP plan selected: {tp_plan}")
         tp_execution_mode = "SINGLE_TP"
         if tp1_partial > 0 and tp_plan != "single_tp":
-            tp_execution_mode = "TP1_PARTIAL_MANAGED"
+            tp_execution_mode = "VIRTUAL_FSM"
         elif tp1_partial > 0 and tp_plan == "single_tp":
             decision_notes.append("TP1 partial ignored: tp_plan=single_tp (no managed remainder).")
         decision_notes.append(f"TP execution mode: {tp_execution_mode}")
@@ -2918,6 +2922,8 @@ class ScalpingRiskManager:
             tp2_pips=tp2_pips_target,
             tp_execution_mode=tp_execution_mode,
             tp1_virtual_trigger=tp1_virtual_trigger,
+            calculated_take_profit=take_profit,
+            broker_take_profit=0.0 if tp_execution_mode == "VIRTUAL_FSM" else take_profit,
         )
 
 
