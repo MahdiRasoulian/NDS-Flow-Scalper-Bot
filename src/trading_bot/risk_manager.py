@@ -35,6 +35,12 @@ if TYPE_CHECKING:
 
 from src.trading_bot.nds.models import FinalizedOrderParams, LivePriceSnapshot
 
+from src.trading_bot.nds.sr_permissions import (
+    allow_sr_override,
+    resolve_sr_gate_settings,
+)
+
+
 
 @dataclass
 class ScalpingRiskParameters:
@@ -837,29 +843,19 @@ class ScalpingRiskManager:
         signal: str,
         signal_context: Dict[str, Any],
         entry_context: Dict[str, Any],
+        sr_context: Dict[str, Any],
     ) -> Tuple[bool, str]:
-        choch = str(signal_context.get("choch", "") or "").upper()
-        bos = str(signal_context.get("bos", "") or "").upper()
-        disp_atr = entry_context.get("disp_atr")
-        try:
-            disp_atr_val = float(disp_atr or 0.0)
-        except (TypeError, ValueError):
-            disp_atr_val = 0.0
-        min_disp_atr = float(self.settings.get("STATIC_SR_BREAK_DISPLACEMENT_ATR_MIN", 0.5))
-
-        bullish_break = choch == "BULLISH_CHOCH" or bos == "BULLISH_BOS"
-        bearish_break = choch == "BEARISH_CHOCH" or bos == "BEARISH_BOS"
-        displacement_ok = disp_atr_val >= min_disp_atr
-
-        if signal == "BUY":
-            ok = bullish_break and displacement_ok
-            reason = f"bullish_break={bullish_break} disp_atr={disp_atr_val:.2f}"
-            return ok, reason
-        if signal == "SELL":
-            ok = bearish_break and displacement_ok
-            reason = f"bearish_break={bearish_break} disp_atr={disp_atr_val:.2f}"
-            return ok, reason
-        return True, "no_signal"
+        shared = resolve_sr_gate_settings(self.settings)
+        allow, reason, flags = allow_sr_override(
+            signal=signal,
+            signal_context=signal_context,
+            entry_context=entry_context,
+            sr_context=sr_context,
+            settings=shared,
+        )
+        if isinstance(entry_context, dict):
+            entry_context["sr_confirmations"] = flags
+        return allow, reason
 
     def _get_point_size(self, config_payload: Dict[str, Any]) -> float:
         """Resolve point size with default for XAUUSD mapping."""
@@ -993,6 +989,21 @@ class ScalpingRiskManager:
             clamp_action = "SKIP"
             clamp_reason = "within_bounds"
 
+        structural_anchor_pips = 0.0
+        if structural_anchor_distance > 0:
+            anchor_metrics = calculate_distance_metrics(
+                entry_price=float(entry_price),
+                current_price=float(entry_price) + float(structural_anchor_distance),
+                point_size=point_size,
+            )
+            structural_anchor_pips = float(anchor_metrics.get("dist_pips") or 0.0)
+            if sl_pips < structural_anchor_pips:
+                sl_pips = structural_anchor_pips
+                sl_distance = pips_to_price(sl_pips, point_size)
+                sl_source = f"structural_enforced:{structural_anchor_source}"
+                clamp_action = "APPLY"
+                clamp_reason = "structural_enforced"
+
         self._logger.info(
             "[NDS][SL_CLAMP] action=%s reason=%s raw=%.2f clamped=%.2f bounds=[%.2f,%.2f] "
             "sl_model=%s sl_source=%s point_size=%.4f",
@@ -1089,6 +1100,8 @@ class ScalpingRiskManager:
             "ref_distance": ref_distance,
             "structural_anchor_distance": structural_anchor_distance,
             "structural_anchor_source": structural_anchor_source,
+            "structural_anchor_pips": structural_anchor_pips,
+            "structural_stop_exceeds_max": bool(structural_anchor_pips > sl_max_pips_scalp + 1e-6),
             "point_size": point_size,
         }
 
@@ -2027,24 +2040,17 @@ class ScalpingRiskManager:
             )
             sr_override = False
             sr_reason = "not_in_band"
-            sr_proximity_atr = float(self.settings.get("STATIC_SR_PROXIMITY_BLOCK_ATR", 0.25))
-            sr_strong_touches = int(self.settings.get("STATIC_SR_STRONG_TOUCHES_MIN", 3))
-            res_dist_atr = float(nearest_resistance.get("dist_atr") or 999.0)
-            sup_dist_atr = float(nearest_support.get("dist_atr") or 999.0)
-            res_touches = int(nearest_resistance.get("touches") or 0)
-            sup_touches = int(nearest_support.get("touches") or 0)
-            near_strong_res = res_dist_atr <= sr_proximity_atr and res_touches >= sr_strong_touches
-            near_strong_sup = sup_dist_atr <= sr_proximity_atr and sup_touches >= sr_strong_touches
-            if signal == "BUY" and (inside_res_band or near_strong_res):
+            if signal == "BUY" and (inside_res_band or nearest_resistance):
                 sr_ok, sr_break_reason = self._sr_break_confirmation(
                     signal=signal,
                     signal_context=signal_context,
                     entry_context=entry_context,
+                    sr_context=sr_context,
                 )
-                sr_override = bool(reversal_ok and sr_ok)
+                sr_override = bool(sr_ok)
                 gate_mode = "resistance_band" if inside_res_band else "resistance_proximity"
-                sr_reason = f"override={sr_override} reversal_ok={reversal_ok} {sr_break_reason} mode={gate_mode}"
-                if not sr_override:
+                sr_reason = f"override={sr_override} {sr_break_reason} mode={gate_mode}"
+                if inside_res_band or (not sr_ok and "missing_confirmation" in sr_break_reason):
                     decision_notes.append(f"Static SR blocked: {gate_mode} {sr_break_reason}")
                     self._logger.info(
                         "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s near_res=%s near_sup=%s "
@@ -2072,15 +2078,16 @@ class ScalpingRiskManager:
                         is_trade_allowed=False,
                         reject_reason="Entry near static resistance without confirmation.",
                     )
-            elif signal == "SELL" and (inside_sup_band or near_strong_sup):
+            elif signal == "SELL" and (inside_sup_band or nearest_support):
                 sr_ok, sr_break_reason = self._sr_break_confirmation(
                     signal=signal,
                     signal_context=signal_context,
                     entry_context=entry_context,
+                    sr_context=sr_context,
                 )
-                sr_override = bool(reversal_ok and sr_ok)
-                sr_reason = f"override={sr_override} reversal_ok={reversal_ok} {sr_break_reason}"
-                if not sr_override:
+                sr_override = bool(sr_ok)
+                sr_reason = f"override={sr_override} {sr_break_reason}"
+                if inside_sup_band or (not sr_ok and "missing_confirmation" in sr_break_reason):
                     decision_notes.append(f"Static SR blocked: support_band {sr_break_reason}")
                     self._logger.info(
                         "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s "
@@ -2168,6 +2175,26 @@ class ScalpingRiskManager:
         sl_pips = float(sltp.get("sl_pips") or 0.0)
         raw_sl_pips = float(sltp.get("raw_sl_pips") or 0.0)
         sl_distance = float(sltp.get("sl_distance") or 0.0)
+        structural_anchor_pips = float(sltp.get("structural_anchor_pips") or 0.0)
+
+        if bool(sltp.get("structural_stop_exceeds_max")):
+            decision_notes.append(
+                "Structural SL required distance exceeds max SL cap."
+            )
+            return _finalize(
+                signal=signal,
+                order_type='NONE',
+                entry_price=entry_price,
+                stop_loss=stop_loss or 0.0,
+                take_profit=take_profit or 0.0,
+                lot_size=0.0,
+                risk_amount_usd=0.0,
+                rr_ratio=0.0,
+                deviation_pips=deviation_pips,
+                decision_notes=decision_notes,
+                is_trade_allowed=False,
+                reject_reason="Structural SL exceeds max SL cap.",
+            )
 
         sl_min_pips_setting = float(self.settings.get("SL_MIN_PIPS", 10.0))
         min_sl_pips_setting = float(self.settings.get("MIN_SL_PIPS", sl_min_pips_setting))
@@ -2414,7 +2441,7 @@ class ScalpingRiskManager:
             trail_after_tp1,
         )
 
-        pre_rr_gate_enabled = bool(risk_manager_config.get("PRE_APPROVAL_RR_GATE_ENABLED", False))
+        pre_rr_gate_enabled = bool(risk_manager_config.get("PRE_APPROVAL_RR_GATE_ENABLED", True))
         pre_rr_min = float(risk_manager_config.get("PRE_APPROVAL_MIN_RR", min_rr_effective))
         rr_for_precheck = rr_ratio_tp2 if rr_validate_mode == "TP2_ONLY" and rr_ratio_tp2 is not None else rr_ratio
         if pre_rr_gate_enabled and rr_for_precheck + float(risk_manager_config.get("RR_EPSILON", 1e-6)) < pre_rr_min:

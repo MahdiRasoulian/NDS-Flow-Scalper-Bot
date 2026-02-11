@@ -407,3 +407,41 @@ def test_static_resistance_proximity_blocks_buy_without_confirmation():
 
     assert not finalized.is_trade_allowed
     assert finalized.reject_reason == "Entry near static resistance without confirmation."
+
+
+def test_structural_sl_exceeds_max_rejects_trade():
+    risk_manager = create_scalping_risk_manager()
+    analysis_payload = {
+        "signal": "BUY",
+        "confidence": 80.0,
+        "entry_level": 100.0,
+        "entry_model": "MARKET",
+        "entry_idea": {"entry_level": 100.0, "entry_model": "MARKET", "entry_type": "FLOW"},
+        "market_metrics": {"atr": 1.0},
+        "analysis_signal_context": {
+            "bias": "BULLISH",
+            "directional_bias": "UPTREND",
+            "choch": "BULLISH_CHOCH",
+            "bos": "BULLISH_BOS",
+            "sweeps_count": 1,
+        },
+        "entry_context": {
+            "counter_trend": False,
+            "reversal_ok": True,
+            "disp_atr": 1.0,
+            "liquidity_ok": True,
+            "trend_ok": True,
+        },
+        "static_sr": {
+            "nearest_resistance": {"price": 110.0, "band_bottom": 109.0, "band_top": 111.0, "dist_atr": 10.0, "touches": 1},
+            "nearest_support": {"price": 80.0, "band_bottom": 79.0, "band_top": 81.0, "dist_atr": 20.0, "touches": 1},
+        },
+    }
+    cfg = _build_config_payload()
+    cfg["risk_settings"].update({"SL_MAX_PIPS_SCALP": 50.0, "SL_MAX_PIPS": 50.0})
+    cfg["risk_manager_config"].update({"MIN_RR_RATIO": 0.1})
+    live_snapshot = LivePriceSnapshot(bid=100.0, ask=100.01, timestamp=datetime.utcnow().isoformat())
+    finalized = risk_manager.finalize_order(analysis=analysis_payload, live=live_snapshot, symbol="XAUUSD", config=cfg)
+    assert not finalized.is_trade_allowed
+    assert finalized.reject_reason in {"Structural SL exceeds max SL cap.", "Pre-approval RR below minimum."}
+
