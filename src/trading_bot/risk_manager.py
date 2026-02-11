@@ -2053,10 +2053,12 @@ class ScalpingRiskManager:
                 if inside_res_band or (not sr_ok and "missing_confirmation" in sr_break_reason):
                     decision_notes.append(f"Static SR blocked: {gate_mode} {sr_break_reason}")
                     self._logger.info(
-                        "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s "
+                        "[NDS][SR_GATE] action=REJECT inside_res_band=%s inside_sup_band=%s near_res=%s near_sup=%s "
                         "nearest_resistance=%s nearest_support=%s override=%s reason=%s",
                         inside_res_band,
                         inside_sup_band,
+                        near_strong_res,
+                        near_strong_sup,
                         res_price,
                         sup_price,
                         sr_override,
