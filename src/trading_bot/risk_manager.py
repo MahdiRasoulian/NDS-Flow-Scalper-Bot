@@ -35,10 +35,14 @@ if TYPE_CHECKING:
 
 from src.trading_bot.nds.models import FinalizedOrderParams, LivePriceSnapshot
 
-from src.trading_bot.nds.sr_permissions import (
-    allow_sr_override,
-    resolve_sr_gate_settings,
-)
+try:
+    from src.trading_bot.nds.sr_permissions import (
+        allow_sr_override,
+        resolve_sr_gate_settings,
+    )
+except Exception:  # pragma: no cover - defensive import fallback
+    allow_sr_override = None
+    resolve_sr_gate_settings = None
 
 
 
@@ -837,6 +841,22 @@ class ScalpingRiskManager:
             return ok, reason
         return True, "not_counter_trend_regime"
 
+    def _get_sr_permission_helpers(self):
+        """Lazy/defensive resolver for S/R permission helpers."""
+        global allow_sr_override, resolve_sr_gate_settings
+        if allow_sr_override is not None and resolve_sr_gate_settings is not None:
+            return allow_sr_override, resolve_sr_gate_settings
+        try:
+            from src.trading_bot.nds.sr_permissions import (
+                allow_sr_override as _allow_sr_override,
+                resolve_sr_gate_settings as _resolve_sr_gate_settings,
+            )
+            allow_sr_override = _allow_sr_override
+            resolve_sr_gate_settings = _resolve_sr_gate_settings
+            return _allow_sr_override, _resolve_sr_gate_settings
+        except Exception:
+            return None, None
+
     def _sr_break_confirmation(
         self,
         *,
@@ -845,8 +865,11 @@ class ScalpingRiskManager:
         entry_context: Dict[str, Any],
         sr_context: Dict[str, Any],
     ) -> Tuple[bool, str]:
-        shared = resolve_sr_gate_settings(self.settings)
-        allow, reason, flags = allow_sr_override(
+        _allow_sr_override, _resolve_sr_gate_settings = self._get_sr_permission_helpers()
+        if _allow_sr_override is None or _resolve_sr_gate_settings is None:
+            return True, "sr_helpers_unavailable_fallback_allow"
+        shared = _resolve_sr_gate_settings(self.settings)
+        allow, reason, flags = _allow_sr_override(
             signal=signal,
             signal_context=signal_context,
             entry_context=entry_context,
@@ -991,9 +1014,14 @@ class ScalpingRiskManager:
 
         structural_anchor_pips = 0.0
         if structural_anchor_distance > 0:
+            anchor_target = (
+                float(entry_price) - float(structural_anchor_distance)
+                if signal == "BUY"
+                else float(entry_price) + float(structural_anchor_distance)
+            )
             anchor_metrics = calculate_distance_metrics(
                 entry_price=float(entry_price),
-                current_price=float(entry_price) + float(structural_anchor_distance),
+                current_price=anchor_target,
                 point_size=point_size,
             )
             structural_anchor_pips = float(anchor_metrics.get("dist_pips") or 0.0)

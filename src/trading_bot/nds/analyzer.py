@@ -58,6 +58,15 @@ from src.trading_bot.time_utils import (
 )
 from src.trading_bot.session_policy import evaluate_session, normalize_session_payload
 
+try:
+    from src.trading_bot.nds.sr_permissions import (
+        allow_sr_override,
+        resolve_sr_gate_settings,
+    )
+except Exception:  # pragma: no cover - defensive import fallback
+    allow_sr_override = None
+    resolve_sr_gate_settings = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -4340,6 +4349,22 @@ class GoldNDSAnalyzer:
 
         return analysis_result
 
+    def _get_sr_permission_helpers(self):
+        """Lazy/defensive resolver for S/R permission helpers."""
+        global allow_sr_override, resolve_sr_gate_settings
+        if allow_sr_override is not None and resolve_sr_gate_settings is not None:
+            return allow_sr_override, resolve_sr_gate_settings
+        try:
+            from src.trading_bot.nds.sr_permissions import (
+                allow_sr_override as _allow_sr_override,
+                resolve_sr_gate_settings as _resolve_sr_gate_settings,
+            )
+            allow_sr_override = _allow_sr_override
+            resolve_sr_gate_settings = _resolve_sr_gate_settings
+            return _allow_sr_override, _resolve_sr_gate_settings
+        except Exception:
+            return None, None
+
     def _evaluate_sr_permission_gate(
         self,
         *,
@@ -4352,8 +4377,11 @@ class GoldNDSAnalyzer:
         if not isinstance(sr_context, dict) or not sr_context:
             return False, "sr_context_missing"
 
-        shared = resolve_sr_gate_settings(self.GOLD_SETTINGS)
-        allow, reason, flags = allow_sr_override(
+        _allow_sr_override, _resolve_sr_gate_settings = self._get_sr_permission_helpers()
+        if _allow_sr_override is None or _resolve_sr_gate_settings is None:
+            return False, "sr_helpers_unavailable_fallback_allow"
+        shared = _resolve_sr_gate_settings(self.GOLD_SETTINGS)
+        allow, reason, flags = _allow_sr_override(
             signal=signal,
             signal_context=signal_context,
             entry_context=entry_context,

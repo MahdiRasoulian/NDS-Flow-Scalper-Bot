@@ -11,6 +11,16 @@ from src.trading_bot.risk_manager import create_scalping_risk_manager
 pd = pytest.importorskip("pandas")
 
 
+def _dataframe_constructor_works() -> bool:
+    try:
+        pd.DataFrame({"a": [1]})
+        return True
+    except Exception:
+        return False
+
+
+
+
 def _build_config_payload() -> dict:
     cfg = config.get_full_config()
     cfg.setdefault("risk_manager_config", {})
@@ -179,6 +189,8 @@ def test_static_resistance_blocks_buy_without_break_confirmation():
 
 
 def test_support_must_be_below_price():
+    if not _dataframe_constructor_works():
+        pytest.skip("pandas DataFrame constructor unavailable in this environment")
     start = datetime(2025, 1, 1, 0, 0, 0)
     times = [start + timedelta(minutes=5 * idx) for idx in range(6)]
     data = {
@@ -200,10 +212,7 @@ def test_support_must_be_below_price():
         },
         "trading_settings": {"POINT_SIZE": 0.01},
     }
-    try:
-        df = pd.DataFrame(data)
-    except TypeError:
-        pytest.skip("pandas DataFrame constructor unavailable in this environment")
+    df = pd.DataFrame(data)
     analyzer = GoldNDSAnalyzer(df, config=cfg)
     ref_price = 11.0
     sr_context = analyzer._compute_static_sr_context(ref_price, atr_value=1.0)
@@ -278,6 +287,8 @@ def test_sr_gate_applies_to_ifvg_and_breaker():
 
 
 def test_analyzer_sr_permission_gate_blocks_buy_near_strong_resistance():
+    if not _dataframe_constructor_works():
+        pytest.skip("pandas DataFrame constructor unavailable in this environment")
     data = {
         'time': [datetime(2025, 1, 1, 0, 0, 0), datetime(2025, 1, 1, 0, 5, 0)],
         'open': [100.0, 100.1],
@@ -286,10 +297,7 @@ def test_analyzer_sr_permission_gate_blocks_buy_near_strong_resistance():
         'close': [100.0, 100.2],
         'volume': [1, 1],
     }
-    try:
-        df = pd.DataFrame(data)
-    except TypeError:
-        pytest.skip("pandas DataFrame constructor unavailable in this environment")
+    df = pd.DataFrame(data)
     analyzer = GoldNDSAnalyzer(df)
     analyzer.GOLD_SETTINGS.update(
         {
