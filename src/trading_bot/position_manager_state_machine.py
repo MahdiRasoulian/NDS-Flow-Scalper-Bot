@@ -82,6 +82,7 @@ class PositionManager:
             market_price = float(position.get("current_price") or 0.0)
             if market_price <= 0:
                 continue
+            self._logger.info("[PM][MANAGE] ticket=%s status=%s price=%.2f", plan.ticket, plan.status.name, market_price)
             self._run_fsm_tick(plan, market_price)
 
     def _build_plan(self, position: PositionContract) -> Optional[PositionPlan]:
@@ -101,8 +102,23 @@ class PositionManager:
             or entry_risk.get("tp2")
         )
         if tp1 is None or tp2 is None:
-            self._logger.warning("[PM][PLAN_SKIP] ticket=%s reason=missing_tp_targets", position.get("position_ticket"))
-            return None
+            risk_settings = self.config.get("risk_settings", {}) if isinstance(self.config, dict) else {}
+            point_size = self._resolve_point_size()
+            entry = float(position.get("entry_price") or 0.0)
+            side = str(position.get("side") or "BUY").upper()
+            tp1_pips = float(risk_settings.get("TP1_PIPS", 35.0) or 35.0)
+            tp2_pips = float(risk_settings.get("TP2_PIPS", tp1_pips * 2.0) or (tp1_pips * 2.0))
+            if entry > 0 and point_size > 0:
+                if tp1 is None:
+                    tp1 = entry + pips_to_price(tp1_pips, point_size) if side == "BUY" else entry - pips_to_price(tp1_pips, point_size)
+                if tp2 is None:
+                    tp2 = entry + pips_to_price(tp2_pips, point_size) if side == "BUY" else entry - pips_to_price(tp2_pips, point_size)
+                self._logger.info("[PM][PLAN_FALLBACK] ticket=%s tp1=%.2f tp2=%.2f", position.get("position_ticket"), float(tp1), float(tp2))
+            else:
+                self._logger.warning("[PM][PLAN_SKIP] ticket=%s reason=missing_tp_targets", position.get("position_ticket"))
+                return None
+
+        self._logger.info("[PM][PLAN_META] ticket=%s metadata_keys=%s", position.get("position_ticket"), sorted(list(metadata.keys())) if isinstance(metadata, dict) else [])
 
         plan = PositionPlan(
             ticket=int(position["position_ticket"]),
@@ -130,10 +146,17 @@ class PositionManager:
                 self._clear_broker_tp(plan)
                 self._logger.info("[PM][STATE] %s OPEN -> WAIT_TP1", plan.ticket)
                 plan.status = PositionStatus.STATUS_WAIT_TP1
-                return
 
             if plan.status == PositionStatus.STATUS_WAIT_TP1:
-                if not self._crossed_tp1(plan, market_price):
+                tp1_hit = self._crossed_tp1(plan, market_price)
+                self._logger.info(
+                    "[PM][tp1_evaluation] ticket=%s price=%.2f tp1=%.2f hit=%s",
+                    plan.ticket,
+                    float(market_price),
+                    float(plan.tp1_price),
+                    tp1_hit,
+                )
+                if not tp1_hit:
                     return
                 if self._secure_at_tp1(plan):
                     plan.status = PositionStatus.STATUS_WAIT_TP2
@@ -189,17 +212,80 @@ class PositionManager:
     def _clear_broker_tp(self, plan: PositionPlan) -> None:
         self._modify_position(plan.ticket, new_tp=0.0, context="CLEAR_BROKER_TP")
 
+    @staticmethod
+    def _floor_to_step(value: float, step: float) -> float:
+        if step <= 0:
+            return float(value)
+        steps = int(float(value) / float(step))
+        return round(steps * float(step), 8)
+
+    def _resolve_volume_constraints(self, symbol: Optional[str]) -> Dict[str, float]:
+        trading_settings = self.config.get("trading_settings", {}) if isinstance(self.config, dict) else {}
+        gold_specs = trading_settings.get("GOLD_SPECIFICATIONS", {}) if isinstance(trading_settings, dict) else {}
+        strategy_min = float(gold_specs.get("MIN_LOT", 0.01) or 0.01)
+        lot_step = float(gold_specs.get("LOT_STEP", 0.01) or 0.01)
+        broker_min = strategy_min
+        if hasattr(self.mt5_client, "_get_symbol_info"):
+            try:
+                symbol_info = self.mt5_client._get_symbol_info(symbol or "")
+                if symbol_info is not None and getattr(symbol_info, "volume_min", None):
+                    broker_min = float(getattr(symbol_info, "volume_min"))
+            except Exception:
+                self._logger.debug("[PM][VOLUME] broker volume_min unavailable", exc_info=True)
+        min_volume = max(strategy_min, broker_min)
+        return {
+            "strategy_min": strategy_min,
+            "broker_min": broker_min,
+            "min_volume": min_volume,
+            "lot_step": lot_step,
+        }
+
     def _partial_close(self, plan: PositionPlan) -> bool:
-        close_volume = max(plan.volume * 0.5, 0.0)
+        constraints = self._resolve_volume_constraints(plan.symbol)
+        lot_step = constraints["lot_step"]
+        min_volume = constraints["min_volume"]
+
+        requested_volume = max(plan.volume * 0.5, 0.0)
+        close_volume = self._floor_to_step(requested_volume, lot_step)
+        remaining_volume = self._floor_to_step(plan.volume - close_volume, lot_step)
+
         if close_volume <= 0:
-            self._logger.error("[PM][PARTIAL_CLOSE] ticket=%s invalid_volume=%.4f", plan.ticket, close_volume)
+            self._logger.error("[PM][partial_close_request] ticket=%s invalid_volume=%.4f", plan.ticket, close_volume)
             return False
+
+        if remaining_volume < min_volume:
+            close_volume = self._floor_to_step(plan.volume, lot_step)
+            remaining_volume = 0.0
+
+        if close_volume < min_volume and remaining_volume > 0:
+            self._logger.warning(
+                "[PM][partial_close_request] ticket=%s rejected close=%.4f min=%.4f remaining=%.4f",
+                plan.ticket,
+                close_volume,
+                min_volume,
+                remaining_volume,
+            )
+            return False
+
+        self._logger.info(
+            "[PM][partial_close_request] ticket=%s position_volume=%.4f requested=%.4f close=%.4f remaining=%.4f min=%.4f step=%.4f",
+            plan.ticket,
+            float(plan.volume),
+            float(requested_volume),
+            float(close_volume),
+            float(remaining_volume),
+            float(min_volume),
+            float(lot_step),
+        )
+
         result = self._call_mt5("close_position", ticket=plan.ticket, volume=close_volume)
         ok = bool(result and result.get("success"))
         if ok:
             self._logger.info("[PM][PARTIAL_CLOSE] ticket=%s volume=%.3f", plan.ticket, close_volume)
         else:
             self._logger.warning("[PM][PARTIAL_CLOSE_FAIL] ticket=%s result=%s", plan.ticket, result)
+            self._logger.warning("[NDS][TP1_PARTIAL_FAIL] ticket=%s result=%s", plan.ticket, result)
+            self._logger.warning("[NDS][SL_BE_FAIL] ticket=%s result=%s", plan.ticket, result)
         return ok
 
     def _modify_sl(self, plan: PositionPlan, new_sl: float) -> bool:
@@ -209,6 +295,7 @@ class PositionManager:
             self._logger.info("[PM][MOVE_SL] ticket=%s sl=%.2f", plan.ticket, new_sl)
         else:
             self._logger.warning("[PM][MOVE_SL_FAIL] ticket=%s result=%s", plan.ticket, result)
+            self._logger.warning("[NDS][SL_BE_FAIL] ticket=%s result=%s", plan.ticket, result)
         return ok
 
     def _set_tp2(self, plan: PositionPlan) -> bool:
