@@ -16,6 +16,7 @@ from pathlib import Path
 import queue
 from collections import deque
 from decimal import Decimal
+from contextlib import nullcontext
 
 logger = logging.getLogger(__name__)
 
@@ -414,41 +415,8 @@ class MT5Client:
             return self._select_symbol(symbol)
         return True
 
-    def _order_send_with_retry(
-        self,
-        request: Dict[str, Any],
-        symbol: str,
-        context: str,
-        retry_on_none: bool = True,
-    ):
-        sanitized_request = self.sanitize_mt5_request(request)
-        req_types = {key: type(value).__name__ for key, value in sanitized_request.items()}
-        self._logger.debug("REQ_TYPES: %s", req_types)
-        self._logger.debug("REQ_DATA: %s", sanitized_request)
-        result = self._mt5_call(mt5.order_send, sanitized_request)
-        if result is not None:
-            return result
-
-        last_error = self._mt5_last_error()
-        snapshot = self._log_symbol_snapshot(symbol)
-        self._logger.error(
-            "❌ MT5 order_send returned None | context=%s | last_error=%s | request=%s | request_types=%s | symbol_snapshot=%s",
-            context,
-            last_error,
-            sanitized_request,
-            req_types,
-            snapshot,
-        )
-
-        if not retry_on_none:
-            return None
-
-        recovered = self._reconnect_for_order(symbol)
-        if not recovered:
-            return None
-
-        self._logger.warning("🔄 Retrying order_send after reconnect | context=%s", context)
-        return self._mt5_call(mt5.order_send, sanitized_request)
+    # NOTE: unified _order_send_with_retry implementation is defined later in the class
+    # near execution methods to keep one canonical send path (locked + sanitized + normalized).
 
     def _to_native_value(self, value: Any) -> Any:
         if isinstance(value, (bool, int, float, str)):
@@ -1063,12 +1031,12 @@ class MT5Client:
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False}
 
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Order failed [{result.retcode}]: {result.comment}"
+            if not result.get("success"):
+                error_msg = f"Order failed [{result.get('retcode')}]: {result.get('comment') or result.get('error')}"
                 self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
+                return {'error': error_msg, 'success': False, 'retcode': result.get('retcode'), 'comment': result.get('comment'), 'raw': result.get('raw')}
 
-            order_ticket = getattr(result, "order", None)
+            order_ticket = result.get("order_ticket") or result.get("ticket") or result.get("order")
             position_ticket = self.resolve_position_ticket(
                 symbol=symbol,
                 magic=request.get("magic"),
@@ -1089,7 +1057,7 @@ class MT5Client:
                 'take_profit': take_profit,
                 'volume': volume,
                 'time': datetime.now(),
-                'comment': result.comment,
+                'comment': result.get('comment'),
                 'bid_at_entry': current_bid,
                 'ask_at_entry': current_ask,
             }
@@ -1834,70 +1802,120 @@ class MT5Client:
 
         except Exception as e:
             self._logger.error(f"❌ Market order exception: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return self._normalize_execution_result(success=False, retcode=None, comment=str(e), raw=None, error=str(e), context="market")
 
-    def _order_send_with_retry(self, request: dict, symbol: str, context: str) -> dict:
-        """
-        🔧 موتور اصلی ارسال سفارش به MT5 (اینجا باگ Unnamed arguments رفع شده است)
-        """
+    def _normalize_execution_result(self, *, success: bool, retcode: Optional[int], comment: str, raw: Any = None, **extra: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "success": bool(success),
+            "retcode": int(retcode) if retcode is not None else None,
+            "comment": str(comment or ""),
+            "raw": raw,
+        }
+        payload.update(extra)
+        return payload
+
+    def _order_send_with_retry(
+        self,
+        request: dict,
+        symbol: str,
+        context: str,
+        retry_on_none: bool = True,
+    ) -> dict:
+        """Deterministic MT5 order_send wrapper with normalized response shape."""
         max_retries = 3
-        
-        # 🛠️ مدیریت Filling Mode
+
+        request_local = dict(request or {})
         try:
-            symbol_info = mt5.symbol_info(symbol)
+            symbol_info = self._mt5_call(mt5.symbol_info, symbol) if symbol else None
             if symbol_info:
-                # اگر فقط FOK دارد
                 if symbol_info.filling_mode == mt5.SYMBOL_FILLING_FOK:
-                    request['type_filling'] = mt5.ORDER_FILLING_FOK
-                # اگر فقط IOC دارد (معمولا در ECN ها)
+                    request_local['type_filling'] = mt5.ORDER_FILLING_FOK
                 elif symbol_info.filling_mode == mt5.SYMBOL_FILLING_IOC:
-                    request['type_filling'] = mt5.ORDER_FILLING_IOC
+                    request_local['type_filling'] = mt5.ORDER_FILLING_IOC
                 else:
-                    # دیفالت امن
-                    request['type_filling'] = mt5.ORDER_FILLING_IOC
+                    request_local['type_filling'] = mt5.ORDER_FILLING_IOC
         except Exception:
-            pass # استفاده از مقدار پیش‌فرض در صورت خطا
+            pass
 
         for i in range(max_retries):
-            # 🔥 CRITICAL FIX: پاس دادن مستقیم request بدون **
-            result = mt5.order_send(request)
-            
+            sanitized_request = self.sanitize_mt5_request(request_local)
+            lock_ctx = getattr(self, "_mt5_lock", None)
+            lock_ctx = lock_ctx if lock_ctx is not None else nullcontext()
+            with lock_ctx:
+                result = mt5.order_send(sanitized_request)
+
             if result is None:
-                last_err = mt5.last_error()
+                last_err = self._mt5_last_error()
                 self._logger.error(f"❌ Attempt {i+1}: MT5 returned None | {last_err}")
+                if not retry_on_none:
+                    return self._normalize_execution_result(
+                        success=False,
+                        retcode=None,
+                        comment=f"order_send returned None: {last_err}",
+                        raw=None,
+                        error="order_send_none",
+                        context=context,
+                    )
                 if i < max_retries - 1:
-                    mt5.shutdown()
+                    self._mt5_call(mt5.shutdown)
                     time.sleep(0.5)
-                    mt5.initialize()
-                continue
-                
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                self._logger.info(f"✅ {context.upper()} EXECUTION DONE | Ticket={result.order}")
-                return {
-                    "success": True,
-                    "ticket": result.order,
-                    "order_ticket": result.order,
-                    "deal_ticket": getattr(result, "deal", None),
-                    "order": result.order, # برای سازگاری
-                    "price": result.price,
-                    "volume": result.volume,
-                    "comment": result.comment,
-                    "request_comment": request.get("comment"),
-                    "magic": request.get("magic"),
-                }
-            elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
-                self._logger.warning(f"⚠️ Requote/PriceOff (Attempt {i+1}): {result.comment}")
-                # بروزرسانی قیمت برای تلاش مجدد
-                tick = mt5.symbol_info_tick(symbol)
+                    self._mt5_call(mt5.initialize)
+                    continue
+                return self._normalize_execution_result(
+                    success=False,
+                    retcode=None,
+                    comment=f"order_send returned None: {last_err}",
+                    raw=None,
+                    error="order_send_none",
+                    context=context,
+                )
+
+            retcode = int(getattr(result, "retcode", 0) or 0)
+            comment = str(getattr(result, "comment", "") or "")
+            if retcode == mt5.TRADE_RETCODE_DONE:
+                self._logger.info(f"✅ {context.upper()} EXECUTION DONE | Ticket={getattr(result, 'order', None)}")
+                return self._normalize_execution_result(
+                    success=True,
+                    retcode=retcode,
+                    comment=comment,
+                    raw=result,
+                    ticket=getattr(result, "order", None),
+                    order_ticket=getattr(result, "order", None),
+                    deal_ticket=getattr(result, "deal", None),
+                    order=getattr(result, "order", None),
+                    price=getattr(result, "price", None),
+                    volume=getattr(result, "volume", None),
+                    request_comment=sanitized_request.get("comment"),
+                    magic=sanitized_request.get("magic"),
+                )
+
+            if retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_OFF]:
+                self._logger.warning(f"⚠️ Requote/PriceOff (Attempt {i+1}): {comment}")
+                tick = self._mt5_call(mt5.symbol_info_tick, symbol) if symbol else None
                 if tick:
-                    request['price'] = tick.ask if request['type'] == mt5.ORDER_TYPE_BUY else tick.bid
+                    request_local['price'] = tick.ask if request_local.get('type') == mt5.ORDER_TYPE_BUY else tick.bid
                 time.sleep(0.2)
-            else:
-                self._logger.error(f"❌ Execution Failed: {result.comment} ({result.retcode})")
-                return {"success": False, "error": result.comment, "retcode": result.retcode}
-        
-        return {"success": False, "error": "Max retries exceeded"}
-    
+                continue
+
+            self._logger.error(f"❌ Execution Failed: {comment} ({retcode})")
+            return self._normalize_execution_result(
+                success=False,
+                retcode=retcode,
+                comment=comment,
+                raw=result,
+                error=comment,
+                context=context,
+            )
+
+        return self._normalize_execution_result(
+            success=False,
+            retcode=None,
+            comment="Max retries exceeded",
+            raw=None,
+            error="max_retries_exceeded",
+            context=context,
+        )
+
     def get_open_positions(self, symbol: str = None) -> List[Dict[str, Any]]:
         """دریافت پوزیشن‌های باز
         
@@ -2041,16 +2059,16 @@ class MT5Client:
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': None}
             
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Failed to cancel order {ticket}: {result.comment}"
+            if not result.get('success'):
+                error_msg = f"Failed to cancel order {ticket}: {result.get('comment') or result.get('error')}"
                 self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
+                return {'error': error_msg, 'success': False, 'retcode': result.get('retcode'), 'comment': result.get('comment'), 'raw': result.get('raw')}
             
             self._logger.info(f"✅ Order {ticket} cancelled successfully")
             return {
                 'success': True,
                 'ticket': ticket,
-                'comment': result.comment,
+                'comment': result.get('comment'),
                 'time': datetime.now()
             }
             
@@ -2101,10 +2119,10 @@ class MT5Client:
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': None}
             
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Failed to modify order {ticket}: {result.comment}"
+            if not result.get('success'):
+                error_msg = f"Failed to modify order {ticket}: {result.get('comment') or result.get('error')}"
                 self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
+                return {'error': error_msg, 'success': False, 'retcode': result.get('retcode'), 'comment': result.get('comment'), 'raw': result.get('raw')}
             
             self._logger.info(f"✅ Order {ticket} modified successfully")
             return {
@@ -2113,7 +2131,7 @@ class MT5Client:
                 'new_price': new_price,
                 'new_sl': new_sl,
                 'new_tp': new_tp,
-                'comment': result.comment,
+                'comment': result.get('comment'),
                 'time': datetime.now()
             }
             
@@ -2163,10 +2181,10 @@ class MT5Client:
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': None}
             
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Failed to modify position {ticket}: {result.comment}"
+            if not result.get('success'):
+                error_msg = f"Failed to modify position {ticket}: {result.get('comment') or result.get('error')}"
                 self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
+                return {'error': error_msg, 'success': False, 'retcode': result.get('retcode'), 'comment': result.get('comment'), 'raw': result.get('raw')}
             
             self._logger.info(f"✅ Position {ticket} modified successfully")
             return {
@@ -2175,7 +2193,7 @@ class MT5Client:
                 'new_sl': new_sl,
                 'new_tp': new_tp,
                 'symbol': position.symbol,
-                'comment': result.comment,
+                'comment': result.get('comment'),
                 'time': datetime.now()
             }
             
@@ -2247,10 +2265,10 @@ class MT5Client:
                 self._logger.error(error_msg)
                 return {'error': error_msg, 'success': False, 'retcode': None}
             
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_msg = f"Failed to close position {ticket}: {result.comment}"
+            if not result.get('success'):
+                error_msg = f"Failed to close position {ticket}: {result.get('comment') or result.get('error')}"
                 self._logger.error(error_msg)
-                return {'error': error_msg, 'success': False, 'retcode': result.retcode}
+                return {'error': error_msg, 'success': False, 'retcode': result.get('retcode'), 'comment': result.get('comment'), 'raw': result.get('raw')}
             
             profit = position.profit if hasattr(position, 'profit') else 0
             self._logger.info(f"✅ Position {ticket} closed successfully | Profit: ${profit:.2f}")
@@ -2261,7 +2279,7 @@ class MT5Client:
                 'closed_volume': close_volume,
                 'profit': profit,
                 'price': price,
-                'comment': result.comment,
+                'comment': result.get('comment'),
                 'time': datetime.now()
             }
             

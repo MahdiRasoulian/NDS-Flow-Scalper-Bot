@@ -2071,6 +2071,8 @@ class ScalpingRiskManager:
             )
             sr_override = False
             sr_reason = "not_in_band"
+            near_strong_res = bool(nearest_resistance)
+            near_strong_sup = bool(nearest_support)
             if signal == "BUY" and (inside_res_band or nearest_resistance):
                 sr_ok, sr_break_reason = self._sr_break_confirmation(
                     signal=signal,

@@ -457,6 +457,46 @@ class NDSBot:
             return 202403
         return 202402
 
+    def _enforce_execution_volume(self, requested_volume: float, symbol: str) -> Optional[float]:
+        specs = getattr(self.risk_manager, "GOLD_SPECS", {}) or {}
+        strategy_min_lot = float(specs.get("MIN_LOT") or specs.get("min_lot") or self.risk_manager._get_gold_spec("MIN_LOT", 0.02) or 0.02)
+        lot_step = float(specs.get("LOT_STEP") or specs.get("lot_step") or self.risk_manager._get_gold_spec("LOT_STEP", 0.01) or 0.01)
+        broker_min_lot = 0.0
+        try:
+            symbol_info = self.mt5_client._get_symbol_info(symbol)
+            if symbol_info is not None and hasattr(symbol_info, "volume_min"):
+                raw_broker_min = getattr(symbol_info, "volume_min")
+                if raw_broker_min is not None:
+                    broker_min_lot = float(raw_broker_min)
+        except Exception:
+            logger.debug("[RISK][volume_check] symbol_info.volume_min unavailable", exc_info=True)
+
+        volume = float(requested_volume)
+        if lot_step > 0:
+            steps = int((volume / lot_step) + 1e-9)
+            volume = round(steps * lot_step, 8)
+
+        effective_min_lot = max(strategy_min_lot, broker_min_lot)
+        logger.info(
+            "[RISK][volume_check] requested=%.4f floored=%.4f strategy_min=%.4f broker_min=%.4f effective_min=%.4f step=%.4f",
+            float(requested_volume),
+            float(volume),
+            float(strategy_min_lot),
+            float(broker_min_lot),
+            float(effective_min_lot),
+            float(lot_step),
+        )
+
+        if volume < strategy_min_lot or volume < effective_min_lot:
+            logger.error(
+                "❌ [RISK][volume_check] rejected volume=%.4f strategy_min=%.4f broker_min=%.4f",
+                float(volume),
+                float(strategy_min_lot),
+                float(broker_min_lot),
+            )
+            return None
+        return volume
+
     def _log_positions_summary(self, positions: List[PositionContract]) -> None:
         total, buy_count, sell_count, tickets = summarize_positions(positions)
         logger.info(
@@ -1658,16 +1698,16 @@ class NDSBot:
             )
 
             order_type = finalized.order_type
-            lot_size = finalized.lot_size
-            min_lot = float(self.risk_manager._get_gold_spec("MIN_LOT", 0.02))
-            lot_step = float(self.risk_manager._get_gold_spec("LOT_STEP", 0.01))
-            if lot_size < min_lot:
-                lot_size = round(min_lot / lot_step) * lot_step if lot_step > 0 else min_lot
-                logger.warning(
-                    "[RISK][LOT_CLAMP] lot_size raised to min_lot=%.2f step=%.2f",
-                    min_lot,
-                    lot_step,
-                )
+            raw_lot_size = getattr(finalized, "lot_size", None)
+            if raw_lot_size is None:
+                raw_lot_size = getattr(finalized, "lot", None)
+            if raw_lot_size is None:
+                logger.error("❌ Missing finalized lot size; rejecting execution")
+                return False
+            lot_size = self._enforce_execution_volume(float(raw_lot_size), SYMBOL)
+            if lot_size is None:
+                return False
+
             price_deviation_pips = finalized.deviation_pips
             current_session = None
             scalping_grade = signal_data.get("quality", "N/A")
@@ -1860,6 +1900,14 @@ class NDSBot:
             elif isinstance(order_result, int):
                 success = True
                 order_id = order_result
+
+            logger.info(
+                "[EXEC][execution_result] success=%s order_id=%s position_ticket=%s payload=%s",
+                success,
+                order_id,
+                position_ticket,
+                order_result,
+            )
 
             needs_reconcile = any(
                 value in (None, 0, 0.0) for value in (actual_entry_price, actual_sl, actual_tp)
