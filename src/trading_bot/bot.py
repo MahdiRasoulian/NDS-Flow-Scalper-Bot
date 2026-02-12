@@ -645,6 +645,129 @@ class NDSBot:
             "min_rr_source": open_metadata.get("min_rr_source") or entry_risk.get("min_rr_source"),
         }
 
+    def _emit_position_closed_event(
+        self,
+        *,
+        position_ticket: int,
+        record: Dict[str, Any],
+        history: Optional[Dict[str, Any]],
+        now: datetime,
+        symbol_fallback: Optional[str] = None,
+        close_status: str = "CLOSE",
+        close_reason: Optional[str] = None,
+    ) -> ExecutionEvent:
+        """Emit deterministic terminal close event for report/telegram pipelines."""
+        identity = record.get("trade_identity", {})
+        open_event = record.get("open_event", {})
+        symbol = identity.get("symbol") or symbol_fallback
+        side = open_event.get("side")
+        entry_price = open_event.get("entry_price")
+        history = history or {}
+        exit_price = history.get("exit_price") or record.get("last_update_event", {}).get("metadata", {}).get("current_price")
+        profit = history.get("total_profit")
+        close_time = history.get("close_time") or now
+        reason = close_reason or history.get("reason") or "Manual/Other"
+        duration_sec = None
+        opened_at = identity.get("opened_at")
+        if opened_at and close_time:
+            duration_sec = (close_time - opened_at).total_seconds()
+
+        point_size, point_source = resolve_point_size_with_source(
+            self.config,
+            default=self.risk_manager._get_gold_spec("point"),
+        )
+        logger.info("[NDS][POINT_SIZE] point_size=%.4f source=%s", point_size, point_source)
+
+        pips_val = compute_pips(
+            symbol,
+            entry_price or 0.0,
+            exit_price or 0.0,
+            side=side,
+            config_payload=self.config,
+        )
+        pips_abs = abs(float(pips_val or 0.0))
+        entry_snapshot = (open_event.get("metadata", {}) or {}).get("entry_snapshot")
+        open_metadata = open_event.get("metadata", {}) or {}
+        tp1_price = open_metadata.get("tp1_price")
+        tp2_price = open_metadata.get("tp2_price")
+        point_size = open_metadata.get("point_size") or point_size
+        tp_level_hit = self._resolve_tp_level_hit(
+            exit_price=exit_price,
+            reason=reason,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            sl_price=open_event.get("sl"),
+            point_size=float(point_size or 0.01),
+        )
+        close_metadata = self._build_close_metadata(
+            open_metadata=open_metadata,
+            entry_snapshot=entry_snapshot,
+            tp_level_hit=tp_level_hit,
+        )
+        logger.info(
+            "[REPORT][CLOSE_ATTRIB] ticket=%s tp_level_hit=%s mode=%s partial_count=%s remaining_vol=%s",
+            position_ticket,
+            tp_level_hit,
+            close_metadata.get("tp_execution_mode"),
+            close_metadata.get("partial_close_count"),
+            close_metadata.get("remaining_volume_after_tp1"),
+        )
+
+        close_event: ExecutionEvent = {
+            "event_type": close_status,
+            "event_time": close_time,
+            "symbol": symbol,
+            "order_ticket": identity.get("order_ticket"),
+            "position_ticket": position_ticket,
+            "side": side,
+            "volume": open_event.get("volume"),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "sl": open_event.get("sl"),
+            "tp": open_event.get("tp"),
+            "profit": profit,
+            "pips": pips_val,
+            "pips_abs": pips_abs,
+            "reason": reason,
+            "metadata": {
+                "history": history,
+                "duration_sec": duration_sec,
+                "entry_snapshot": entry_snapshot,
+                "close_detected_by": "reconciliation",
+                **close_metadata,
+            },
+        }
+
+        if close_status == "CLOSE_UNKNOWN":
+            self.trade_tracker.finalize_unknown_close(position_ticket, close_event)
+        else:
+            self.trade_tracker.close_trade_event(close_event)
+
+        generate_execution_report(logger=logger, event=close_event)
+        logger.info("[REPORT_WRITE] ticket=%s event_type=%s", position_ticket, close_status)
+        logger.info(
+            "[PM][FINAL_CLOSE] ticket=%s closed_time=%s pnl=%.2f reason=%s",
+            position_ticket,
+            close_time,
+            float(profit or 0.0),
+            reason,
+        )
+
+        if hasattr(self, "notifier") and self.notifier is not None:
+            try:
+                self.notifier.send_trade_close_notification(
+                    symbol=symbol,
+                    signal_type=side or "Unknown",
+                    profit_usd=float(profit or 0.0),
+                    pips=float(pips_val or 0.0),
+                    reason=reason,
+                )
+                logger.info("[TELEGRAM_NOTIFY] close ticket=%s event_type=%s", position_ticket, close_status)
+            except Exception as tel_err:
+                logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
+
+        return close_event
+
     def _build_entry_snapshot(
         self,
         *,
@@ -2423,112 +2546,15 @@ class NDSBot:
                     )
                     continue
 
-                symbol = identity.get("symbol") or SYMBOL
-                side = record.get("open_event", {}).get("side")
-                entry_price = record.get("open_event", {}).get("entry_price")
-                exit_price = history.get("exit_price") or record.get("last_update_event", {}).get("metadata", {}).get("current_price")
-                profit = history.get("total_profit")
-                close_time = history.get("close_time")
-                reason = history.get("reason")
-                duration_sec = None
-                opened_at = identity.get("opened_at")
-                if opened_at and close_time:
-                    duration_sec = (close_time - opened_at).total_seconds()
-
-                point_size, point_source = resolve_point_size_with_source(
-                    self.config,
-                    default=self.risk_manager._get_gold_spec("point"),
+                close_event = self._emit_position_closed_event(
+                    position_ticket=position_ticket,
+                    record=record,
+                    history=history,
+                    now=now,
+                    symbol_fallback=SYMBOL,
+                    close_status="CLOSE",
                 )
-                logger.info(
-                    "[NDS][POINT_SIZE] point_size=%.4f source=%s",
-                    point_size,
-                    point_source,
-                )
-                pips_val = compute_pips(
-                    symbol,
-                    entry_price or 0.0,
-                    exit_price or 0.0,
-                    side=side,
-                    config_payload=self.config,
-                )
-                pips_abs = abs(float(pips_val or 0.0))
-                entry_snapshot = (
-                    record.get("open_event", {})
-                    .get("metadata", {})
-                    .get("entry_snapshot")
-                )
-                open_metadata = record.get("open_event", {}).get("metadata", {}) or {}
-                tp1_price = open_metadata.get("tp1_price")
-                tp2_price = open_metadata.get("tp2_price")
-                point_size = open_metadata.get("point_size") or point_size
-                tp_level_hit = self._resolve_tp_level_hit(
-                    exit_price=exit_price,
-                    reason=reason,
-                    tp1_price=tp1_price,
-                    tp2_price=tp2_price,
-                    sl_price=record.get("open_event", {}).get("sl"),
-                    point_size=float(point_size or 0.01),
-                )
-                close_metadata = self._build_close_metadata(
-                    open_metadata=open_metadata,
-                    entry_snapshot=entry_snapshot,
-                    tp_level_hit=tp_level_hit,
-                )
-                logger.info(
-                    "[REPORT][CLOSE_ATTRIB] tp_level_hit=%s mode=%s partial_count=%s remaining_vol=%s",
-                    tp_level_hit,
-                    close_metadata.get("tp_execution_mode"),
-                    close_metadata.get("partial_close_count"),
-                    close_metadata.get("remaining_volume_after_tp1"),
-                )
-
-                close_event: ExecutionEvent = {
-                    "event_type": "CLOSE",
-                    "event_time": close_time or datetime.utcnow(),
-                    "symbol": symbol,
-                    "order_ticket": identity.get("order_ticket"),
-                    "position_ticket": position_ticket,
-                    "side": side,
-                    "volume": record.get("open_event", {}).get("volume"),
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "sl": record.get("open_event", {}).get("sl"),
-                    "tp": record.get("open_event", {}).get("tp"),
-                    "profit": profit,
-                    "pips": pips_val,
-                    "pips_abs": pips_abs,
-                    "reason": reason,
-                    "metadata": {
-                        "history": history,
-                        "duration_sec": duration_sec,
-                        "entry_snapshot": entry_snapshot,
-                        **close_metadata,
-                    },
-                }
-
-                self.trade_tracker.close_trade_event(close_event)
-                generate_execution_report(logger=logger, event=close_event)
-
-                logger.info(
-                    "[CLOSE] ticket=%s closed_time=%s pnl=%.2f reason=%s",
-                    position_ticket,
-                    close_time,
-                    float(profit or 0.0),
-                    reason or "Manual/Other",
-                )
-
-                if hasattr(self, "notifier") and self.notifier is not None:
-                    try:
-                        self.notifier.send_trade_close_notification(
-                            symbol=symbol,
-                            signal_type=side or "Unknown",
-                            profit_usd=float(profit or 0.0),
-                            pips=float(pips_val or 0.0),
-                            reason=reason or "Manual/Other",
-                        )
-                        logger.info(f"✅ گزارش تلگرام برای بسته‌شدن پوزیشن #{position_ticket} ارسال شد.")
-                    except Exception as tel_err:
-                        logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
+                close_time = close_event.get("event_time")
 
                 state_record = state_closed_map.get(position_ticket)
                 if state_record is not None:
@@ -2536,8 +2562,21 @@ class NDSBot:
                     state_record["close_time"] = close_time or now
 
             if pending_timeouts:
+                for position_ticket, payload in pending_timeouts:
+                    record = self.trade_tracker.normalize_trade_record(payload.get("record", {}))
+                    if not record:
+                        continue
+                    self._emit_position_closed_event(
+                        position_ticket=position_ticket,
+                        record=record,
+                        history={"reason": "HistoryTimeout/Unknown"},
+                        now=now,
+                        symbol_fallback=SYMBOL,
+                        close_status="CLOSE_UNKNOWN",
+                        close_reason="HistoryTimeout/Unknown",
+                    )
                 logger.warning(
-                    "[CLOSE_PENDING_KEEP] count=%s reason=history_not_available_yet",
+                    "[CLOSE_PENDING_TIMEOUT] count=%s reason=history_not_available",
                     len(pending_timeouts),
                 )
 
