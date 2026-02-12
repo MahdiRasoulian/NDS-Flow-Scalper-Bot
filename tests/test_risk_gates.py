@@ -514,3 +514,40 @@ def test_sr_gate_fails_closed_when_permission_helpers_unavailable(monkeypatch):
 
     assert not finalized.is_trade_allowed
     assert finalized.reject_reason == "Entry near static resistance without confirmation."
+
+
+def test_static_sr_band_half_hard_cap_pct_limits_zone_width():
+    if not _dataframe_constructor_works():
+        pytest.skip("pandas DataFrame constructor unavailable in this environment")
+    data = {
+        "time": [
+            datetime(2025, 1, 1, 0, 0, 0),
+            datetime(2025, 1, 1, 0, 5, 0),
+            datetime(2025, 1, 1, 0, 10, 0),
+            datetime(2025, 1, 1, 0, 15, 0),
+            datetime(2025, 1, 1, 0, 20, 0),
+            datetime(2025, 1, 1, 0, 25, 0),
+        ],
+        "open": [10.0, 10.1, 10.4, 10.3, 10.7, 10.6],
+        "high": [10.5, 10.8, 10.6, 11.2, 11.0, 10.9],
+        "low": [9.5, 10.0, 9.8, 11.0, 10.8, 10.5],
+        "close": [10.2, 12.0, 10.7, 12.5, 11.2, 11.0],
+        "volume": [1, 1, 1, 1, 1, 1],
+    }
+    cfg = {
+        "technical_settings": {
+            "STATIC_SR_LOOKBACK": 6,
+            "STATIC_SR_SWING_WINDOW": 1,
+            "STATIC_SR_CLUSTER_PIPS": 1.0,
+            "STATIC_SR_MAX_LEVELS": 5,
+            "STATIC_SR_BAND_ATR": 0.5,
+            "STATIC_SR_MIN_BAND_PIPS": 1.0,
+            "STATIC_SR_BAND_HARD_CAP_PCT": 0.0015,
+        },
+        "trading_settings": {"POINT_SIZE": 0.01},
+    }
+    df = pd.DataFrame(data)
+    analyzer = GoldNDSAnalyzer(df, config=cfg)
+    ref_price = 11.0
+    sr_context = analyzer._compute_static_sr_context(ref_price, atr_value=10.0)
+    assert sr_context["band_half"] == pytest.approx(ref_price * 0.0015)
