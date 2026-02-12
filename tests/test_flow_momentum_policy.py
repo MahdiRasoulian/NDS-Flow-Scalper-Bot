@@ -203,3 +203,101 @@ def test_flow_setup_gaussian_proximity_rewards_edge_location():
     )
 
     assert near_edge["proximity"] > center_like["proximity"]
+
+
+def test_flow_execution_high_setup_score_uses_aggressive_limit():
+    analyzer = GoldNDSAnalyzer(_make_df())
+    analyzer._point_size = 0.01
+    analyzer.GOLD_SETTINGS.update(
+        {
+            "FLOW_EXEC_AGGRESSIVE_MIN": 0.85,
+            "FLOW_EXEC_CONSERVATIVE_MIN": 0.65,
+            "FLOW_EXEC_CONFIRMATION_MIN": 0.5,
+            "FLOW_EXEC_CONSERVATIVE_DEPTH": 0.25,
+            "FLOW_SETUP_TOP_K": 1,
+            "BRK_MAX_DIST_ATR": 2.0,
+            "BRK_MAX_AGE_BARS": 200,
+            "FLOW_MAX_TOUCHES": 10,
+        }
+    )
+
+    structure = _make_structure(current_price=100.4)
+    structure.breaker_blocks = [
+        {
+            "type": "BULLISH_BREAKER",
+            "top": 100.0,
+            "bottom": 99.5,
+            "strength": 2.0,
+            "confidence": 0.9,
+            "touch_count": 1,
+            "age_bars": 2,
+            "eligible": True,
+            "disp_atr": 1.2,
+            "retest_reason": "CLOSE_RECLAIM",
+        }
+    ]
+
+    entry = analyzer._select_flow_entry(
+        signal="BUY",
+        structure=structure,
+        current_price=100.4,
+        atr_value=1.0,
+        adx_value=35.0,
+        session_analysis=_make_session(),
+        volume_analysis={"rvol": 1.0, "market_status": "OPEN"},
+        scalping_mode=True,
+        signal_context={"bias": "BULLISH"},
+        log_decisions=False,
+    )
+
+    assert entry["entry_model"] == "LIMIT"
+    assert "aggressive_limit_front_run" in entry["entry_reason"]
+
+
+def test_flow_execution_mid_setup_score_waits_for_confirmation_and_skips_momo():
+    analyzer = GoldNDSAnalyzer(_make_df())
+    analyzer._point_size = 0.01
+    analyzer.GOLD_SETTINGS.update(
+        {
+            "FLOW_EXEC_AGGRESSIVE_MIN": 0.85,
+            "FLOW_EXEC_CONSERVATIVE_MIN": 0.65,
+            "FLOW_EXEC_CONFIRMATION_MIN": 0.5,
+            "FLOW_SETUP_TOP_K": 1,
+            "BRK_MAX_DIST_ATR": 2.0,
+            "BRK_MAX_AGE_BARS": 200,
+            "FLOW_MAX_TOUCHES": 10,
+        }
+    )
+
+    structure = _make_structure(current_price=100.4)
+    structure.breaker_blocks = [
+        {
+            "type": "BULLISH_BREAKER",
+            "top": 100.0,
+            "bottom": 99.5,
+            "strength": 0.0,
+            "confidence": 0.6,
+            "touch_count": 3,
+            "age_bars": 2,
+            "eligible": True,
+            "disp_atr": 1.0,
+            "retest_reason": "WICK_REJECTION",
+        }
+    ]
+
+    entry = analyzer._select_flow_entry(
+        signal="BUY",
+        structure=structure,
+        current_price=100.4,
+        atr_value=1.0,
+        adx_value=50.0,
+        session_analysis=_make_session(),
+        volume_analysis={"rvol": 1.0, "market_status": "OPEN"},
+        scalping_mode=True,
+        signal_context={"bias": "BULLISH"},
+        log_decisions=False,
+    )
+
+    assert entry["entry_model"] == "NONE"
+    assert "wait_trigger_candle_setup_score" in entry["entry_reason"]
+    assert entry["entry_type"] == "BREAKER"

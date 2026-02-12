@@ -210,6 +210,10 @@ class GoldNDSAnalyzer:
             'FLOW_SETUP_WEIGHTS': dict,
             'FLOW_SETUP_TOP_K': int,
             'FLOW_SETUP_DISPLACEMENT_ATR_TARGET': float,
+            'FLOW_EXEC_AGGRESSIVE_MIN': float,
+            'FLOW_EXEC_CONSERVATIVE_MIN': float,
+            'FLOW_EXEC_CONFIRMATION_MIN': float,
+            'FLOW_EXEC_CONSERVATIVE_DEPTH': float,
             'FLOW_MOMENTUM_MAX_DIST_ATR': float,
             'FLOW_MOMENTUM_MAX_DIST_PIPS': float,
             'FLOW_ALLOW_MOMO_WITHOUT_BASE_SIGNAL': bool,
@@ -2019,7 +2023,7 @@ class GoldNDSAnalyzer:
             adx_value=adx_value,
         )
         entry_level = idea.get("entry_level")
-        if entry_level is None:
+        if entry_level is None and not suppress_momentum_fallback:
             return {
                 "signal": "NONE",
                 "tier": "D",
@@ -2260,14 +2264,38 @@ class GoldNDSAnalyzer:
                 candidates.append({**zone, "dist_atr": dist_atr, "util": util, **setup_scores})
             return candidates
 
-        def _resolve_entry_model(side: str, top: float, bottom: float) -> Tuple[str, float, str]:
+        def _resolve_entry_model(side: str, top: float, bottom: float, setup_score: float) -> Tuple[str, Optional[float], str, bool]:
+            """Resolve execution style from setup quality.
+
+            Returns: (entry_model, entry_level, reason, suppress_momentum_fallback)
+            """
+            zone_top = max(float(top), float(bottom))
+            zone_bottom = min(float(top), float(bottom))
+            zone_width = max(zone_top - zone_bottom, 0.0)
+
+            aggressive_thr = float(settings.get("FLOW_EXEC_AGGRESSIVE_MIN", 0.85))
+            conservative_thr = float(settings.get("FLOW_EXEC_CONSERVATIVE_MIN", 0.65))
+            confirmation_thr = float(settings.get("FLOW_EXEC_CONFIRMATION_MIN", 0.50))
+            depth_ratio = max(0.0, min(1.0, float(settings.get("FLOW_EXEC_CONSERVATIVE_DEPTH", 0.25))))
+
+            if setup_score < confirmation_thr:
+                return "NONE", None, f"no_trade_low_setup_score:{setup_score:.2f}", True
+
+            if setup_score < conservative_thr:
+                return "NONE", None, f"wait_trigger_candle_setup_score:{setup_score:.2f}", True
+
             if side == "BUY":
-                if bottom <= current_price <= top:
-                    return "MARKET", float(current_price), "price_inside_zone"
-                return "STOP", float(top) + buffer_price, "price_outside_zone"
-            if bottom <= current_price <= top:
-                return "MARKET", float(current_price), "price_inside_zone"
-            return "STOP", float(bottom) - buffer_price, "price_outside_zone"
+                front_edge = zone_top + buffer_price
+                conservative_level = zone_top - (zone_width * depth_ratio)
+                if setup_score >= aggressive_thr:
+                    return "LIMIT", float(front_edge), f"aggressive_limit_front_run_setup_score:{setup_score:.2f}", False
+                return "LIMIT", float(conservative_level), f"conservative_limit_depth_setup_score:{setup_score:.2f}", False
+
+            front_edge = zone_bottom - buffer_price
+            conservative_level = zone_bottom + (zone_width * depth_ratio)
+            if setup_score >= aggressive_thr:
+                return "LIMIT", float(front_edge), f"aggressive_limit_front_run_setup_score:{setup_score:.2f}", False
+            return "LIMIT", float(conservative_level), f"conservative_limit_depth_setup_score:{setup_score:.2f}", False
 
         brk_max_dist = float(settings.get("BRK_MAX_DIST_ATR", 0.5))
         brk_max_age = int(settings.get("BRK_MAX_AGE_BARS", 60))
@@ -2324,6 +2352,7 @@ class GoldNDSAnalyzer:
         tier = "NONE"
         entry_confidence = 0.0
         reject_reason = "NO_ELIGIBLE_ZONE"
+        suppress_momentum_fallback = False
 
         top_k = int(settings.get("FLOW_SETUP_TOP_K", 3))
         runner_ups: List[Dict[str, Any]] = []
@@ -2339,11 +2368,16 @@ class GoldNDSAnalyzer:
             runner_ups = brk_candidates[1:top_k]
             entry_type = "BREAKER"
             entry_source = pick
-            entry_model, entry_level, entry_reason = _resolve_entry_model(signal, float(pick.get("top")), float(pick.get("bottom")))
+            entry_model, entry_level, entry_reason, suppress_momentum_fallback = _resolve_entry_model(
+                signal,
+                float(pick.get("top")),
+                float(pick.get("bottom")),
+                float(pick.get("setup_score", 0.0)),
+            )
             entry_reason = f"tier=A breaker retest ({entry_reason})"
             tier = "A"
             entry_confidence = float(pick.get("confidence", 0.0))
-            reject_reason = None
+            reject_reason = None if entry_model != "NONE" else entry_reason
         elif ifvg_candidates:
             ifvg_candidates.sort(
                 key=lambda z: (
@@ -2356,15 +2390,20 @@ class GoldNDSAnalyzer:
             runner_ups = ifvg_candidates[1:top_k]
             entry_type = "IFVG"
             entry_source = pick
-            entry_model, entry_level, entry_reason = _resolve_entry_model(signal, float(pick.get("top")), float(pick.get("bottom")))
+            entry_model, entry_level, entry_reason, suppress_momentum_fallback = _resolve_entry_model(
+                signal,
+                float(pick.get("top")),
+                float(pick.get("bottom")),
+                float(pick.get("setup_score", 0.0)),
+            )
             entry_reason = f"tier=B inversion fvg ({entry_reason})"
             tier = "B"
             entry_confidence = float(pick.get("confidence", 0.0))
-            reject_reason = None
+            reject_reason = None if entry_model != "NONE" else entry_reason
 
         momentum_reason = None
         momentum_block_reason = None
-        if entry_level is None:
+        if entry_level is None and not suppress_momentum_fallback:
             momo_adx_min = float(settings.get("MOMO_ADX_MIN", 35.0))
             time_start = settings.get("MOMO_TIME_START", "10:00")
             time_end = settings.get("MOMO_TIME_END", "18:00")
@@ -2512,7 +2551,7 @@ class GoldNDSAnalyzer:
                         momentum_block_reason,
                     )
 
-        if entry_level is None:
+        if entry_level is None and not suppress_momentum_fallback:
             entry_reason = entry_reason if momentum_reason is None else f"{entry_reason}; momo_block={momentum_reason}"
             if reject_reason is None:
                 reject_reason = "NO_ENTRY"
