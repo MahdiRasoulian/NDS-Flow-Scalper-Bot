@@ -1309,10 +1309,18 @@ class GoldNDSAnalyzer:
         retest_quality = retest_quality_map.get(retest_reason, 0.5)
 
         touch_count = int(zone.get("touch_count", 1))
-        freshness_map = {1: 1.0, 2: 0.75, 3: 0.55}
-        freshness = freshness_map.get(touch_count, 0.35)
+        freshness_map = {1: 1.0, 2: 1.0, 3: 0.7}
+        freshness = freshness_map.get(touch_count, 0.2)
 
-        proximity = 1.0 if dist_atr <= 0 else max(0.0, 1.0 - (dist_atr / max(max_dist_atr, 0.01)))
+        # Prefer edge-quality entries (close to zone boundary) and strongly penalize
+        # "no man's land" locations using a Gaussian decay instead of a linear score.
+        if dist_atr <= 0:
+            proximity = 1.0
+        else:
+            max_dist = max(max_dist_atr, 0.01)
+            position_ratio = max(0.0, min(1.0, dist_atr / max_dist))
+            sigma = max(0.05, float(settings.get("FLOW_PROXIMITY_GAUSS_SIGMA", 0.35)))
+            proximity = math.exp(-((position_ratio ** 2) / (2.0 * (sigma ** 2))))
         disp_target = float(settings.get("FLOW_SETUP_DISPLACEMENT_ATR_TARGET", 1.0))
         displacement = min(1.0, float(zone.get("disp_atr", 0.0)) / max(disp_target, 0.01))
 
@@ -1326,7 +1334,7 @@ class GoldNDSAnalyzer:
         liquidity = min(1.0, (0.6 * min(1.0, rvol / 1.0)) + (0.4 * min(1.0, session_weight / 1.2)))
 
         total_weight = sum(float(w) for w in weights.values()) or 1.0
-        setup_score = (
+        additive_score = (
             float(weights.get("retest_quality", 0.0)) * retest_quality
             + float(weights.get("freshness", 0.0)) * freshness
             + float(weights.get("proximity", 0.0)) * proximity
@@ -1335,6 +1343,11 @@ class GoldNDSAnalyzer:
             + float(weights.get("liquidity", 0.0)) * liquidity
         ) / total_weight
 
+        # Veto-like structural gate: weak/consumed levels should suppress the final setup
+        # even if context (trend/liquidity) looks strong.
+        strength_gate = max(0.0, min(1.0, min(retest_quality, freshness)))
+        setup_score = additive_score * strength_gate
+
         return {
             "retest_quality": retest_quality,
             "freshness": freshness,
@@ -1342,6 +1355,8 @@ class GoldNDSAnalyzer:
             "displacement": displacement,
             "trend_alignment": trend_alignment,
             "liquidity": liquidity,
+            "additive_score": additive_score,
+            "strength_gate": strength_gate,
             "setup_score": setup_score,
         }
 
@@ -3534,6 +3549,9 @@ class GoldNDSAnalyzer:
         point_size = self._get_point_size()
         cluster_price = pips_to_price(cluster_pips, point_size)
         band_half = max(atr_val * band_atr, pips_to_price(min_band_pips, point_size))
+        hard_cap_pct = float(settings.get("STATIC_SR_BAND_HARD_CAP_PCT", 0.0) or 0.0)
+        if hard_cap_pct > 0:
+            band_half = min(band_half, abs(ref_price) * hard_cap_pct)
 
         def _cluster(levels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if not levels:

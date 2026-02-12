@@ -542,6 +542,7 @@
     "FLOW_TP1_MOVE_SL_TO_BE": true,
     "FLOW_SETUP_DISPLACEMENT_ATR_TARGET": 1.0,
     "FLOW_SETUP_TOP_K": 3,
+    "FLOW_PROXIMITY_GAUSS_SIGMA": 0.35,
     "FLOW_SETUP_WEIGHTS": {
       "retest_quality": 0.25,
       "freshness": 0.2,
@@ -558,7 +559,8 @@
     "ADX_STRONG_TREND_MIN": 30.0,
     "FLOW_NY_OPEN_COOLDOWN_START": "15:00",
     "FLOW_NY_OPEN_COOLDOWN_END": "15:15",
-    "FLOW_ATR_SPIKE_MULT": 3.0
+    "FLOW_ATR_SPIKE_MULT": 3.0,
+    "STATIC_SR_BAND_HARD_CAP_PCT": 0.0015
   },
   "momentum_settings": {
     "MOMO_ADX_MIN": 25.0,

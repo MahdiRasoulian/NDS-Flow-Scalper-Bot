@@ -133,3 +133,73 @@ def test_strong_trend_sell_promotes_momentum_without_base_signal():
 
     assert entry["signal"] == "SELL"
     assert entry["entry_type"] == "MOMENTUM"
+
+
+def test_flow_setup_touch_parabola_and_strength_gate():
+    analyzer = GoldNDSAnalyzer(_make_df())
+    analyzer.GOLD_SETTINGS.update(
+        {
+            "FLOW_PROXIMITY_GAUSS_SIGMA": 0.35,
+            "FLOW_SETUP_WEIGHTS": {
+                "retest_quality": 0.25,
+                "freshness": 0.2,
+                "proximity": 0.2,
+                "displacement": 0.15,
+                "trend_alignment": 0.1,
+                "liquidity": 0.1,
+            },
+        }
+    )
+
+    base_zone = {"retest_reason": "CLOSE_RECLAIM", "disp_atr": 1.0}
+    score_touch_2 = analyzer._score_flow_setup(
+        zone={**base_zone, "touch_count": 2},
+        dist_atr=0.1,
+        max_dist_atr=1.0,
+        signal="BUY",
+        session_analysis=_make_session(),
+        volume_analysis={"rvol": 1.0},
+        signal_context={"bias": "BULLISH"},
+    )
+    score_touch_4 = analyzer._score_flow_setup(
+        zone={**base_zone, "touch_count": 4},
+        dist_atr=0.1,
+        max_dist_atr=1.0,
+        signal="BUY",
+        session_analysis=_make_session(),
+        volume_analysis={"rvol": 1.0},
+        signal_context={"bias": "BULLISH"},
+    )
+
+    assert score_touch_2["freshness"] == 1.0
+    assert score_touch_4["freshness"] == 0.2
+    assert score_touch_4["setup_score"] < score_touch_2["setup_score"]
+    assert score_touch_4["setup_score"] == pytest.approx(
+        score_touch_4["additive_score"] * score_touch_4["strength_gate"]
+    )
+
+
+def test_flow_setup_gaussian_proximity_rewards_edge_location():
+    analyzer = GoldNDSAnalyzer(_make_df())
+    analyzer.GOLD_SETTINGS.update({"FLOW_PROXIMITY_GAUSS_SIGMA": 0.35})
+
+    near_edge = analyzer._score_flow_setup(
+        zone={"touch_count": 1, "retest_reason": "CLOSE_RECLAIM", "disp_atr": 1.0},
+        dist_atr=0.1,
+        max_dist_atr=1.0,
+        signal="BUY",
+        session_analysis=_make_session(),
+        volume_analysis={"rvol": 1.0},
+        signal_context={"bias": "BULLISH"},
+    )
+    center_like = analyzer._score_flow_setup(
+        zone={"touch_count": 1, "retest_reason": "CLOSE_RECLAIM", "disp_atr": 1.0},
+        dist_atr=1.0,
+        max_dist_atr=1.0,
+        signal="BUY",
+        session_analysis=_make_session(),
+        volume_analysis={"rvol": 1.0},
+        signal_context={"bias": "BULLISH"},
+    )
+
+    assert near_edge["proximity"] > center_like["proximity"]
