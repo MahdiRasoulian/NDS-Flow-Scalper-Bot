@@ -216,7 +216,7 @@ class PositionManager:
     def _floor_to_step(value: float, step: float) -> float:
         if step <= 0:
             return float(value)
-        steps = int(float(value) / float(step))
+        steps = int((float(value) / float(step)) + 1e-9)
         return round(steps * float(step), 8)
 
     def _resolve_volume_constraints(self, symbol: Optional[str]) -> Dict[str, float]:
@@ -228,8 +228,10 @@ class PositionManager:
         if hasattr(self.mt5_client, "_get_symbol_info"):
             try:
                 symbol_info = self.mt5_client._get_symbol_info(symbol or "")
-                if symbol_info is not None and getattr(symbol_info, "volume_min", None):
-                    broker_min = float(getattr(symbol_info, "volume_min"))
+                if symbol_info is not None and hasattr(symbol_info, "volume_min"):
+                    raw_broker_min = getattr(symbol_info, "volume_min")
+                    if raw_broker_min is not None:
+                        broker_min = float(raw_broker_min)
             except Exception:
                 self._logger.debug("[PM][VOLUME] broker volume_min unavailable", exc_info=True)
         min_volume = max(strategy_min, broker_min)
@@ -256,6 +258,14 @@ class PositionManager:
         if remaining_volume < min_volume:
             close_volume = self._floor_to_step(plan.volume, lot_step)
             remaining_volume = 0.0
+            if close_volume < min_volume:
+                self._logger.warning(
+                    "[PM][partial_close_request] ticket=%s rejected full_close=%.4f min=%.4f",
+                    plan.ticket,
+                    close_volume,
+                    min_volume,
+                )
+                return False
 
         if close_volume < min_volume and remaining_volume > 0:
             self._logger.warning(

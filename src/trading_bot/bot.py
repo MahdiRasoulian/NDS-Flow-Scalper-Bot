@@ -464,15 +464,17 @@ class NDSBot:
         broker_min_lot = 0.0
         try:
             symbol_info = self.mt5_client._get_symbol_info(symbol)
-            if symbol_info is not None and getattr(symbol_info, "volume_min", None):
-                broker_min_lot = float(symbol_info.volume_min)
+            if symbol_info is not None and hasattr(symbol_info, "volume_min"):
+                raw_broker_min = getattr(symbol_info, "volume_min")
+                if raw_broker_min is not None:
+                    broker_min_lot = float(raw_broker_min)
         except Exception:
             logger.debug("[RISK][volume_check] symbol_info.volume_min unavailable", exc_info=True)
 
         volume = float(requested_volume)
         if lot_step > 0:
-            volume = int(volume / lot_step) * lot_step
-            volume = round(volume, 8)
+            steps = int((volume / lot_step) + 1e-9)
+            volume = round(steps * lot_step, 8)
 
         effective_min_lot = max(strategy_min_lot, broker_min_lot)
         logger.info(
@@ -1696,7 +1698,13 @@ class NDSBot:
             )
 
             order_type = finalized.order_type
-            lot_size = self._enforce_execution_volume(float(finalized.lot_size), SYMBOL)
+            raw_lot_size = getattr(finalized, "lot_size", None)
+            if raw_lot_size is None:
+                raw_lot_size = getattr(finalized, "lot", None)
+            if raw_lot_size is None:
+                logger.error("❌ Missing finalized lot size; rejecting execution")
+                return False
+            lot_size = self._enforce_execution_volume(float(raw_lot_size), SYMBOL)
             if lot_size is None:
                 return False
 
