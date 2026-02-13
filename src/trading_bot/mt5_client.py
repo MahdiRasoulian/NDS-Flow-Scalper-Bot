@@ -6,7 +6,7 @@ MT5 Client بهینه‌شده برای استراتژی NDS - نسخه Real-Tim
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 import threading
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 from src.trading_bot.contracts import normalize_position
 from src.trading_bot.config_utils import get_setting, resolve_mt5_credentials
-from src.trading_bot.time_utils import DEFAULT_BROKER_OFFSET_HOURS, DEFAULT_TIME_MODE
+from src.trading_bot.time_utils import DEFAULT_BROKER_OFFSET_HOURS, DEFAULT_TIME_MODE, to_utc_time
 
 @dataclass
 class ConnectionConfig:
@@ -374,15 +374,13 @@ class MT5Client:
     def _normalize_to_utc(self, dt: Optional[datetime], *, time_mode: str, broker_offset: float) -> Optional[datetime]:
         if dt is None:
             return None
-        normalized = dt.replace(tzinfo=None)
-        if time_mode == "BROKER":
-            return normalized - timedelta(hours=broker_offset)
+        normalized = to_utc_time(dt, offset_hours=broker_offset, time_mode=time_mode)
         return normalized
 
     def _mt5_timestamp_to_utc(self, timestamp: Optional[float], *, time_mode: str, broker_offset: float) -> Optional[datetime]:
         if not timestamp:
             return None
-        return datetime.utcfromtimestamp(timestamp)
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
     def _log_symbol_snapshot(self, symbol: str) -> Dict[str, Any]:
         if not symbol:
@@ -832,7 +830,7 @@ class MT5Client:
             
             # تبدیل به DataFrame
             df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             df = df.sort_values('time').reset_index(drop=True)
             
             # اعمال تغییرات لازم

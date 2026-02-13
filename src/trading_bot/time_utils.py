@@ -5,7 +5,7 @@ Canonical time mode: BROKER (server time, UTC+02 by default).
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 DEFAULT_BROKER_OFFSET_HOURS = 2
@@ -20,19 +20,24 @@ DEFAULT_SESSION_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def parse_timestamp(value: Any) -> Optional[datetime]:
+def parse_timestamp(value: Any, *, assume_tz: timezone = timezone.utc) -> Optional[datetime]:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=assume_tz)
+        return value.astimezone(timezone.utc)
     if hasattr(value, "to_pydatetime"):
         try:
-            return value.to_pydatetime()
+            parsed = value.to_pydatetime()
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=assume_tz)
+            return parsed.astimezone(timezone.utc)
         except Exception:
             pass
     if isinstance(value, (int, float)):
         try:
-            return datetime.utcfromtimestamp(value)
+            return datetime.fromtimestamp(value, tz=timezone.utc)
         except (OSError, ValueError):
             return None
     if isinstance(value, str):
@@ -40,7 +45,10 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
         if not raw:
             return None
         try:
-            return datetime.fromisoformat(raw)
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=assume_tz)
+            return parsed.astimezone(timezone.utc)
         except ValueError:
             pass
         formats = [
@@ -57,16 +65,16 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
         ]
         for fmt in formats:
             try:
-                return datetime.strptime(raw, fmt)
+                return datetime.strptime(raw, fmt).replace(tzinfo=assume_tz)
             except ValueError:
                 continue
     return None
 
 
-def _strip_tz(dt: datetime) -> datetime:
+def _coerce_aware(dt: datetime, default_tz: timezone) -> datetime:
     if dt.tzinfo is None:
-        return dt
-    return dt.astimezone(tz=None).replace(tzinfo=None)
+        return dt.replace(tzinfo=default_tz)
+    return dt
 
 
 def to_broker_time(
@@ -76,15 +84,33 @@ def to_broker_time(
 ) -> datetime:
     if dt is None:
         return None
-    normalized = _strip_tz(dt)
+    broker_tz = timezone(timedelta(hours=float(offset_hours)))
     mode = str(time_mode or DEFAULT_TIME_MODE).upper()
     if mode == "UTC":
-        return normalized + timedelta(hours=float(offset_hours))
-    return normalized
+        normalized_utc = _coerce_aware(dt, timezone.utc).astimezone(timezone.utc)
+        return normalized_utc.astimezone(broker_tz)
+
+    normalized_broker = _coerce_aware(dt, broker_tz)
+    return normalized_broker.astimezone(broker_tz)
+
+
+def to_utc_time(
+    dt: datetime,
+    offset_hours: float = DEFAULT_BROKER_OFFSET_HOURS,
+    time_mode: str = DEFAULT_TIME_MODE,
+) -> Optional[datetime]:
+    if dt is None:
+        return None
+    broker_tz = timezone(timedelta(hours=float(offset_hours)))
+    mode = str(time_mode or DEFAULT_TIME_MODE).upper()
+    if mode == "BROKER":
+        return _coerce_aware(dt, broker_tz).astimezone(timezone.utc)
+    return _coerce_aware(dt, timezone.utc).astimezone(timezone.utc)
 
 
 def get_broker_now(offset_hours: float = DEFAULT_BROKER_OFFSET_HOURS) -> datetime:
-    return datetime.utcnow() + timedelta(hours=float(offset_hours))
+    broker_tz = timezone(timedelta(hours=float(offset_hours)))
+    return datetime.now(tz=timezone.utc).astimezone(broker_tz)
 
 
 def minutes_from_midnight(dt: datetime) -> int:

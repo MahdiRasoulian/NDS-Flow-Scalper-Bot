@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -185,7 +186,8 @@ def setup_logging(
             root.removeHandler(h)
 
     # 4) formatter
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter("%(asctime)sZ - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    formatter.converter = time.gmtime
 
     # 5) file handler (utf-8)
     file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
