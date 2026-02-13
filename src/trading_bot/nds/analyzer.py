@@ -18,7 +18,7 @@ Config keys (whitelisted via ANALYSIS_CONFIG_KEYS):
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from collections import deque
@@ -364,8 +364,10 @@ class GoldNDSAnalyzer:
 
         self.df['time'] = pd.to_datetime(self.df['time'], errors="coerce")
         try:
-            if getattr(self.df["time"].dt, "tz", None) is not None:
-                self.df["time"] = self.df["time"].dt.tz_convert(None)
+            if getattr(self.df["time"].dt, "tz", None) is None:
+                self.df["time"] = self.df["time"].dt.tz_localize("UTC")
+            else:
+                self.df["time"] = self.df["time"].dt.tz_convert("UTC")
         except Exception:
             pass
 
@@ -4033,7 +4035,7 @@ class GoldNDSAnalyzer:
                 "time_mode": session_analysis.time_mode,
                 "broker_utc_offset_hours": session_analysis.broker_utc_offset_hours,
             },
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             "current_price": current_price,
             "timeframe": timeframe,
             "scalping_mode": scalping_mode,
@@ -5267,7 +5269,7 @@ class GoldNDSAnalyzer:
             take_profit=take_profit,
             reasons=reasons[:12],
             context=context,
-            timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now(tz=timezone.utc).isoformat(),
             timeframe=timeframe,
             current_price=current_price,
         )
@@ -5288,7 +5290,7 @@ class GoldNDSAnalyzer:
             take_profit=None,
             reasons=[f"Error: {error_message}"],
             context={"error": True},
-            timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now(tz=timezone.utc).isoformat(),
             timeframe=timeframe,
             current_price=current_close or 0.0,
         )
@@ -5314,7 +5316,7 @@ def analyze_gold_market(
             take_profit=None,
             reasons=["DataFrame is empty"],
             context={"error": True},
-            timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now(tz=timezone.utc).isoformat(),
             timeframe=timeframe,
             current_price=0.0,
         )
@@ -5344,7 +5346,7 @@ def analyze_gold_market(
             take_profit=None,
             reasons=[f"Analysis error: {str(e)}"],
             context={"error": True},
-            timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now(tz=timezone.utc).isoformat(),
             timeframe=timeframe,
             current_price=0.0,
         )
