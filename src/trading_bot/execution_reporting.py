@@ -44,12 +44,12 @@ def _update_summary(path: Path, event: ExecutionEvent) -> None:
             summary = {}
 
     summary["last_event"] = _serialize_event(event)
-    summary["status"] = "CLOSED" if event["event_type"] == "CLOSE" else summary.get("status", "OPEN")
+    summary["status"] = "CLOSED" if event["event_type"] in ("CLOSE", "CLOSE_UNKNOWN") else summary.get("status", "OPEN")
 
     if event["event_type"] == "OPEN":
         summary["open_event"] = _serialize_event(event)
         summary["status"] = "OPEN"
-    if event["event_type"] == "CLOSE":
+    if event["event_type"] in ("CLOSE", "CLOSE_UNKNOWN"):
         summary["close_event"] = _serialize_event(event)
 
     path.parent.mkdir(parents=True, exist_ok=True)
