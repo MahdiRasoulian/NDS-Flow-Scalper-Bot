@@ -870,6 +870,114 @@ class NDSBot:
             self._last_trade_monitor_ts = now
             self._monitor_open_trades()
 
+
+    @staticmethod
+    def _normalize_order_direction(order_type: Any) -> str:
+        order_type = str(order_type or "").upper()
+        if "BUY" in order_type:
+            return "BUY"
+        if "SELL" in order_type:
+            return "SELL"
+        return "NONE"
+
+    def _compute_directional_exposure(
+        self,
+        *,
+        direction: str,
+        open_positions: List[Dict[str, Any]],
+        pending_orders: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        direction = str(direction or "NONE").upper()
+        open_same = sum(1 for pos in open_positions if str(pos.get("side", "")).upper() == direction)
+        pending_same = sum(
+            1
+            for order in pending_orders
+            if self._normalize_order_direction(order.get("type")) == direction
+        )
+        return {
+            "direction": direction,
+            "open_same": int(open_same),
+            "pending_same": int(pending_same),
+            "effective_exposure": int(open_same + pending_same),
+        }
+
+    def _can_execute_trade(self, *, direction: str, symbol: str, df) -> Tuple[bool, str]:
+        open_positions = self.get_open_positions_info()
+        pending_orders = self.get_pending_orders_info()
+        self._latest_open_positions = open_positions
+        self._latest_pending_orders = pending_orders
+
+        exposure = self._compute_directional_exposure(
+            direction=direction,
+            open_positions=open_positions,
+            pending_orders=pending_orders,
+        )
+        if exposure["open_same"] > 0:
+            logger.warning(
+                "[BLOCKED_OPEN_POSITION] symbol=%s direction=%s open_same=%s pending_same=%s effective_exposure=%s",
+                symbol,
+                direction,
+                exposure["open_same"],
+                exposure["pending_same"],
+                exposure["effective_exposure"],
+            )
+            logger.warning(
+                "[BLOCKED_EXPOSURE] reason=open_position symbol=%s direction=%s effective_exposure=%s",
+                symbol,
+                direction,
+                exposure["effective_exposure"],
+            )
+            return False, "OPEN_POSITION"
+
+        if exposure["pending_same"] > 0:
+            logger.warning(
+                "[BLOCKED_PENDING_EXIST] symbol=%s direction=%s open_same=%s pending_same=%s effective_exposure=%s",
+                symbol,
+                direction,
+                exposure["open_same"],
+                exposure["pending_same"],
+                exposure["effective_exposure"],
+            )
+            logger.warning(
+                "[BLOCKED_EXPOSURE] reason=pending_exists symbol=%s direction=%s effective_exposure=%s",
+                symbol,
+                direction,
+                exposure["effective_exposure"],
+            )
+            return False, "PENDING_ORDER"
+
+        if hasattr(self, "trade_tracker") and self.trade_tracker:
+            intent_ok, intent_details = self.trade_tracker.reconcile_with_pending_orders(pending_orders)
+            if not intent_ok:
+                logger.error(
+                    "[INTENT_MISMATCH_DETECTED] symbol=%s direction=%s details=%s",
+                    symbol,
+                    direction,
+                    intent_details,
+                )
+                return False, "INTENT_MISMATCH"
+
+        cooldown_decision = evaluate_cooldown(
+            signal=direction,
+            min_candles_between=get_min_candles_between_trades(self.config),
+            df=df,
+            open_positions=open_positions,
+            pending_orders=pending_orders,
+            last_trade_candle_time=self.bot_state.last_trade_candle_time,
+            last_trade_direction=self.bot_state.last_trade_direction,
+        )
+        if not cooldown_decision.allowed:
+            logger.warning(
+                "[BLOCKED_COOLDOWN] symbol=%s direction=%s reason=%s details=%s",
+                symbol,
+                direction,
+                cooldown_decision.reason,
+                cooldown_decision.details,
+            )
+            return False, cooldown_decision.reason
+
+        return True, "ALLOWED"
+
     # ----------------------------
     # Initialize
     # ----------------------------
@@ -1266,22 +1374,18 @@ class NDSBot:
                     )
                     return
 
-                cooldown_decision = evaluate_cooldown(
-                    signal=final_signal,
-                    min_candles_between=MIN_CANDLES_BETWEEN,
+                can_execute, block_reason = self._can_execute_trade(
+                    direction=final_signal,
+                    symbol=symbol,
                     df=df,
-                    open_positions=open_positions,
-                    last_trade_candle_time=self.bot_state.last_trade_candle_time,
-                    last_trade_direction=self.bot_state.last_trade_direction,
                 )
-                if cooldown_decision.reason == "MIXED_EXPOSURE":
+                if not can_execute:
                     logger.info(
-                        "[COOLDOWN] mixed exposure detected (BUY/SELL open) => BLOCKED"
+                        "[TRADE_BLOCK] symbol=%s reason=%s direction=%s",
+                        symbol,
+                        block_reason,
+                        final_signal,
                     )
-                    return
-                if cooldown_decision.reason in {"COOLDOWN_BLOCKED", "COOLDOWN_OK"}:
-                    self._log_cooldown_decision(cooldown_decision)
-                if not cooldown_decision.allowed:
                     return
 
                 # محدودیت تعداد پوزیشن
@@ -1902,6 +2006,18 @@ class NDSBot:
             logger.info(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر: {signal_data['signal']} {lot_size:.3f} لات")
             print(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر...")
 
+            pending_orders_before_send = self.get_pending_orders_info()
+            if hasattr(self, "trade_tracker") and self.trade_tracker:
+                intent_ok, intent_details = self.trade_tracker.reconcile_with_pending_orders(pending_orders_before_send)
+                if not intent_ok:
+                    logger.error(
+                        "[INTENT_MISMATCH_DETECTED] phase=pre_submit symbol=%s side=%s details=%s",
+                        SYMBOL,
+                        signal_data.get("signal"),
+                        intent_details,
+                    )
+                    return False
+
             order_result = None
             order_comment = f"NDS Scalping - {current_session or 'N/A'}"
             resolved_magic = self._resolve_order_magic(order_type)
@@ -2287,6 +2403,18 @@ class NDSBot:
                     },
                 }
                 self.trade_tracker.add_trade_open(open_event)
+                pending_orders_after_send = self.get_pending_orders_info()
+                intent_ok_after, intent_details_after = self.trade_tracker.reconcile_with_pending_orders(
+                    pending_orders_after_send
+                )
+                if not intent_ok_after:
+                    logger.error(
+                        "[INTENT_MISMATCH_DETECTED] phase=post_submit symbol=%s side=%s details=%s",
+                        SYMBOL,
+                        signal_data.get("signal"),
+                        intent_details_after,
+                    )
+                    return False
                 self.bot_state.add_trade(success=True)
 
                 if df is None or df.empty:

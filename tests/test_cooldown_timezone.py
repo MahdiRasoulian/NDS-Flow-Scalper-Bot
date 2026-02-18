@@ -61,8 +61,8 @@ def test_cooldown_handles_naive_candles_and_aware_last_trade():
         last_trade_direction=None,
     )
 
-    assert decision.allowed
-    assert decision.reason == "COOLDOWN_OK"
+    assert not decision.allowed
+    assert decision.reason == "EXPOSURE_PRESENT"
 
 
 def test_bot_state_normalizes_times_to_utc():

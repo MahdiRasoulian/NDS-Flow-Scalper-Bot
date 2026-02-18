@@ -117,6 +117,7 @@ def evaluate_cooldown(
     min_candles_between: int,
     df,
     open_positions: List[Dict[str, Any]],
+    pending_orders: Optional[List[Dict[str, Any]]] = None,
     last_trade_candle_time: Optional[datetime],
     last_trade_direction: Optional[str],
 ) -> CooldownDecision:
@@ -135,6 +136,19 @@ def evaluate_cooldown(
                 "buy_count": buy_count,
                 "sell_count": sell_count,
                 "tickets": tickets,
+            },
+        )
+
+    pending_orders = pending_orders or []
+    if open_positions or pending_orders:
+        return CooldownDecision(
+            False,
+            "EXPOSURE_PRESENT",
+            {
+                "signal": signal,
+                "open_positions": len(open_positions),
+                "pending_orders": len(pending_orders),
+                "exposure_bias": exposure_bias,
             },
         )
 
@@ -195,7 +209,7 @@ def evaluate_cooldown(
         normalized_times = [ts for ts in normalized_times if ts is not None]
         candles_passed = int(sum(1 for ts in normalized_times if ts > last_trade_time))
         current_bar_time = normalized_times[-1] if normalized_times else None
-    if candles_passed < min_candles_between:
+    if candles_passed <= min_candles_between:
         return CooldownDecision(
             False,
             "COOLDOWN_BLOCKED",
