@@ -576,18 +576,13 @@ class NDSBot:
         flow_settings: Dict[str, Any],
         risk_settings: Dict[str, Any],
     ) -> Tuple[float, str]:
+        del flow_settings, risk_settings
         tp_execution_mode = getattr(finalized, "tp_execution_mode", None)
-        if not tp_execution_mode:
-            tp1_partial = float(flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.0) or 0.0)
-            trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
-            tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
-            tp_execution_mode = (
-                "VIRTUAL_FSM"
-                if tp1_partial > 0 and (trail_after_tp1 or tp2_enabled)
-                else "SINGLE_TP"
-            )
+        tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
 
-        if tp_execution_mode in {"VIRTUAL_FSM", "TP1_PARTIAL_MANAGED"}:
+        if tp_execution_mode in {"TP1_PARTIAL_MANAGED", "VIRTUAL_FSM"}:
+            if tp2_price is not None:
+                return float(tp2_price), "tp2_runner"
             return 0.0, "sl_only_fsm_managed"
 
         broker_tp = getattr(finalized, "broker_take_profit", None)
@@ -1837,17 +1832,12 @@ class NDSBot:
 
             flow_settings = config_payload.get("flow_settings", {}) if isinstance(config_payload, dict) else {}
             risk_settings = config_payload.get("risk_settings", {}) if isinstance(config_payload, dict) else {}
-            tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
-            trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
             tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
+            tp2_price = getattr(finalized, "tp2", None) or getattr(finalized, "take_profit2", None)
             tp1_virtual_trigger = bool(getattr(finalized, "tp1_virtual_trigger", False))
-            tp_plan = "single_tp"
-            if trail_after_tp1:
-                tp_plan = "trail_after_tp1"
-            elif tp2_enabled and tp2_price is not None:
-                tp_plan = "tp1_tp2"
-            if tp1_virtual_trigger:
-                tp_plan = "tp1_tp2" if tp2_price is not None else "single_tp"
+            tp_plan = "tp1_tp2" if tp2_price is not None else "single_tp"
+            if tp1_virtual_trigger and tp2_price is None:
+                tp_plan = "single_tp"
 
             risk_plan = {
                 "entry_price": float(finalized.entry_price),
@@ -2193,13 +2183,7 @@ class NDSBot:
                     float(point_size),
                 )
                 tp2_pips = float(tp2_metrics.get("dist_pips") or 0.0)
-                trail_after_tp1 = bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", True))
-                tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
-                tp_plan = "single_tp"
-                if trail_after_tp1:
-                    tp_plan = "trail_after_tp1"
-                elif tp2_enabled and tp2_price is not None:
-                    tp_plan = "tp1_tp2"
+                tp_plan = "tp1_tp2" if tp2_price is not None else "single_tp"
 
                 logger.info(
                     "✅ [TRADE][OPEN] ticket=%s position=%s symbol=%s side=%s entry=%.2f sl=%.2f tp=%.2f vol=%.3f order_type=%s",
@@ -2295,7 +2279,7 @@ class NDSBot:
                         "tp1_price": float(finalized.take_profit),
                         "tp_plan": tp_plan,
                         "tp2_enabled": tp2_enabled,
-                        "trail_after_tp1": trail_after_tp1,
+                        "trail_after_tp1": False,
                         "tp_execution_mode": getattr(finalized, "tp_execution_mode", None),
                         "tp_sent_to_broker": tp_sent_to_broker,
                         "risk_plan": risk_plan,

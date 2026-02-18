@@ -34,7 +34,7 @@ def test_tp1_partial_mode_avoids_broker_tp1():
     assert reason == "tp2_runner"
 
 
-def test_tp1_partial_with_trailing_sends_no_tp():
+def test_tp1_partial_without_tp2_sends_no_tp():
     finalized = _finalized_with_tp(tp1=2005.0, tp2=None, mode="TP1_PARTIAL_MANAGED")
     flow_settings = {"FLOW_TRAIL_AFTER_TP1": True, "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5}
     risk_settings = {"TP2_ENABLED": False}
@@ -42,7 +42,7 @@ def test_tp1_partial_with_trailing_sends_no_tp():
     tp_sent, reason = NDSBot._resolve_broker_tp(finalized, flow_settings, risk_settings)
 
     assert tp_sent == 0.0
-    assert reason == "trail_after_tp1"
+    assert reason == "sl_only_fsm_managed"
 
 
 def test_single_tp_mode_sends_tp1():

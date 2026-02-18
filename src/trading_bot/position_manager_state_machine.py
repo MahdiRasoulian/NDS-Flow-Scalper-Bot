@@ -15,9 +15,7 @@ from src.trading_bot.nds.distance_utils import pips_to_price, resolve_point_size
 class PositionStatus(Enum):
     STATUS_OPEN = auto()
     STATUS_WAIT_TP1 = auto()
-    STATUS_SECURED = auto()
     STATUS_WAIT_TP2 = auto()
-    STATUS_TRAILING = auto()
     STATUS_CLOSED = auto()
     STATUS_FAILED = auto()
 
@@ -37,8 +35,6 @@ class PositionPlan:
     status: PositionStatus = PositionStatus.STATUS_OPEN
     partial_closed: bool = False
     sl_moved_to_be: bool = False
-    trailing_active: bool = False
-    last_trailing_sl: Optional[float] = None
     close_summary: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -166,18 +162,7 @@ class PositionManager:
             if plan.status == PositionStatus.STATUS_WAIT_TP2:
                 if not self._crossed_tp2(plan, market_price):
                     return
-                if self._activate_trailing(plan):
-                    plan.status = PositionStatus.STATUS_TRAILING
-                    self._logger.info("[PM][STATE] %s WAIT_TP2 -> TRAILING", plan.ticket)
-                return
-
-            if plan.status == PositionStatus.STATUS_TRAILING:
-                new_sl = self._compute_trailing_sl(plan, market_price)
-                if new_sl is None:
-                    return
-                if self._modify_sl(plan, new_sl):
-                    plan.last_trailing_sl = new_sl
-                    plan.sl_price = new_sl
+                self._logger.info("[PM][EVENT] TP2 reached ticket=%s price=%.2f", plan.ticket, float(market_price))
                 return
 
             if plan.status in {PositionStatus.STATUS_CLOSED, PositionStatus.STATUS_FAILED}:
@@ -190,7 +175,7 @@ class PositionManager:
             plan.status = PositionStatus.STATUS_FAILED
 
     def _secure_at_tp1(self, plan: PositionPlan) -> bool:
-        self._logger.info("[PM][EVENT] TP1 trigger ticket=%s", plan.ticket)
+        self._logger.info("[PM][TP1_DETECTED] ticket=%s", plan.ticket)
         if not plan.partial_closed:
             if not self._partial_close(plan):
                 return False
@@ -206,7 +191,6 @@ class PositionManager:
         if not self._set_tp2(plan):
             return False
 
-        plan.status = PositionStatus.STATUS_SECURED
         return True
 
     def _clear_broker_tp(self, plan: PositionPlan) -> None:
@@ -291,7 +275,7 @@ class PositionManager:
         result = self._call_mt5("close_position", ticket=plan.ticket, volume=close_volume)
         ok = bool(result and result.get("success"))
         if ok:
-            self._logger.info("[PM][PARTIAL_CLOSE] ticket=%s volume=%.3f", plan.ticket, close_volume)
+            self._logger.info("[PM][PARTIAL_CLOSE_CONFIRMED] ticket=%s volume=%.3f", plan.ticket, close_volume)
         else:
             self._logger.warning("[PM][PARTIAL_CLOSE_FAIL] ticket=%s result=%s", plan.ticket, result)
             self._logger.warning("[NDS][TP1_PARTIAL_FAIL] ticket=%s result=%s", plan.ticket, result)
@@ -302,7 +286,7 @@ class PositionManager:
         result = self._modify_position(plan.ticket, new_sl=new_sl, context="MODIFY_SL")
         ok = bool(result and result.get("success"))
         if ok:
-            self._logger.info("[PM][MOVE_SL] ticket=%s sl=%.2f", plan.ticket, new_sl)
+            self._logger.info("[PM][SL_BE_CONFIRMED] ticket=%s sl=%.2f", plan.ticket, new_sl)
         else:
             self._logger.warning("[PM][MOVE_SL_FAIL] ticket=%s result=%s", plan.ticket, result)
             self._logger.warning("[NDS][SL_BE_FAIL] ticket=%s result=%s", plan.ticket, result)
@@ -312,40 +296,16 @@ class PositionManager:
         result = self._modify_position(plan.ticket, new_tp=plan.tp2_price, context="SET_TP2")
         ok = bool(result and result.get("success"))
         if ok:
-            self._logger.info("[PM][SET_TP2] ticket=%s tp2=%.2f", plan.ticket, plan.tp2_price)
+            self._logger.info("[PM][TP2_SENT_CONFIRMED] ticket=%s tp2=%.2f", plan.ticket, plan.tp2_price)
         else:
             self._logger.warning("[PM][SET_TP2_FAIL] ticket=%s result=%s", plan.ticket, result)
         return ok
-
-    def _activate_trailing(self, plan: PositionPlan) -> bool:
-        plan.trailing_active = True
-        self._logger.info("[PM][TRAILING] activated ticket=%s", plan.ticket)
-        return True
 
     def _compute_sl_to_be(self, plan: PositionPlan) -> float:
         offset = pips_to_price(self._get_cover_pips(), self._resolve_point_size())
         if plan.direction == "BUY":
             return plan.entry_price + offset
         return plan.entry_price - offset
-
-    def _compute_trailing_sl(self, plan: PositionPlan, price: float) -> Optional[float]:
-        if not plan.trailing_active:
-            return None
-        atr = self._get_atr_value()
-        if atr <= 0:
-            return None
-        offset = 2.0 * atr
-        if plan.direction == "BUY":
-            candidate = price - offset
-            candidate = max(candidate, plan.entry_price)
-            if plan.sl_price and candidate <= plan.sl_price:
-                return None
-            return candidate
-        candidate = price + offset
-        candidate = min(candidate, plan.entry_price)
-        if plan.sl_price and candidate >= plan.sl_price:
-            return None
-        return candidate
 
     def _crossed_tp1(self, plan: PositionPlan, price: float) -> bool:
         return (plan.direction == "BUY" and price >= plan.tp1_price) or (
@@ -475,15 +435,6 @@ class PositionManager:
     def _get_cover_pips(self) -> float:
         flow_settings = self.config.get("flow_settings", {}) if isinstance(self.config, dict) else {}
         return float(flow_settings.get("FLOW_TP1_MOVE_SL_TO_BE_PLUS_PIPS", 0.0) or 0.0)
-
-    def _get_atr_value(self) -> float:
-        flow_settings = self.config.get("flow_settings", {}) if isinstance(self.config, dict) else {}
-        atr = flow_settings.get("FLOW_TRAIL_ATR_VALUE")
-        if atr is None:
-            atr = flow_settings.get("FLOW_ATR_VALUE")
-        if atr is None:
-            return 0.0
-        return float(atr)
 
     def _get_trade_metadata(self, position: PositionContract) -> Dict[str, Any]:
         if self.trade_tracker is None:
