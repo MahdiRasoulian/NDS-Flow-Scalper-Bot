@@ -110,10 +110,12 @@ def test_emit_position_closed_event_timeout_fallback(monkeypatch):
     )
 
     assert event["event_type"] == "CLOSE_UNKNOWN"
+    assert event["profit"] == 0.0
     assert not bot.trade_tracker.closed_events
     assert bot.trade_tracker.unknown_events and bot.trade_tracker.unknown_events[0][0] == 9001
     assert reported_events and reported_events[0]["event_type"] == "CLOSE_UNKNOWN"
     assert bot.notifier.close_calls and bot.notifier.close_calls[0]["reason"] == "HistoryTimeout/Unknown"
+    assert bot.notifier.close_calls[0]["event_type"] == "CLOSE_UNKNOWN"
 
 
 def test_generate_execution_report_for_close_unknown_writes_artifacts(tmp_path, monkeypatch):
@@ -179,3 +181,69 @@ def test_generate_execution_report_for_close_unknown_writes_artifacts(tmp_path, 
     assert close_report, "expected close summary in scalping_reports/summary"
     assert daily_json.exists()
 
+
+
+def test_emit_position_closed_event_duration_never_negative(monkeypatch):
+    bot, _reported_events = _build_bot(monkeypatch)
+    record = _sample_record()
+    opened_at = datetime.utcnow()
+    record["trade_identity"]["opened_at"] = opened_at
+
+    event = bot._emit_position_closed_event(
+        position_ticket=9001,
+        record=record,
+        history={
+            "exit_price": 1998.0,
+            "total_profit": -10.0,
+            "close_time": opened_at - timedelta(minutes=5),
+            "reason": "SL",
+        },
+        now=datetime.utcnow(),
+        symbol_fallback="XAUUSD",
+        close_status="CLOSE",
+    )
+
+    assert event["metadata"]["duration_sec"] == 0.0
+
+
+def test_generate_execution_report_close_unknown_sets_closed_status(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    event = {
+        "event_type": "CLOSE_UNKNOWN",
+        "event_time": datetime(2026, 1, 2, 10, 30, 0),
+        "symbol": "XAUUSD",
+        "order_ticket": 501,
+        "position_ticket": 9001,
+        "side": "BUY",
+        "volume": 1.0,
+        "entry_price": 2000.0,
+        "exit_price": 1998.0,
+        "sl": 1990.0,
+        "tp": 2010.0,
+        "profit": 0.0,
+        "pips": -20.0,
+        "pips_abs": 20.0,
+        "reason": "HistoryTimeout/Unknown",
+        "metadata": {"duration_sec": 15.0},
+    }
+
+    class L:
+        def warning(self, *_a, **_k):
+            return None
+
+        def info(self, *_a, **_k):
+            return None
+
+        def error(self, *_a, **_k):
+            return None
+
+        def debug(self, *_a, **_k):
+            return None
+
+    generate_execution_report(logger=L(), event=event)
+
+    summary_file = Path("reports/2026-01-02/trades/9001/summary.json")
+    payload = __import__("json").loads(summary_file.read_text(encoding="utf-8"))
+    assert payload["status"] == "CLOSED"
+    assert payload.get("close_event", {}).get("event_type") == "CLOSE_UNKNOWN"

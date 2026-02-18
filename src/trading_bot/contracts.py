@@ -45,7 +45,7 @@ class TradeIdentity(TypedDict):
 
 
 class ExecutionEvent(TypedDict):
-    event_type: Literal["OPEN", "UPDATE", "CLOSE", "ERROR"]
+    event_type: Literal["OPEN", "UPDATE", "CLOSE", "CLOSE_UNKNOWN", "ERROR"]
     event_time: datetime
     symbol: str
     order_ticket: Optional[int]

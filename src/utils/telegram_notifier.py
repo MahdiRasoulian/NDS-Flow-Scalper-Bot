@@ -332,6 +332,10 @@ class TelegramNotifier:
         profit_usd: float,
         pips: float,
         reason: str,
+        event_type: Optional[str] = None,
+        duration_sec: Optional[float] = None,
+        ticket: Optional[int] = None,
+        exit_price: Optional[float] = None,
     ):
         result_emoji = "✅ #PROFIT" if profit_usd > 0 else "❌ #LOSS"
         trend_emoji = "💰" if profit_usd > 0 else "📉"
@@ -340,14 +344,22 @@ class TelegramNotifier:
         profit_txt = f"${profit_usd:,.2f}" if profit_usd is not None else "N/A"
         pips_txt = f"{pips:,.1f} Pips" if pips is not None else "N/A"
         signal_type = (signal_type or "").upper().strip()
+        duration_txt = "N/A" if duration_sec is None else f"{float(duration_sec):.0f}s"
+        ticket_txt = "N/A" if ticket is None else str(ticket)
+        exit_txt = "N/A" if exit_price is None else f"{float(exit_price):,.2f}"
+        status_txt = str(event_type or "CLOSE").upper()
 
         message = (
             f"{trend_emoji} <b>معامله {symbol} بسته شد</b>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🏁 <b>نتیجه:</b> {result_emoji}\n"
+            f"🔖 <b>وضعیت:</b> <code>{status_txt}</code>\n"
+            f"🎫 <b>تیکت:</b> <code>{ticket_txt}</code>\n"
             f"👤 <b>نوع معامله:</b> {signal_type}\n"
             f"💵 <b>سود/ضرر دلار:</b> <code>{profit_txt}</code>\n"
             f"📏 <b>مقدار جابجایی:</b> <code>{pips_txt}</code>\n"
+            f"💹 <b>قیمت خروج:</b> <code>{exit_txt}</code>\n"
+            f"⏱ <b>مدت معامله:</b> <code>{duration_txt}</code>\n"
             f"📝 <b>علت خروج:</b> {reason}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"⏰ <b>زمان بسته شدن:</b> {datetime.now().strftime('%H:%M:%S')}\n"

@@ -640,6 +640,98 @@ class NDSBot:
             "min_rr_source": open_metadata.get("min_rr_source") or entry_risk.get("min_rr_source"),
         }
 
+    def _resolve_position_timeout_minutes(self) -> int:
+        """Resolve hard timeout minutes for open positions (risk guardrail)."""
+        timeframe = str(self.config.get("trading_settings.TIMEFRAME") if hasattr(self.config, "get") else "M5").upper()
+        risk_cfg = self.config.get("risk_settings", {}) if hasattr(self.config, "get") else {}
+        configured = risk_cfg.get("POSITION_TIMEOUT_MINUTES") if isinstance(risk_cfg, dict) else None
+        if configured is not None:
+            try:
+                minutes = int(configured)
+                if minutes > 0:
+                    return minutes
+            except Exception:
+                pass
+        if timeframe == "M5":
+            return 60
+        return 120
+
+    @staticmethod
+    def _normalize_duration_seconds(opened_at: Optional[datetime], closed_at: Optional[datetime]) -> Optional[float]:
+        if not opened_at or not closed_at:
+            return None
+        try:
+            return max(0.0, float((closed_at - opened_at).total_seconds()))
+        except Exception:
+            return None
+
+    def finalize_trade_report(self, event: ExecutionEvent, *, notify_telegram: bool = True) -> None:
+        """Atomic terminal trade finalization: report + optional telegram, after full reconciliation."""
+        generate_execution_report(logger=logger, event=event)
+        logger.info("[REPORT_WRITE] ticket=%s event_type=%s", event.get("position_ticket"), event.get("event_type"))
+
+        if not notify_telegram:
+            return
+        if hasattr(self, "notifier") and self.notifier is not None:
+            try:
+                self.notifier.send_trade_close_notification(
+                    symbol=event.get("symbol") or "UNKNOWN",
+                    signal_type=event.get("side") or "Unknown",
+                    profit_usd=float(event.get("profit") or 0.0),
+                    pips=float(event.get("pips") or 0.0),
+                    reason=event.get("reason") or "Unknown",
+                    event_type=event.get("event_type"),
+                    duration_sec=((event.get("metadata") or {}).get("duration_sec") if isinstance(event.get("metadata"), dict) else None),
+                    ticket=event.get("position_ticket") or event.get("order_ticket"),
+                    exit_price=event.get("exit_price"),
+                )
+                logger.info("[TELEGRAM_NOTIFY] close ticket=%s event_type=%s", event.get("position_ticket"), event.get("event_type"))
+            except Exception as tel_err:
+                logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
+
+    def _enforce_time_based_exits(self, open_positions: List[PositionContract], now: datetime) -> None:
+        """Hard risk enforcement for max holding time (M5 => 60m guaranteed baseline)."""
+        timeout_minutes = self._resolve_position_timeout_minutes()
+        timeout_sec = float(timeout_minutes * 60)
+
+        for position in open_positions:
+            ticket = int(position.get("position_ticket") or 0)
+            if not ticket:
+                continue
+            opened_at = position.get("open_time")
+            if not opened_at:
+                record = self.trade_tracker.active_trades.get(ticket, {}) if hasattr(self.trade_tracker, "active_trades") else {}
+                opened_at = (record.get("trade_identity", {}) or {}).get("opened_at")
+            if not opened_at:
+                continue
+            elapsed_sec = self._normalize_duration_seconds(opened_at, now)
+            if elapsed_sec is None or elapsed_sec < timeout_sec:
+                continue
+
+            logger.warning(
+                "[RISK_TIMEOUT] ticket=%s symbol=%s side=%s elapsed_sec=%.0f limit_sec=%.0f action=force_close",
+                ticket,
+                position.get("symbol"),
+                position.get("side"),
+                float(elapsed_sec),
+                timeout_sec,
+            )
+            try:
+                close_result = self.mt5_client.close_position(ticket=ticket, volume=position.get("volume"))
+            except Exception as close_err:
+                logger.error("[RISK_TIMEOUT_FAIL] ticket=%s error=%s", ticket, close_err, exc_info=True)
+                continue
+
+            if not (isinstance(close_result, dict) and close_result.get("success")):
+                logger.error("[RISK_TIMEOUT_FAIL] ticket=%s result=%s", ticket, close_result)
+                continue
+
+            record = self.trade_tracker.active_trades.get(ticket) if hasattr(self.trade_tracker, "active_trades") else None
+            if record:
+                record = self.trade_tracker.normalize_trade_record(record)
+                self.trade_tracker.register_pending_close(ticket, record, now)
+            logger.info("[RISK_TIMEOUT_FORCE_CLOSE] ticket=%s close_result=%s", ticket, close_result)
+
     def _emit_position_closed_event(
         self,
         *,
@@ -662,10 +754,8 @@ class NDSBot:
         profit = history.get("total_profit")
         close_time = history.get("close_time") or now
         reason = close_reason or history.get("reason") or "Manual/Other"
-        duration_sec = None
         opened_at = identity.get("opened_at")
-        if opened_at and close_time:
-            duration_sec = (close_time - opened_at).total_seconds()
+        duration_sec = self._normalize_duration_seconds(opened_at, close_time)
 
         point_size, point_source = resolve_point_size_with_source(
             self.config,
@@ -720,7 +810,7 @@ class NDSBot:
             "exit_price": exit_price,
             "sl": open_event.get("sl"),
             "tp": open_event.get("tp"),
-            "profit": profit,
+            "profit": float(profit or 0.0),
             "pips": pips_val,
             "pips_abs": pips_abs,
             "reason": reason,
@@ -738,28 +828,14 @@ class NDSBot:
         else:
             self.trade_tracker.close_trade_event(close_event)
 
-        generate_execution_report(logger=logger, event=close_event)
-        logger.info("[REPORT_WRITE] ticket=%s event_type=%s", position_ticket, close_status)
+        self.finalize_trade_report(close_event, notify_telegram=True)
         logger.info(
             "[PM][FINAL_CLOSE] ticket=%s closed_time=%s pnl=%.2f reason=%s",
             position_ticket,
             close_time,
-            float(profit or 0.0),
+            float(close_event.get("profit") or 0.0),
             reason,
         )
-
-        if hasattr(self, "notifier") and self.notifier is not None:
-            try:
-                self.notifier.send_trade_close_notification(
-                    symbol=symbol,
-                    signal_type=side or "Unknown",
-                    profit_usd=float(profit or 0.0),
-                    pips=float(pips_val or 0.0),
-                    reason=reason,
-                )
-                logger.info("[TELEGRAM_NOTIFY] close ticket=%s event_type=%s", position_ticket, close_status)
-            except Exception as tel_err:
-                logger.error(f"⚠️ خطا در ارسال نوتیفیکیشن تلگرام: {tel_err}", exc_info=True)
 
         return close_event
 
@@ -2520,6 +2596,8 @@ class NDSBot:
                         manager_error,
                         exc_info=True,
                     )
+            if open_positions:
+                self._enforce_time_based_exits(open_positions, now)
             exposure_bias = resolve_exposure_bias(open_positions)
             if open_positions or pending_orders:
                 self.bot_state.active_signal_direction = exposure_bias if exposure_bias != "NONE" else None
