@@ -61,6 +61,11 @@ from src.trading_bot.session_policy import evaluate_session, normalize_session_p
 from src.trading_bot.trade_tracker import TradeTracker
 from src.trading_bot.position_state import PositionStateStore
 from src.trading_bot.position_manager import PositionManager
+from src.trading_bot.breakout_watch import (
+    BreakoutWatch,
+    BreakoutWatchManager,
+    revalidate_breakout,
+)
 from src.trading_bot.cooldown import (
     CooldownDecision,
     evaluate_cooldown,
@@ -135,6 +140,7 @@ class NDSBot:
         self._latest_pending_orders: List[Dict[str, Any]] = []
         self.position_state_store = PositionStateStore(Path("reports") / "state" / "positions.json")
         self.position_state_store.load()
+        self.breakout_watch_manager = BreakoutWatchManager(logger)
         self._shutdown_started = False
         self._cleanup_done = False
 
@@ -1338,6 +1344,8 @@ class NDSBot:
 
             logger.info("🧠 اجرای تحلیل NDS اسکلپینگ...")
 
+            self._process_breakout_watches(df=df, latest_analysis=None)
+
             # --- اجرای تحلیل ---
             try:
                 raw_result = self.analyze_market_func(
@@ -1418,6 +1426,9 @@ class NDSBot:
                 is_active_session=is_active_session, untradable=untradable,
                 reject_reason=reject_reason, reject_details=reject_details
             )
+
+            # قبل از تصمیم‌گیری سفارش جدید، واچ‌های شکست را با وضعیت فعلی بازار ارزیابی کن
+            self._process_breakout_watches(df=df, latest_analysis=result)
 
             # نمایش نتایج در کنسول (همان تابع قبلی شما)
             result["signal"] = final_signal  # آپدیت سیگنال نهایی در دیکشنری
@@ -1800,7 +1811,160 @@ class NDSBot:
             if not (tp < entry < sl):
                 return False, f"Invalid SELL geometry: tp={tp:.2f} entry={entry:.2f} sl={sl:.2f}"
 
+
         return True, "OK"
+
+    def _extract_breakout_market_state(self, result: Dict[str, Any], df) -> Dict[str, Any]:
+        market_metrics = result.get("market_metrics", {}) if isinstance(result.get("market_metrics"), dict) else {}
+        indicators = result.get("indicators", {}) if isinstance(result.get("indicators"), dict) else {}
+        ema_slope = indicators.get("ema_slope")
+        if ema_slope is None:
+            ema_fast = indicators.get("ema_fast")
+            ema_slow = indicators.get("ema_slow")
+            if ema_fast is not None and ema_slow is not None:
+                try:
+                    ema_slope = float(ema_fast) - float(ema_slow)
+                except Exception:
+                    ema_slope = 0.0
+        try:
+            ema_slope = float(ema_slope or 0.0)
+        except Exception:
+            ema_slope = 0.0
+
+        rsi = indicators.get("rsi")
+        if rsi is None:
+            rsi = market_metrics.get("rsi")
+        try:
+            rsi = float(rsi or 50.0)
+        except Exception:
+            rsi = 50.0
+
+        atr = market_metrics.get("atr") or market_metrics.get("atr_short")
+        atr_baseline = market_metrics.get("atr_baseline") or market_metrics.get("atr_long") or atr
+        try:
+            atr = float(atr or 0.0)
+        except Exception:
+            atr = 0.0
+        try:
+            atr_baseline = float(atr_baseline or atr or 1e-9)
+        except Exception:
+            atr_baseline = atr or 1e-9
+
+        sweep = False
+        structure = result.get("structure", {}) if isinstance(result.get("structure"), dict) else {}
+        liquidity = structure.get("liquidity") if isinstance(structure.get("liquidity"), dict) else {}
+        if isinstance(liquidity, dict):
+            sweep = bool(liquidity.get("sweep") or liquidity.get("has_sweep"))
+
+        inside_sr = False
+        static_sr = result.get("static_sr") or (result.get("context", {}) or {}).get("static_sr")
+        if isinstance(static_sr, dict) and df is not None and not getattr(df, "empty", True):
+            try:
+                close_px = float(df["close"].iloc[-1])
+                nearest_res = static_sr.get("nearest_resistance")
+                nearest_sup = static_sr.get("nearest_support")
+                near_band = max(atr * 0.25, 0.01)
+                if nearest_res is not None and abs(float(nearest_res) - close_px) <= near_band:
+                    inside_sr = True
+                if nearest_sup is not None and abs(float(nearest_sup) - close_px) <= near_band:
+                    inside_sr = True
+            except Exception:
+                inside_sr = False
+
+        candle = {}
+        if df is not None and not getattr(df, "empty", True):
+            try:
+                last = df.iloc[-1]
+                candle = {
+                    "open": float(last.get("open", 0.0) or 0.0),
+                    "close": float(last.get("close", 0.0) or 0.0),
+                    "high": float(last.get("high", 0.0) or 0.0),
+                    "low": float(last.get("low", 0.0) or 0.0),
+                }
+            except Exception:
+                candle = {}
+
+        return {
+            "rsi": rsi,
+            "ema_slope": ema_slope,
+            "atr": atr,
+            "atr_baseline": atr_baseline,
+            "inside_sr": inside_sr,
+            "liquidity_sweep": sweep,
+            "breakout_candle": candle,
+        }
+
+    def _stage_breakout_watch(self, signal_data: Dict[str, Any], finalized: FinalizedOrderParams) -> bool:
+        direction = self._normalize_signal(signal_data.get("signal", "NONE"))
+        if direction not in ("BUY", "SELL"):
+            logger.warning("[BREAKOUT_WATCH][SKIP] invalid_direction=%s", direction)
+            return False
+
+        structural_reference = {
+            "entry_model": signal_data.get("entry_model") or signal_data.get("entry_type"),
+            "structure": signal_data.get("structure"),
+            "static_sr": signal_data.get("static_sr") or (signal_data.get("context", {}) or {}).get("static_sr"),
+        }
+        expiration_candles = int(self.config.get("trading_rules.BREAKOUT_WATCH_EXPIRATION_CANDLES") or 3)
+        watch = BreakoutWatch(
+            direction=direction,
+            trigger_price=float(finalized.entry_price),
+            expiration_candles=max(1, expiration_candles),
+            structural_reference=structural_reference,
+            original_score=float(signal_data.get("score", 0.0) or 0.0),
+            finalized_payload=finalized.to_standard_payload(),
+            signal_snapshot=dict(signal_data),
+        )
+        self.breakout_watch_manager.add(watch)
+        logger.info(
+            "[BREAKOUT_WATCH][CREATED] id=%s direction=%s trigger=%.2f score=%.1f",
+            watch.watch_id,
+            watch.direction,
+            watch.trigger_price,
+            watch.original_score,
+        )
+        return True
+
+    def _process_breakout_watches(self, *, df, latest_analysis: Optional[Dict[str, Any]] = None) -> None:
+        self.breakout_watch_manager.on_new_candle()
+        pending = self.breakout_watch_manager.pending()
+        if not pending or df is None or getattr(df, "empty", True):
+            return
+
+        try:
+            close_price = float(df["close"].iloc[-1])
+        except Exception:
+            return
+
+        market_state = self._extract_breakout_market_state(latest_analysis or {}, df)
+        for watch in pending:
+            if watch.direction == "BUY" and close_price < watch.trigger_price:
+                continue
+            if watch.direction == "SELL" and close_price > watch.trigger_price:
+                continue
+
+            self.breakout_watch_manager.mark_triggered(watch)
+            validation = revalidate_breakout(watch, market_state)
+            logger.info(
+                "[BREAKOUT_WATCH][VALIDATION] id=%s passed=%s reasons=%s metrics=%s",
+                watch.watch_id,
+                validation.passed,
+                validation.reasons,
+                validation.metrics,
+            )
+            if not validation.passed:
+                self.breakout_watch_manager.mark_cancelled(watch, ";".join(validation.reasons) or "validation_failed")
+                continue
+
+            payload = dict(watch.signal_snapshot)
+            payload["entry_model"] = "MARKET_CONFIRMATION"
+            payload["entry_type"] = "MARKET_CONFIRMATION"
+            payload["force_order_type"] = "market"
+            executed = self.execute_scalping_trade(payload, df=df)
+            if executed:
+                self.breakout_watch_manager.mark_executed(watch)
+            else:
+                self.breakout_watch_manager.mark_cancelled(watch, "execution_failed")
 
     def execute_scalping_trade(self, signal_data: dict, df=None) -> bool:
         """🔥 اجرای معامله اسکلپینگ با Real-Time، ثبت گزارش و ذخیره JSON"""
@@ -1993,7 +2157,7 @@ class NDSBot:
                 }
             )
 
-            order_type = finalized.order_type
+            order_type = str(signal_data.get("force_order_type") or finalized.order_type)
             raw_lot_size = getattr(finalized, "lot_size", None)
             if raw_lot_size is None:
                 raw_lot_size = getattr(finalized, "lot", None)
@@ -2079,6 +2243,14 @@ class NDSBot:
                 float(finalized.entry_price),
             )
 
+            if str(order_type).lower() == "stop" and str(signal_data.get("force_order_type") or "").lower() != "market":
+                staged = self._stage_breakout_watch(signal_data, finalized)
+                if staged:
+                    logger.info("[BREAKOUT_WATCH][ARMED] direction=%s trigger=%.2f", signal_data.get("signal"), float(finalized.entry_price))
+                    return True
+                logger.warning("[BREAKOUT_WATCH][FALLBACK] staging_failed -> market_order")
+                order_type = "market"
+
             logger.info(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر: {signal_data['signal']} {lot_size:.3f} لات")
             print(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر...")
 
@@ -2118,33 +2290,21 @@ class NDSBot:
                         comment=order_comment,
                     )
             elif str(order_type).lower() == "stop":
-                stop_order_type = f"{signal_data['signal']}_STOP"
-                if hasattr(self.mt5_client, "send_stop_order"):
-                    order_result = self.mt5_client.send_stop_order(
+                logger.warning("[BREAKOUT_WATCH][UNEXPECTED] stop_order_requested_after_refactor; forcing_market")
+                if hasattr(self.mt5_client, "send_order_real_time"):
+                    order_result = self.mt5_client.send_order_real_time(
                         symbol=SYMBOL,
-                        order_type=stop_order_type,
+                        order_type=signal_data["signal"],
                         volume=lot_size,
-                        stop_price=finalized.entry_price,
-                        stop_loss=finalized.stop_loss,
-                        take_profit=tp_sent_to_broker,
-                        comment=order_comment,
-                    )
-                elif hasattr(self.mt5_client, "send_pending_order"):
-                    order_result = self.mt5_client.send_pending_order(
-                        symbol=SYMBOL,
-                        order_type=stop_order_type,
-                        volume=lot_size,
-                        pending_price=finalized.entry_price,
-                        stop_loss=finalized.stop_loss,
-                        take_profit=tp_sent_to_broker,
+                        sl_price=finalized.stop_loss,
+                        tp_price=tp_sent_to_broker,
                         comment=order_comment,
                     )
                 else:
-                    order_result = self.mt5_client.send_order_with_type(
+                    order_result = self.mt5_client.send_order(
                         symbol=SYMBOL,
-                        order_type=stop_order_type,
+                        order_type=signal_data["signal"],
                         volume=lot_size,
-                        price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
                         comment=order_comment,
