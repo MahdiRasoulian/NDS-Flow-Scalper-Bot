@@ -202,6 +202,24 @@ class ReportGenerator:
             if value is not None and value != 0:
                 return value
         return None
+
+    def _parse_event_time(self, event_time: Any) -> Optional[datetime]:
+        """تبدیل امن event_time به datetime (پشتیبانی از string و timestamp)."""
+        if event_time is None:
+            return None
+        if isinstance(event_time, datetime):
+            return event_time
+        if isinstance(event_time, str):
+            normalized = event_time.strip()
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                return datetime.fromisoformat(normalized)
+            except ValueError:
+                self._logger.warning("⚠️ Invalid event_time string: %s", event_time)
+                return None
+        self._logger.warning("⚠️ Unsupported event_time type: %s", type(event_time).__name__)
+        return None
     
     def _calculate_metrics(self, trades_data: List[Dict]) -> TradeMetrics:
         """محاسبه متریک‌های معاملاتی از داده‌های معاملات"""
@@ -582,6 +600,12 @@ class ReportGenerator:
             if plt is None or pd is None or mdates is None:
                 self._logger.warning("⚠️ matplotlib/pandas not available; skipping chart generation.")
                 return ""
+
+            if df is None or df.empty:
+                self._logger.warning("⚠️ Empty dataframe provided; skipping chart generation.")
+                return ""
+
+            df = df.copy()
 
             if filename is None:
                 timestamp = self._get_timestamp()
@@ -1171,7 +1195,8 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
         if event.get("event_type") not in ("CLOSE", "CLOSE_UNKNOWN"):
             return ""
 
-        report_date = (event.get("event_time") or datetime.now()).strftime("%Y-%m-%d")
+        event_dt = self._parse_event_time(event.get("event_time"))
+        report_date = (event_dt or datetime.now()).strftime("%Y-%m-%d")
         daily_file = self.output_dir / 'daily' / f"daily_{report_date}.json"
         daily_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1192,7 +1217,7 @@ Risk %: {order_details.get('lot_calculation', {}).get('actual_risk_percent', 0):
             "entry_price": self._coerce_float(event.get("entry_price")),
             "exit_price": self._coerce_float(event.get("exit_price")),
             "reason": event.get("reason"),
-            "close_time": event.get("event_time").isoformat() if event.get("event_time") else None,
+            "close_time": event_dt.isoformat() if event_dt else None,
             "status": event.get("event_type"),
             "tp_level_hit": (event.get("metadata") or {}).get("tp_level_hit"),
             "partial_close_count": (event.get("metadata") or {}).get("partial_close_count"),
