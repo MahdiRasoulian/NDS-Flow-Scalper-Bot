@@ -26,6 +26,11 @@ class TradeTracker:
             'total_profit': 0.0
         }
         self.last_reconcile_at: Optional[datetime] = None
+        self.last_intent_reconcile_ok: bool = True
+        self.last_intent_reconcile_details: Dict[str, List[int]] = {
+            "orphan_intents": [],
+            "missing_intents": [],
+        }
 
     @property
     def active_trades_view(self) -> Dict[int, Dict]:
@@ -76,6 +81,21 @@ class TradeTracker:
             "close_event": {},
             "status": "OPEN",
         }
+
+        if identity["position_ticket"] and int(identity["position_ticket"]) in self.active_trades:
+            logger.warning(
+                "[TRADE][DUPLICATE_INTENT_SKIPPED] type=position position=%s order=%s",
+                identity.get("position_ticket"),
+                identity.get("order_ticket"),
+            )
+            return
+
+        if identity["order_ticket"] and int(identity["order_ticket"]) in self.pending_trades_by_order:
+            logger.warning(
+                "[TRADE][DUPLICATE_INTENT_SKIPPED] type=order order=%s",
+                identity.get("order_ticket"),
+            )
+            return
 
         if identity["position_ticket"]:
             self.active_trades[int(identity["position_ticket"])] = record
@@ -513,6 +533,39 @@ class TradeTracker:
                 )
 
         return added_count, updated_count, closed_candidates
+
+    def reconcile_with_pending_orders(self, pending_orders: List[Dict]) -> Tuple[bool, Dict[str, List[int]]]:
+        """Reconcile broker pending tickets with tracker pending intents."""
+        broker_tickets = {
+            int(order.get("ticket"))
+            for order in pending_orders
+            if isinstance(order, dict) and order.get("ticket")
+        }
+        tracked_tickets = {int(ticket) for ticket in self.pending_trades_by_order.keys()}
+
+        orphan_intents = sorted(tracked_tickets - broker_tickets)
+        missing_intents = sorted(broker_tickets - tracked_tickets)
+
+        for orphan_ticket in orphan_intents:
+            record = self.pending_trades_by_order.pop(orphan_ticket, None)
+            if record is None:
+                continue
+            identity = record.get("trade_identity", {}) if isinstance(record, dict) else {}
+            logger.error(
+                "[INTENT_MISMATCH_DETECTED] type=orphan_intent order=%s symbol=%s side=%s",
+                orphan_ticket,
+                identity.get("symbol"),
+                record.get("open_event", {}).get("side") if isinstance(record, dict) else None,
+            )
+
+        details = {
+            "orphan_intents": orphan_intents,
+            "missing_intents": missing_intents,
+        }
+        ok = not orphan_intents and not missing_intents
+        self.last_intent_reconcile_ok = ok
+        self.last_intent_reconcile_details = details
+        return ok, details
 
     def _comments_match(self, expected: Optional[str], actual: Optional[str]) -> bool:
         if not expected or not actual:
