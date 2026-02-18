@@ -133,3 +133,71 @@ def test_mt5_client_failure_return_structure(monkeypatch):
     assert result["retcode"] == 10014
     assert "comment" in result
     assert "raw" in result
+
+
+def test_breakout_watch_candle_advance_only_once_per_cycle():
+    from src.trading_bot.breakout_watch import BreakoutWatch, BreakoutWatchManager
+
+    bot = NDSBot.__new__(NDSBot)
+    bot.breakout_watch_manager = BreakoutWatchManager(_DummyLogger())
+
+    watch = BreakoutWatch(
+        direction="BUY",
+        trigger_price=2100.0,
+        expiration_candles=3,
+        structural_reference={},
+        original_score=80.0,
+        finalized_payload={},
+        signal_snapshot={"signal": "BUY"},
+    )
+    bot.breakout_watch_manager.add(watch)
+
+    class _FakeSeries:
+        def __init__(self, values):
+            self._values = values
+            self.iloc = self
+
+        def __getitem__(self, idx):
+            return self._values[idx]
+
+    class _FakeRow(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    class _FakeDF:
+        empty = False
+
+        def __init__(self):
+            self._row = _FakeRow({"open": 2000.0, "high": 2001.0, "low": 1999.0, "close": 2000.5})
+            self.iloc = self
+
+        def __getitem__(self, key):
+            if key == "close":
+                return _FakeSeries([self._row["close"]])
+            raise KeyError(key)
+
+        def __call__(self, idx):
+            return self._row
+
+        def __getattr__(self, item):
+            if item == "iloc":
+                return self
+            raise AttributeError(item)
+
+        def __getitem_iloc__(self, idx):
+            return self._row
+
+        def __getitem__(self, key):
+            if isinstance(key, int):
+                return self._row
+            if key == "close":
+                return _FakeSeries([self._row["close"]])
+            raise KeyError(key)
+
+    df = _FakeDF()
+
+    bot._process_breakout_watches(df=df, latest_analysis=None, advance_candle=True)
+    bot._process_breakout_watches(df=df, latest_analysis={}, advance_candle=False)
+
+    assert watch.elapsed_candles == 1
+

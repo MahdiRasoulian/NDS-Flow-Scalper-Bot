@@ -1344,7 +1344,7 @@ class NDSBot:
 
             logger.info("🧠 اجرای تحلیل NDS اسکلپینگ...")
 
-            self._process_breakout_watches(df=df, latest_analysis=None)
+            self._process_breakout_watches(df=df, latest_analysis=None, advance_candle=True)
 
             # --- اجرای تحلیل ---
             try:
@@ -1428,7 +1428,7 @@ class NDSBot:
             )
 
             # قبل از تصمیم‌گیری سفارش جدید، واچ‌های شکست را با وضعیت فعلی بازار ارزیابی کن
-            self._process_breakout_watches(df=df, latest_analysis=result)
+            self._process_breakout_watches(df=df, latest_analysis=result, advance_candle=False)
 
             # نمایش نتایج در کنسول (همان تابع قبلی شما)
             result["signal"] = final_signal  # آپدیت سیگنال نهایی در دیکشنری
@@ -1925,8 +1925,15 @@ class NDSBot:
         )
         return True
 
-    def _process_breakout_watches(self, *, df, latest_analysis: Optional[Dict[str, Any]] = None) -> None:
-        self.breakout_watch_manager.on_new_candle()
+    def _process_breakout_watches(
+        self,
+        *,
+        df,
+        latest_analysis: Optional[Dict[str, Any]] = None,
+        advance_candle: bool = True,
+    ) -> None:
+        if advance_candle:
+            self.breakout_watch_manager.on_new_candle()
         pending = self.breakout_watch_manager.pending()
         if not pending or df is None or getattr(df, "empty", True):
             return
