@@ -1113,9 +1113,6 @@ class ScalpingRiskManager:
                     min_gap_pips,
                 )
 
-        if bool(settings.get("FLOW_TRAIL_AFTER_TP1", True)):
-            tp2_price = None
-
         return {
             "stop_loss": stop_loss,
             "take_profit": take_profit,
@@ -2288,24 +2285,23 @@ class ScalpingRiskManager:
         )
         tp1_partial = float(self.settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5))
         move_sl_to_be = bool(self.settings.get("FLOW_TP1_MOVE_SL_TO_BE", True))
-        trail_atr_mult = float(self.settings.get("FLOW_TRAIL_ATR_MULT", 2.0))
         decision_notes.append(
-            f"TP1 plan: {tp1_source} close {tp1_partial:.0%} at TP1; move SL to BE={move_sl_to_be}; trail {trail_atr_mult:.2f}x ATR after TP1."
+            f"TP1 plan: {tp1_source} close {tp1_partial:.0%} at TP1; move SL to BE={move_sl_to_be}; send TP2 server-side immediately after TP1 confirmation."
         )
-        tp_plan = "trail_after_tp1" if bool(self.settings.get("FLOW_TRAIL_AFTER_TP1", True)) else "single_tp"
-        if tp2_price is not None and tp_plan != "trail_after_tp1":
+        tp_plan = "single_tp"
+        if tp2_price is not None:
             tp_plan = "tp1_tp2"
         decision_notes.append(f"TP plan selected: {tp_plan}")
         tp_execution_mode = "SINGLE_TP"
         if tp1_partial > 0 and tp_plan != "single_tp":
-            tp_execution_mode = "VIRTUAL_FSM"
+            tp_execution_mode = "TP1_PARTIAL_MANAGED"
         elif tp1_partial > 0 and tp_plan == "single_tp":
             decision_notes.append("TP1 partial ignored: tp_plan=single_tp (no managed remainder).")
         decision_notes.append(f"TP execution mode: {tp_execution_mode}")
         if tp2_price is not None:
             self._logger.info("[NDS][TP2_PLAN] tp2=%.2f intent=runner optional=true", float(tp2_price))
         else:
-            skip_reason = "trail_after_tp1" if tp_plan == "trail_after_tp1" else "tp2_disabled"
+            skip_reason = "tp2_disabled"
             decision_notes.append(f"TP2 skipped: {skip_reason}")
 
         if stop_loss is None or take_profit is None:
@@ -2382,7 +2378,7 @@ class ScalpingRiskManager:
             rr_ratio_tp2 = tp2_pips_target / sl_pips
 
         scalping_mode = bool(analysis_payload.get("scalping_mode", True))
-        trail_after_tp1 = bool(self.settings.get("FLOW_TRAIL_AFTER_TP1", True))
+        trail_after_tp1 = False
         preserve_tp1 = bool(self.settings.get("SCALP_PRESERVE_TP1", False))
         if counter_trend and not reversal_ok:
             preserve_tp1 = True
@@ -2551,7 +2547,7 @@ class ScalpingRiskManager:
         if preserve_tp1 and rr_repair_mode == "LEGACY":
             rr_repair_mode = "TP2_ONLY"
 
-        tp2_available = tp2_price is not None or (trail_after_tp1 and tp2_pips_target > 0)
+        tp2_available = tp2_price is not None
         rr_eval = rr_ratio
         if rr_validate_mode == "TP2_ONLY":
             if not tp2_available:
@@ -2713,52 +2709,7 @@ class ScalpingRiskManager:
                 decision_notes.append("RR_REPAIR_SKIPPED mode=OFF")
             elif rr_repair_mode == "TP2_ONLY":
                 if tp2_price is None:
-                    if trail_after_tp1 and tp2_pips_target > 0 and rr_ratio_tp2 is not None:
-                        rr_target_buffer = float(
-                            risk_manager_config.get("RR_REPAIR_TARGET_BUFFER", max(rr_epsilon, 1e-4))
-                        )
-                        desired_rr = min_rr_effective + rr_target_buffer
-                        desired_tp2_pips = desired_rr * sl_pips
-                        max_tp_pips = float(
-                            risk_manager_config.get(
-                                "RR_REPAIR_MAX_TP_PIPS",
-                                max(tp_pips, float(self.settings.get("TP2_PIPS", tp_pips))),
-                            )
-                        )
-                        cap_reasons = []
-                        if desired_tp2_pips > max_tp_pips:
-                            cap_reasons.append(
-                                f"tp_pips_cap {desired_tp2_pips:.1f}>{max_tp_pips:.1f}"
-                            )
-                        if cap_reasons:
-                            decision_notes.append(
-                                f"RR_REPAIR_TP2_REJECT caps_exceeded={'|'.join(cap_reasons)}"
-                            )
-                            return _finalize(
-                                signal=signal,
-                                order_type='NONE',
-                                entry_price=entry_price,
-                                stop_loss=stop_loss,
-                                take_profit=take_profit,
-                                lot_size=0.0,
-                                risk_amount_usd=0.0,
-                                rr_ratio=rr_eval,
-                                deviation_pips=deviation_pips,
-                                decision_notes=decision_notes,
-                                is_trade_allowed=False,
-                                reject_reason="TP2 cap exceeded for RR repair.",
-                            )
-                        tp2_pips_target = desired_tp2_pips
-                        rr_ratio_tp2 = desired_rr
-                        rr_eval = desired_rr
-                        decision_notes.append(
-                            "RR_REPAIR_TP2 trail_after_tp1=true tp2_pips_target={:.1f} rr_tp2={:.2f}".format(
-                                tp2_pips_target,
-                                desired_rr,
-                            )
-                        )
-                    else:
-                        decision_notes.append("RR_REPAIR_TP2_SKIP tp2_missing")
+                    decision_notes.append("RR_REPAIR_TP2_SKIP tp2_missing")
                 else:
                     repaired_tp2, repair_source, repair_reject = self._attempt_rr_repair_tp2(
                         signal=signal,
@@ -3055,7 +3006,7 @@ class ScalpingRiskManager:
             tp_execution_mode=tp_execution_mode,
             tp1_virtual_trigger=tp1_virtual_trigger,
             calculated_take_profit=take_profit,
-            broker_take_profit=0.0 if tp_execution_mode == "VIRTUAL_FSM" else take_profit,
+            broker_take_profit=0.0 if tp_execution_mode == "TP1_PARTIAL_MANAGED" else take_profit,
         )
 
 
