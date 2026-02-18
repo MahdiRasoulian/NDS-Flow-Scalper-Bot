@@ -1,10 +1,25 @@
 # src/trading_bot/state.py
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from src.trading_bot.time_utils import parse_timestamp, to_utc_time
+
+
+def _utc_now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+def _normalize_utc(value: Any) -> Optional[datetime]:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None
+    return to_utc_time(parsed, time_mode="UTC")
+
 
 class BotState:
     """مدیریت وضعیت ربات"""
-    
+
     def __init__(self):
         self.running = True
         self.paused = False
@@ -13,7 +28,7 @@ class BotState:
         self.successful_trades = 0
         self.failed_trades = 0
         self.total_profit = 0.0
-        self.start_time = datetime.now()
+        self.start_time = _utc_now()
         self.last_analysis = None
         self.consecutive_losses = 0
         self.daily_pnl = 0.0
@@ -23,29 +38,39 @@ class BotState:
         self.last_trade_candle_time = None
         self.last_trade_direction = None
         self.active_signal_direction = None
-        
+
+    def set_last_analysis(self, value: Any) -> None:
+        self.last_analysis = _normalize_utc(value)
+
+    def set_last_trade_times(self, *, wall_time: Any = None, candle_time: Any = None) -> None:
+        if wall_time is not None:
+            normalized_wall = _normalize_utc(wall_time)
+            self.last_trade_wall_time = normalized_wall
+            self.last_trade_time = normalized_wall
+        if candle_time is not None:
+            self.last_trade_candle_time = _normalize_utc(candle_time)
+
     def add_trade(self, success: bool, profit: float = 0.0):
         """ثبت معامله"""
         self.trade_count += 1
-        self.last_trade_time = datetime.now()
-        self.last_trade_wall_time = self.last_trade_time
-        
+        self.set_last_trade_times(wall_time=_utc_now())
+
         if success:
             self.successful_trades += 1
         else:
             self.failed_trades += 1
             self.consecutive_losses += 1
-        
+
         self.daily_pnl += profit
         self.total_profit += profit
-        
+
         if success and self.consecutive_losses > 0:
             self.consecutive_losses = 0
-    
+
     def get_statistics(self) -> dict:
         """دریافت آمار ربات"""
-        runtime = datetime.now() - self.start_time
-        
+        runtime = _utc_now() - self.start_time
+
         stats = {
             'runtime_seconds': runtime.total_seconds(),
             'analysis_count': self.analysis_count,

@@ -1245,7 +1245,7 @@ class NDSBot:
             self.display_results(result)
 
             self.bot_state.analysis_count += 1
-            self.bot_state.last_analysis = datetime.now()
+            self.bot_state.set_last_analysis(datetime.now())
 
             open_positions = self._latest_open_positions or self.get_open_positions_info()
             pending_orders = self._latest_pending_orders or self.get_pending_orders_info()
@@ -1345,9 +1345,7 @@ class NDSBot:
                 if not ENABLE_DRY_RUN:
                     trade_success = self.execute_scalping_trade(result, df)
                     if trade_success:
-                        self.bot_state.last_trade_candle_time = df["time"].iloc[-1]
-                        self.bot_state.last_trade_wall_time = datetime.now()
-                        self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
+                        self.bot_state.set_last_trade_times(wall_time=datetime.now(), candle_time=df["time"].iloc[-1])
                         self.bot_state.last_trade_direction = final_signal
                         logger.info(f"✅ معامله ثبت شد")
                         self._maybe_monitor_trades(force=True)
@@ -2308,8 +2306,7 @@ class NDSBot:
                 self.bot_state.add_trade(success=True)
 
                 if df is None or df.empty:
-                    self.bot_state.last_trade_wall_time = datetime.now()
-                    self.bot_state.last_trade_time = self.bot_state.last_trade_wall_time
+                    self.bot_state.set_last_trade_times(wall_time=datetime.now())
                     self.bot_state.last_trade_direction = signal_data.get("signal")
 
                 if hasattr(self.risk_manager, "add_position"):

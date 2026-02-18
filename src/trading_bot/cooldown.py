@@ -6,6 +6,54 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from src.trading_bot.time_utils import parse_timestamp, to_utc_time
+
+
+def _normalize_utc(value: Any) -> Optional[datetime]:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None
+    # parse_timestamp returns UTC-aware for strings/epoch; keep explicit UTC normalization
+    return to_utc_time(parsed, time_mode="UTC")
+
+
+def _normalize_candle_times_to_utc(candle_times):
+    try:
+        import pandas as pd  # local import to keep module lightweight in non-pandas contexts
+
+        normalized = pd.to_datetime(candle_times, errors="coerce", utc=True)
+        return normalized
+    except Exception:
+        return candle_times
+
+
+def _normalize_open_positions_times(open_positions: List[Dict[str, Any]], signal: str) -> List[datetime]:
+    normalized: List[datetime] = []
+    for pos in open_positions:
+        if str(pos.get("side", "")).upper() != signal:
+            continue
+        ts = _normalize_utc(pos.get("open_time"))
+        if ts is not None:
+            normalized.append(ts)
+    return normalized
+
+
+def _iter_times(series_like):
+    if hasattr(series_like, "tolist"):
+        try:
+            return list(series_like.tolist())
+        except Exception:
+            pass
+    if hasattr(series_like, "_values"):
+        try:
+            return list(series_like._values)
+        except Exception:
+            pass
+    try:
+        return list(series_like)
+    except Exception:
+        return []
+
 
 @dataclass
 class CooldownDecision:
@@ -92,17 +140,14 @@ def evaluate_cooldown(
 
     last_trade_time = None
     if open_positions:
-        same_side_positions = [
-            pos for pos in open_positions if str(pos.get("side", "")).upper() == signal
-        ]
-        if same_side_positions:
-            last_trade_time = max(
-                (pos.get("open_time") for pos in same_side_positions if pos.get("open_time")),
-                default=None,
-            )
+        same_side_open_times = _normalize_open_positions_times(open_positions, signal)
+        if same_side_open_times:
+            last_trade_time = max(same_side_open_times)
 
     if last_trade_time is None and last_trade_direction == signal:
-        last_trade_time = last_trade_candle_time
+        last_trade_time = _normalize_utc(last_trade_candle_time)
+    else:
+        last_trade_time = _normalize_utc(last_trade_time)
 
     if not last_trade_time or min_candles_between <= 0:
         return CooldownDecision(
@@ -128,9 +173,28 @@ def evaluate_cooldown(
             },
         )
 
-    candle_times = df["time"]
-    candles_passed = int((candle_times > last_trade_time).sum())
-    current_bar_time = candle_times.iloc[-1]
+    candle_times = _normalize_candle_times_to_utc(df["time"])
+    if last_trade_time is None:
+        return CooldownDecision(
+            True,
+            "NO_COOLDOWN",
+            {
+                "signal": signal,
+                "last_trade_bar": None,
+                "min_candles": min_candles_between,
+                "exposure_bias": exposure_bias,
+                "note": "last_trade_time_unparseable",
+            },
+        )
+
+    try:
+        candles_passed = int((candle_times > last_trade_time).sum())
+        current_bar_time = candle_times.iloc[-1]
+    except TypeError:
+        normalized_times = [_normalize_utc(ts) for ts in _iter_times(candle_times)]
+        normalized_times = [ts for ts in normalized_times if ts is not None]
+        candles_passed = int(sum(1 for ts in normalized_times if ts > last_trade_time))
+        current_bar_time = normalized_times[-1] if normalized_times else None
     if candles_passed < min_candles_between:
         return CooldownDecision(
             False,
