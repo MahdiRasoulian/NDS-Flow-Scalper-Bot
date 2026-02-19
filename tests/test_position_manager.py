@@ -24,8 +24,10 @@ class DummyTradeTracker:
         self.active_trades = {
             101: {"open_event": {"metadata": metadata}},
         }
+        self.partial_calls = []
 
-    def register_partial_close(self, **_kwargs):
+    def register_partial_close(self, **kwargs):
+        self.partial_calls.append(kwargs)
         return None
 
 
@@ -64,7 +66,8 @@ def test_tp1_partial_close_and_tp2_set():
         },
     }
     mt5 = DummyMT5()
-    manager = PositionManager(config, mt5, trade_tracker=DummyTradeTracker(metadata))
+    tracker = DummyTradeTracker(metadata)
+    manager = PositionManager(config, mt5, trade_tracker=tracker)
     open_positions = [
         {
             "position_ticket": 101,
@@ -89,6 +92,7 @@ def test_tp1_partial_close_and_tp2_set():
     assert mt5.closed[0]["volume"] == 0.5
     assert any(call["new_tp"] == 2010.0 for call in mt5.modified)
     assert any(call["new_sl"] == 2000.0 for call in mt5.modified)
+    assert tracker.partial_calls and tracker.partial_calls[0]["position_ticket"] == 101
 
 
 def test_tp1_partial_close_only_once():

@@ -180,6 +180,7 @@ class PositionManager:
             if not self._partial_close(plan):
                 return False
             plan.partial_closed = True
+            self._record_partial_close(plan)
 
         if not plan.sl_moved_to_be:
             new_sl = self._compute_sl_to_be(plan)
@@ -192,6 +193,27 @@ class PositionManager:
             return False
 
         return True
+
+    def _record_partial_close(self, plan: PositionPlan) -> None:
+        if self.trade_tracker is None:
+            return
+        register = getattr(self.trade_tracker, "register_partial_close", None)
+        if not callable(register):
+            return
+        constraints = self._resolve_volume_constraints(plan.symbol)
+        lot_step = constraints["lot_step"]
+        requested_volume = max(plan.volume * 0.5, 0.0)
+        close_volume = self._floor_to_step(requested_volume, lot_step)
+        remaining_volume = self._floor_to_step(max(plan.volume - close_volume, 0.0), lot_step)
+        try:
+            register(
+                position_ticket=plan.ticket,
+                volume_closed=float(close_volume),
+                remaining_volume=float(remaining_volume),
+                reason="TP1_PARTIAL",
+            )
+        except Exception:
+            self._logger.exception("[PM][PARTIAL_META_FAIL] ticket=%s", plan.ticket)
 
     def _clear_broker_tp(self, plan: PositionPlan) -> None:
         self._modify_position(plan.ticket, new_tp=0.0, context="CLEAR_BROKER_TP")

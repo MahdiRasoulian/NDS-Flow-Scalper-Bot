@@ -206,6 +206,27 @@ def test_emit_position_closed_event_duration_never_negative(monkeypatch):
     assert event["metadata"]["duration_sec"] == 0.0
 
 
+def test_emit_position_closed_event_classifies_tp1_from_partial_metadata(monkeypatch):
+    bot, _reported_events = _build_bot(monkeypatch)
+    record = _sample_record()
+
+    event = bot._emit_position_closed_event(
+        position_ticket=9001,
+        record=record,
+        history={
+            "exit_price": 2008.9,
+            "total_profit": 70.0,
+            "close_time": datetime.utcnow(),
+            "reason": "Manual/Other",
+        },
+        now=datetime.utcnow(),
+        symbol_fallback="XAUUSD",
+        close_status="CLOSE",
+    )
+
+    assert event["metadata"]["tp_level_hit"] == "TP1"
+
+
 def test_generate_execution_report_close_unknown_sets_closed_status(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
