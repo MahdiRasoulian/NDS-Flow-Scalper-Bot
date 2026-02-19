@@ -86,19 +86,40 @@ class PositionManager:
         risk_plan = metadata.get("risk_plan") if isinstance(metadata.get("risk_plan"), dict) else {}
         entry_risk = ((metadata.get("entry_snapshot") or {}).get("risk") or {}) if isinstance(metadata, dict) else {}
 
+        broker_tp = position.get("tp")
         tp1 = (
             risk_plan.get("tp1_price")
             or metadata.get("tp1_price")
             or entry_risk.get("tp1")
-            or position.get("tp")
         )
         tp2 = (
             risk_plan.get("tp2_price")
             or metadata.get("tp2_price")
             or entry_risk.get("tp2")
         )
+        risk_settings = self.config.get("risk_settings", {}) if isinstance(self.config, dict) else {}
+        tp2_enabled = bool(risk_settings.get("TP2_ENABLED", True))
+
+        # Broker TP can be TP2 when running TP1-partial managed mode.
+        # Never assume broker TP == TP1 when TP2 strategy is enabled and
+        # tracker metadata is temporarily unavailable.
+        if tp1 is None and broker_tp is not None:
+            if tp2_enabled and tp2 is None:
+                tp2 = broker_tp
+                self._logger.info(
+                    "[PM][PLAN_HINT] ticket=%s broker_tp_assigned=tp2 value=%.2f",
+                    position.get("position_ticket"),
+                    float(broker_tp),
+                )
+            else:
+                tp1 = broker_tp
+                self._logger.info(
+                    "[PM][PLAN_HINT] ticket=%s broker_tp_assigned=tp1 value=%.2f",
+                    position.get("position_ticket"),
+                    float(broker_tp),
+                )
+
         if tp1 is None or tp2 is None:
-            risk_settings = self.config.get("risk_settings", {}) if isinstance(self.config, dict) else {}
             point_size = self._resolve_point_size()
             entry = float(position.get("entry_price") or 0.0)
             side = str(position.get("side") or "BUY").upper()
@@ -297,6 +318,7 @@ class PositionManager:
             float(lot_step),
         )
 
+        self._logger.info("[PM][PARTIAL_CLOSE_ATTEMPT] ticket=%s volume=%.3f", plan.ticket, close_volume)
         result = self._call_mt5("close_position", ticket=plan.ticket, volume=close_volume)
         ok = bool(result and result.get("success"))
         if ok:
@@ -337,8 +359,9 @@ class PositionManager:
         return plan.entry_price - offset
 
     def _crossed_tp1(self, plan: PositionPlan, price: float) -> bool:
-        return (plan.direction == "BUY" and price >= plan.tp1_price) or (
-            plan.direction == "SELL" and price <= plan.tp1_price
+        eps = max(self._resolve_point_size() * 0.2, 1e-6)
+        return (plan.direction == "BUY" and price >= (plan.tp1_price - eps)) or (
+            plan.direction == "SELL" and price <= (plan.tp1_price + eps)
         )
 
     def _crossed_tp2(self, plan: PositionPlan, price: float) -> bool:
