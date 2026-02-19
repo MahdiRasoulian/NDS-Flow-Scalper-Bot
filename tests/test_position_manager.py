@@ -273,3 +273,38 @@ def test_tp1_flow_without_register_partial_close_hook():
     manager.manage_positions(open_positions)
 
     assert mt5.closed and mt5.closed[0]["volume"] == 0.3
+
+
+def test_plan_does_not_treat_broker_tp2_as_tp1_when_metadata_missing():
+    config = {
+        "risk_settings": {"TP2_ENABLED": True, "TP1_PIPS": 40.0, "TP2_PIPS": 110.0},
+        "flow_settings": {
+            "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
+            "FLOW_TP1_MOVE_SL_TO_BE": True,
+            "FLOW_TRAIL_AFTER_TP1": False,
+        },
+        "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01, "POINT": 0.01}},
+    }
+    mt5 = DummyMT5()
+    manager = PositionManager(config, mt5, trade_tracker=DummyTradeTracker({}))
+    open_positions = [{
+        "position_ticket": 101,
+        "symbol": "XAUUSD",
+        "side": "BUY",
+        "volume": 1.0,
+        "entry_price": 4990.4,
+        "current_price": 4994.5,
+        "sl": 4986.0,
+        "tp": 5001.4,
+        "profit": 0.0,
+        "magic": 0,
+        "comment": "",
+        "open_time": datetime.utcnow(),
+        "update_time": datetime.utcnow(),
+    }]
+
+    manager.manage_positions(open_positions)
+
+    # TP1 should be synthesized at +40 pips (= +4.0 price) even when broker TP is TP2.
+    assert mt5.closed, "Expected TP1 partial close around 4994.4"
+    assert any(call["new_tp"] == 5001.4 for call in mt5.modified)
