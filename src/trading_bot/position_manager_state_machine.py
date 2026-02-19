@@ -177,9 +177,11 @@ class PositionManager:
     def _secure_at_tp1(self, plan: PositionPlan) -> bool:
         self._logger.info("[PM][TP1_DETECTED] ticket=%s", plan.ticket)
         if not plan.partial_closed:
-            if not self._partial_close(plan):
+            partial_result = self._partial_close(plan)
+            if not partial_result:
                 return False
             plan.partial_closed = True
+            self._record_partial_close(plan, partial_result)
 
         if not plan.sl_moved_to_be:
             new_sl = self._compute_sl_to_be(plan)
@@ -192,6 +194,24 @@ class PositionManager:
             return False
 
         return True
+
+    def _record_partial_close(self, plan: PositionPlan, partial_result: Dict[str, float]) -> None:
+        if self.trade_tracker is None:
+            return
+        register = getattr(self.trade_tracker, "register_partial_close", None)
+        if not callable(register):
+            return
+        close_volume = float(partial_result.get("close_volume") or 0.0)
+        remaining_volume = float(partial_result.get("remaining_volume") or 0.0)
+        try:
+            register(
+                position_ticket=plan.ticket,
+                volume_closed=float(close_volume),
+                remaining_volume=float(remaining_volume),
+                reason="TP1_PARTIAL",
+            )
+        except Exception:
+            self._logger.exception("[PM][PARTIAL_META_FAIL] ticket=%s", plan.ticket)
 
     def _clear_broker_tp(self, plan: PositionPlan) -> None:
         self._modify_position(plan.ticket, new_tp=0.0, context="CLEAR_BROKER_TP")
@@ -226,18 +246,23 @@ class PositionManager:
             "lot_step": lot_step,
         }
 
-    def _partial_close(self, plan: PositionPlan) -> bool:
+    def _resolve_partial_close_pct(self) -> float:
+        flow_settings = self.config.get("flow_settings", {}) if isinstance(self.config, dict) else {}
+        pct = float(flow_settings.get("FLOW_TP1_PARTIAL_CLOSE_PCT", 0.5) or 0.5)
+        return min(max(pct, 0.0), 1.0)
+
+    def _partial_close(self, plan: PositionPlan) -> Optional[Dict[str, float]]:
         constraints = self._resolve_volume_constraints(plan.symbol)
         lot_step = constraints["lot_step"]
         min_volume = constraints["min_volume"]
 
-        requested_volume = max(plan.volume * 0.5, 0.0)
+        requested_volume = max(plan.volume * self._resolve_partial_close_pct(), 0.0)
         close_volume = self._floor_to_step(requested_volume, lot_step)
         remaining_volume = self._floor_to_step(plan.volume - close_volume, lot_step)
 
         if close_volume <= 0:
             self._logger.error("[PM][partial_close_request] ticket=%s invalid_volume=%.4f", plan.ticket, close_volume)
-            return False
+            return None
 
         if remaining_volume < min_volume:
             close_volume = self._floor_to_step(plan.volume, lot_step)
@@ -249,7 +274,7 @@ class PositionManager:
                     close_volume,
                     min_volume,
                 )
-                return False
+                return None
 
         if close_volume < min_volume and remaining_volume > 0:
             self._logger.warning(
@@ -259,7 +284,7 @@ class PositionManager:
                 min_volume,
                 remaining_volume,
             )
-            return False
+            return None
 
         self._logger.info(
             "[PM][partial_close_request] ticket=%s position_volume=%.4f requested=%.4f close=%.4f remaining=%.4f min=%.4f step=%.4f",
@@ -276,11 +301,15 @@ class PositionManager:
         ok = bool(result and result.get("success"))
         if ok:
             self._logger.info("[PM][PARTIAL_CLOSE_CONFIRMED] ticket=%s volume=%.3f", plan.ticket, close_volume)
+            return {
+                "close_volume": float(close_volume),
+                "remaining_volume": float(remaining_volume),
+            }
         else:
             self._logger.warning("[PM][PARTIAL_CLOSE_FAIL] ticket=%s result=%s", plan.ticket, result)
             self._logger.warning("[NDS][TP1_PARTIAL_FAIL] ticket=%s result=%s", plan.ticket, result)
             self._logger.warning("[NDS][SL_BE_FAIL] ticket=%s result=%s", plan.ticket, result)
-        return ok
+        return None
 
     def _modify_sl(self, plan: PositionPlan, new_sl: float) -> bool:
         result = self._modify_position(plan.ticket, new_sl=new_sl, context="MODIFY_SL")
