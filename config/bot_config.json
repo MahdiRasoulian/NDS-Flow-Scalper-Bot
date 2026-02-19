@@ -32,7 +32,7 @@
     "SL_MAX_PIPS": 300.0,
     "SL_MAX_PIPS_SCALP": 300.0,
     "SL_MODEL_SCALP": "LEGACY",
-    "TP1_PIPS": 65.0,
+    "TP1_PIPS": 40.0,
     "TP2_ENABLED": true,
     "TP2_PIPS": 110.0,
     "COUNTERTREND_MIN_RR": 0.8,
