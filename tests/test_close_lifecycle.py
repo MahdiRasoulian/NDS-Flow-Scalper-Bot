@@ -227,6 +227,50 @@ def test_emit_position_closed_event_classifies_tp1_from_partial_metadata(monkeyp
     assert event["metadata"]["tp_level_hit"] == "TP1"
 
 
+def test_emit_position_closed_event_sl_precedence_over_partial_metadata(monkeypatch):
+    bot, _reported_events = _build_bot(monkeypatch)
+    record = _sample_record()
+
+    event = bot._emit_position_closed_event(
+        position_ticket=9001,
+        record=record,
+        history={
+            "exit_price": 1990.0,
+            "total_profit": -30.0,
+            "close_time": datetime.utcnow(),
+            "reason": "SL",
+        },
+        now=datetime.utcnow(),
+        symbol_fallback="XAUUSD",
+        close_status="CLOSE",
+    )
+
+    assert event["metadata"]["tp_level_hit"] == "SL"
+
+
+def test_emit_position_closed_event_coerces_string_price_metadata(monkeypatch):
+    bot, _reported_events = _build_bot(monkeypatch)
+    record = _sample_record()
+    record["open_event"]["metadata"]["tp1_price"] = "2005.0"
+    record["open_event"]["metadata"]["tp2_price"] = "2010.0"
+
+    event = bot._emit_position_closed_event(
+        position_ticket=9001,
+        record=record,
+        history={
+            "exit_price": 2010.0,
+            "total_profit": 100.0,
+            "close_time": datetime.utcnow(),
+            "reason": "TP",
+        },
+        now=datetime.utcnow(),
+        symbol_fallback="XAUUSD",
+        close_status="CLOSE",
+    )
+
+    assert event["metadata"]["tp_level_hit"] == "TP2"
+
+
 def test_generate_execution_report_close_unknown_sets_closed_status(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 

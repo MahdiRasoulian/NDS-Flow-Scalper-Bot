@@ -609,8 +609,22 @@ class NDSBot:
         side: Optional[str] = None,
         partial_close_count: Optional[int] = None,
     ) -> str:
+        def _coerce_price(value: Optional[float]) -> Optional[float]:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         if exit_price is None:
             return "UNKNOWN"
+        exit_px = _coerce_price(exit_price)
+        if exit_px is None:
+            return "UNKNOWN"
+        tp1_px = _coerce_price(tp1_price)
+        tp2_px = _coerce_price(tp2_price)
+        sl_px = _coerce_price(sl_price)
         reason_lower = str(reason or "").lower()
         if "trail" in reason_lower:
             return "TRAIL"
@@ -619,23 +633,23 @@ class NDSBot:
         tolerance = max(point_size * 2.0, 0.01)
         side_norm = str(side or "").upper()
 
-        if tp2_price and side_norm == "BUY" and exit_price >= (float(tp2_price) - tolerance):
+        if tp2_px is not None and side_norm == "BUY" and exit_px >= (tp2_px - tolerance):
             return "TP2"
-        if tp2_price and side_norm == "SELL" and exit_price <= (float(tp2_price) + tolerance):
+        if tp2_px is not None and side_norm == "SELL" and exit_px <= (tp2_px + tolerance):
             return "TP2"
-        if tp1_price and side_norm == "BUY" and exit_price >= (float(tp1_price) - tolerance):
+        if tp1_px is not None and side_norm == "BUY" and exit_px >= (tp1_px - tolerance):
             return "TP1"
-        if tp1_price and side_norm == "SELL" and exit_price <= (float(tp1_price) + tolerance):
+        if tp1_px is not None and side_norm == "SELL" and exit_px <= (tp1_px + tolerance):
             return "TP1"
 
-        if tp2_price and abs(exit_price - tp2_price) <= tolerance:
+        if tp2_px is not None and abs(exit_px - tp2_px) <= tolerance:
             return "TP2"
-        if tp1_price and abs(exit_price - tp1_price) <= tolerance:
+        if tp1_px is not None and abs(exit_px - tp1_px) <= tolerance:
             return "TP1"
+        if sl_px is not None and abs(exit_px - sl_px) <= tolerance:
+            return "SL"
         if partial_close_count and int(partial_close_count) > 0:
             return "TP1"
-        if sl_price and abs(exit_price - sl_price) <= tolerance:
-            return "SL"
         if "tp" in reason_lower or "take" in reason_lower:
             return "TP"
         return "UNKNOWN"

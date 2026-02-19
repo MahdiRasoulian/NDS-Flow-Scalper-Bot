@@ -47,6 +47,12 @@ class FailingMT5:
         return {"success": False, **payload}
 
 
+class DummyTradeTrackerNoPartial:
+    def __init__(self, metadata):
+        self.active_trades = {
+            101: {"open_event": {"metadata": metadata}},
+        }
+
 def test_tp1_partial_close_and_tp2_set():
     config = {
         "risk_settings": {"TP2_ENABLED": True},
@@ -217,3 +223,53 @@ def test_fallback_plan_synthesizes_tp_targets():
     manager.manage_positions(open_positions)
 
     assert mt5.closed, "Expected TP1 partial close even with synthesized plan"
+
+
+def test_partial_close_metadata_matches_full_close_fallback():
+    config = {
+        "risk_settings": {"TP2_ENABLED": True},
+        "flow_settings": {
+            "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.5,
+            "FLOW_TP1_MOVE_SL_TO_BE": True,
+            "FLOW_TRAIL_AFTER_TP1": False,
+        },
+        "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.02, "LOT_STEP": 0.01}},
+    }
+    metadata = {"tp1_price": 2005.0, "tp2_price": 2010.0}
+    mt5 = DummyMT5()
+    tracker = DummyTradeTracker(metadata)
+    manager = PositionManager(config, mt5, trade_tracker=tracker)
+    open_positions = [{
+        "position_ticket": 101, "symbol": "XAUUSD", "side": "BUY", "volume": 0.02,
+        "entry_price": 2000.0, "current_price": 2005.0, "sl": 1995.0, "tp": 0.0,
+        "profit": 0.0, "magic": 0, "comment": "", "open_time": datetime.utcnow(), "update_time": datetime.utcnow(),
+    }]
+
+    manager.manage_positions(open_positions)
+
+    assert mt5.closed and mt5.closed[0]["volume"] == 0.02
+    assert tracker.partial_calls and tracker.partial_calls[0]["remaining_volume"] == 0.0
+
+
+def test_tp1_flow_without_register_partial_close_hook():
+    config = {
+        "risk_settings": {"TP2_ENABLED": True},
+        "flow_settings": {
+            "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.3,
+            "FLOW_TP1_MOVE_SL_TO_BE": True,
+            "FLOW_TRAIL_AFTER_TP1": False,
+        },
+        "trading_settings": {"GOLD_SPECIFICATIONS": {"MIN_LOT": 0.01, "LOT_STEP": 0.01}},
+    }
+    metadata = {"tp1_price": 2005.0, "tp2_price": 2010.0}
+    mt5 = DummyMT5()
+    manager = PositionManager(config, mt5, trade_tracker=DummyTradeTrackerNoPartial(metadata))
+    open_positions = [{
+        "position_ticket": 101, "symbol": "XAUUSD", "side": "BUY", "volume": 1.0,
+        "entry_price": 2000.0, "current_price": 2005.0, "sl": 1995.0, "tp": 0.0,
+        "profit": 0.0, "magic": 0, "comment": "", "open_time": datetime.utcnow(), "update_time": datetime.utcnow(),
+    }]
+
+    manager.manage_positions(open_positions)
+
+    assert mt5.closed and mt5.closed[0]["volume"] == 0.3
