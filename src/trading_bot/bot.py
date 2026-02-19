@@ -606,6 +606,8 @@ class NDSBot:
         tp2_price: Optional[float],
         sl_price: Optional[float],
         point_size: float,
+        side: Optional[str] = None,
+        partial_close_count: Optional[int] = None,
     ) -> str:
         if exit_price is None:
             return "UNKNOWN"
@@ -615,9 +617,22 @@ class NDSBot:
         if "sl" in reason_lower or "stop" in reason_lower:
             return "SL"
         tolerance = max(point_size * 2.0, 0.01)
+        side_norm = str(side or "").upper()
+
+        if tp2_price and side_norm == "BUY" and exit_price >= (float(tp2_price) - tolerance):
+            return "TP2"
+        if tp2_price and side_norm == "SELL" and exit_price <= (float(tp2_price) + tolerance):
+            return "TP2"
+        if tp1_price and side_norm == "BUY" and exit_price >= (float(tp1_price) - tolerance):
+            return "TP1"
+        if tp1_price and side_norm == "SELL" and exit_price <= (float(tp1_price) + tolerance):
+            return "TP1"
+
         if tp2_price and abs(exit_price - tp2_price) <= tolerance:
             return "TP2"
         if tp1_price and abs(exit_price - tp1_price) <= tolerance:
+            return "TP1"
+        if partial_close_count and int(partial_close_count) > 0:
             return "TP1"
         if sl_price and abs(exit_price - sl_price) <= tolerance:
             return "SL"
@@ -789,6 +804,8 @@ class NDSBot:
             tp2_price=tp2_price,
             sl_price=open_event.get("sl"),
             point_size=float(point_size or 0.01),
+            side=side,
+            partial_close_count=open_metadata.get("partial_close_count"),
         )
         close_metadata = self._build_close_metadata(
             open_metadata=open_metadata,
