@@ -2281,13 +2281,9 @@ class NDSBot:
                 float(finalized.entry_price),
             )
 
-            if str(order_type).lower() == "stop" and str(signal_data.get("force_order_type") or "").lower() != "market":
-                staged = self._stage_breakout_watch(signal_data, finalized)
-                if staged:
-                    logger.info("[BREAKOUT_WATCH][ARMED] direction=%s trigger=%.2f", signal_data.get("signal"), float(finalized.entry_price))
-                    return True
-                logger.warning("[BREAKOUT_WATCH][FALLBACK] staging_failed -> market_order")
-                order_type = "market"
+            if str(order_type).lower() == "stop":
+                logger.error("[EXEC][ORDER_TYPE_ERROR] STOP intent is disabled in live deterministic mode")
+                return False
 
             logger.info(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر: {signal_data['signal']} {lot_size:.3f} لات")
             print(f"📤 ارسال سفارش اسکلپینگ ({order_type}) به بروکر...")
@@ -2328,25 +2324,8 @@ class NDSBot:
                         comment=order_comment,
                     )
             elif str(order_type).lower() == "stop":
-                logger.warning("[BREAKOUT_WATCH][UNEXPECTED] stop_order_requested_after_refactor; forcing_market")
-                if hasattr(self.mt5_client, "send_order_real_time"):
-                    order_result = self.mt5_client.send_order_real_time(
-                        symbol=SYMBOL,
-                        order_type=signal_data["signal"],
-                        volume=lot_size,
-                        sl_price=finalized.stop_loss,
-                        tp_price=tp_sent_to_broker,
-                        comment=order_comment,
-                    )
-                else:
-                    order_result = self.mt5_client.send_order(
-                        symbol=SYMBOL,
-                        order_type=signal_data["signal"],
-                        volume=lot_size,
-                        stop_loss=finalized.stop_loss,
-                        take_profit=tp_sent_to_broker,
-                        comment=order_comment,
-                    )
+                logger.error("[EXEC][ORDER_TYPE_ERROR] STOP intent reached broker router")
+                return False
             else:
                 # Limit/Pending
                 limit_order_type = f"{signal_data['signal']}_LIMIT"  # BUY_LIMIT / SELL_LIMIT
@@ -2954,11 +2933,11 @@ class NDSBot:
                     self._emit_position_closed_event(
                         position_ticket=position_ticket,
                         record=record,
-                        history={"reason": "HistoryTimeout/Unknown"},
+                        history={"reason": "RECONCILE_HISTORY_TIMEOUT"},
                         now=now,
                         symbol_fallback=SYMBOL,
                         close_status="CLOSE_UNKNOWN",
-                        close_reason="HistoryTimeout/Unknown",
+                        close_reason="RECONCILE_HISTORY_TIMEOUT",
                     )
                 logger.warning(
                     "[CLOSE_PENDING_TIMEOUT] count=%s reason=history_not_available",
