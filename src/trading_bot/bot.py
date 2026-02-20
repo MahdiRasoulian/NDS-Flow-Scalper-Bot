@@ -595,7 +595,10 @@ class NDSBot:
         if broker_tp is not None:
             return float(broker_tp), "risk_manager_override"
 
-        return float(finalized.take_profit), "single_tp"
+        if tp2_price is not None:
+            return float(tp2_price), "tp2_fallback"
+
+        return 0.0, "sl_only_internal_tp"
 
     @staticmethod
     def _resolve_tp_level_hit(

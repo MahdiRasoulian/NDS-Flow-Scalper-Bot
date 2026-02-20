@@ -305,10 +305,10 @@ class RiskEngine:
             sl_pips=sl_pips,
             tp1_pips=tp1_pips,
             tp2_pips=tp2_pips,
-            tp_execution_mode="TP1_PARTIAL_MANAGED" if tp2 is not None else "TP1_ONLY",
+            tp_execution_mode="TP1_PARTIAL_MANAGED" if tp2 is not None else "TP1_INTERNAL_ONLY",
             tp1_virtual_trigger=False,
             calculated_take_profit=take_profit,
-            broker_take_profit=0.0 if tp2 is not None else take_profit,
+            broker_take_profit=0.0 if tp2 is None else float(tp2),
         )
 
 
@@ -382,6 +382,21 @@ class ScalpingRiskManager:
 
     def _normalize_analysis_payload(self, analysis: Union[AnalysisResult, Dict[str, Any]]) -> Dict[str, Any]:
         return dict(analysis) if isinstance(analysis, dict) else asdict(analysis)
+
+    def _sanitize_analyzer_payload(self, analysis_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Enforce analyzer/risk boundary: analyzer cannot provide executable SL/TP/size."""
+        sanitized = dict(analysis_payload or {})
+        dropped_keys: List[str] = []
+        for key in ("stop_loss", "take_profit", "take_profit2", "tp2", "lot", "lot_size", "volume"):
+            if sanitized.get(key) is not None:
+                dropped_keys.append(key)
+            sanitized.pop(key, None)
+        if dropped_keys:
+            self._logger.info(
+                "[RISK][SANITIZE_ANALYZER] dropped=%s reason=analyzer_must_not_define_execution_levels",
+                dropped_keys,
+            )
+        return sanitized
 
     def _resolve_adx_from_signal(self, signal_data: Optional[Dict[str, Any]]) -> Tuple[float, str]:
         if not isinstance(signal_data, dict):
@@ -485,7 +500,7 @@ class ScalpingRiskManager:
         symbol: str,
         config: Dict[str, Any],
     ) -> FinalizedOrderParams:
-        analysis_payload = self._normalize_analysis_payload(analysis)
+        analysis_payload = self._sanitize_analyzer_payload(self._normalize_analysis_payload(analysis))
         live_payload = live if isinstance(live, dict) else asdict(live)
 
         signal = str(analysis_payload.get("signal") or "NONE").upper()
