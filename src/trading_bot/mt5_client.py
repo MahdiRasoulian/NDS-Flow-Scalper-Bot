@@ -17,6 +17,7 @@ import queue
 from collections import deque
 from decimal import Decimal
 from contextlib import nullcontext
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
@@ -437,10 +438,41 @@ class MT5Client:
     def sanitize_mt5_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         sanitized: Dict[str, Any] = {}
         for key, value in request.items():
+            key_name = str(key)
+            if key_name == "comment":
+                sanitized[key_name] = self._sanitize_mt5_comment(value)
+                continue
             if value is None:
                 continue
-            sanitized[str(key)] = self._to_native_value(value)
+            sanitized[key_name] = self._to_native_value(value)
+
+        if "comment" not in sanitized:
+            sanitized["comment"] = self._sanitize_mt5_comment(None)
         return sanitized
+
+    def _sanitize_mt5_comment(self, comment: Any) -> str:
+        """Normalize request comments to MT5-safe ASCII (max 31 chars)."""
+        if comment is None:
+            text = ""
+        elif isinstance(comment, bytes):
+            text = comment.decode("utf-8", errors="ignore")
+        else:
+            native_comment = self._to_native_value(comment)
+            text = native_comment if isinstance(native_comment, str) else str(native_comment)
+
+        stripped = text.strip()
+        if stripped.lower() in {"", "none", "nan", "null"}:
+            stripped = "NDS_SCALP"
+
+        normalized = unicodedata.normalize("NFKD", stripped)
+        ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+        printable_ascii = "".join(ch for ch in ascii_only if 32 <= ord(ch) <= 126)
+        compact = " ".join(printable_ascii.split())
+
+        if not compact:
+            compact = "NDS_SCALP"
+
+        return compact[:31]
 
     def build_order_request(
         self,
