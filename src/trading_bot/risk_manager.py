@@ -150,11 +150,51 @@ class RiskEngine:
         return float(sl_pips), float(tp1_pips), float(rr)
 
     @staticmethod
-    def validate_rr(*, rr: float, min_rr: float, sl_pips: float, tp1_pips: float) -> Tuple[bool, str]:
+    def compute_rr_metrics(
+        *,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        take_profit2: Optional[float],
+        point_size: float,
+        tp2_enabled: bool,
+    ) -> Dict[str, float]:
+        sl_pips, tp1_pips, rr_tp1 = RiskEngine.compute_rr(
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            point_size=point_size,
+        )
+        tp2_pips = 0.0
+        rr_tp2 = 0.0
+        if tp2_enabled and take_profit2 is not None:
+            tp2_pips = abs(float(take_profit2) - float(entry_price)) / float(point_size)
+            rr_tp2 = (tp2_pips / sl_pips) if sl_pips > 0 else 0.0
+
+        use_tp2_for_rr = tp2_enabled and take_profit2 is not None
+        rr_checked = "TP2" if use_tp2_for_rr else "TP1"
+        rr_validate_mode = "TP2_ENABLED" if use_tp2_for_rr else "TP1_ONLY"
+        rr_used = rr_tp2 if use_tp2_for_rr else rr_tp1
+        tp_checked_pips = tp2_pips if use_tp2_for_rr else tp1_pips
+
+        return {
+            "sl_pips": float(sl_pips),
+            "tp1_pips": float(tp1_pips),
+            "tp2_pips": float(tp2_pips),
+            "rr_tp1": float(rr_tp1),
+            "rr_tp2": float(rr_tp2),
+            "rr_used": float(rr_used),
+            "rr_checked": rr_checked,
+            "rr_validate_mode": rr_validate_mode,
+            "tp_checked_pips": float(tp_checked_pips),
+        }
+
+    @staticmethod
+    def validate_rr(*, rr: float, min_rr: float, sl_pips: float, tp_checked_pips: float, rr_checked: str) -> Tuple[bool, str]:
         if sl_pips <= 0:
             return False, "SL distance must be positive."
-        if tp1_pips <= 0:
-            return False, "TP1 distance must be positive."
+        if tp_checked_pips <= 0:
+            return False, f"{rr_checked} distance must be positive."
         if rr < min_rr:
             return False, f"RR ratio below minimum ({rr:.4f} < {min_rr:.4f})."
         return True, "ok"
@@ -229,6 +269,10 @@ class RiskEngine:
         tp1_pips: float,
         tp2_pips: float,
         min_rr: float,
+        rr_tp1: Optional[float] = None,
+        rr_tp2: Optional[float] = None,
+        rr_checked: str = "TP1",
+        rr_validate_mode: str = "TP1_ONLY",
     ) -> FinalizedOrderParams:
         return FinalizedOrderParams(
             signal=signal,
@@ -252,10 +296,10 @@ class RiskEngine:
             final_sl=stop_loss,
             final_tp=take_profit,
             lot=lot_size,
-            rr_tp1=rr_ratio,
-            rr_tp2=None,
-            rr_checked="TP1",
-            rr_validate_mode="TP1",
+            rr_tp1=rr_ratio if rr_tp1 is None else rr_tp1,
+            rr_tp2=rr_tp2,
+            rr_checked=rr_checked,
+            rr_validate_mode=rr_validate_mode,
             min_rr_effective=min_rr,
             min_rr_source="risk_settings.MIN_RR_RATIO",
             sl_pips=sl_pips,
@@ -530,6 +574,34 @@ class ScalpingRiskManager:
             sl=float(geometry.stop_loss),
             tp1=float(geometry.take_profit),
         )
+        if geometry.take_profit2 is not None:
+            tp2_further = (
+                float(geometry.take_profit2) > float(geometry.take_profit)
+                if signal == "BUY"
+                else float(geometry.take_profit2) < float(geometry.take_profit)
+            )
+            if not tp2_further:
+                return engine.build_decision(
+                    signal=signal,
+                    order_type="NONE",
+                    symbol=symbol,
+                    entry_price=geometry.entry_price,
+                    stop_loss=geometry.stop_loss,
+                    take_profit=geometry.take_profit,
+                    lot_size=0.0,
+                    risk_amount_usd=0.0,
+                    rr_ratio=0.0,
+                    deviation_pips=deviation_pips,
+                    decision_notes=["TP2 must be further than TP1."],
+                    is_trade_allowed=False,
+                    reject_reason="TP2 must be further than TP1.",
+                    tp2=geometry.take_profit2,
+                    sl_pips=geometry.sl_pips,
+                    tp1_pips=geometry.tp1_pips,
+                    tp2_pips=geometry.tp2_pips,
+                    min_rr=float(self.settings.get("MIN_RR_RATIO", self.settings.get("MIN_RISK_REWARD", 1.0)) or 1.0),
+                )
+
         if not inv_ok:
             return engine.build_decision(
                 signal=signal,
@@ -552,14 +624,45 @@ class ScalpingRiskManager:
                 min_rr=float(self.settings.get("MIN_RR_RATIO", self.settings.get("MIN_RISK_REWARD", 1.0)) or 1.0),
             )
 
-        sl_pips, tp1_pips, rr = engine.compute_rr(
+        tp2_enabled = bool(self.settings.get("TP2_ENABLED", True))
+        rr_metrics = engine.compute_rr_metrics(
             entry_price=geometry.entry_price,
             stop_loss=geometry.stop_loss,
             take_profit=geometry.take_profit,
+            take_profit2=geometry.take_profit2,
             point_size=float(point_size),
+            tp2_enabled=tp2_enabled,
         )
+        sl_pips = rr_metrics["sl_pips"]
+        tp1_pips = rr_metrics["tp1_pips"]
+        tp2_pips = rr_metrics["tp2_pips"]
+        rr_tp1 = rr_metrics["rr_tp1"]
+        rr_tp2 = rr_metrics["rr_tp2"]
+        rr = rr_metrics["rr_used"]
+        rr_checked = rr_metrics["rr_checked"]
+        rr_validate_mode = rr_metrics["rr_validate_mode"]
+
         min_rr = float(self.settings.get("MIN_RR_RATIO", self.settings.get("MIN_RISK_REWARD", 1.0)) or 1.0)
-        rr_ok, rr_reason = engine.validate_rr(rr=rr, min_rr=min_rr, sl_pips=sl_pips, tp1_pips=tp1_pips)
+        self._logger.info(
+            "[RISK][RR_SELECTION] tp2_enabled=%s rr_checked=%s sl_pips=%.2f tp1_pips=%.2f tp2_pips=%.2f rr_tp1=%.4f rr_tp2=%.4f rr_used=%.4f min_rr=%.4f",
+            tp2_enabled,
+            rr_checked,
+            sl_pips,
+            tp1_pips,
+            tp2_pips,
+            rr_tp1,
+            rr_tp2,
+            rr,
+            min_rr,
+        )
+
+        rr_ok, rr_reason = engine.validate_rr(
+            rr=rr,
+            min_rr=min_rr,
+            sl_pips=sl_pips,
+            tp_checked_pips=rr_metrics["tp_checked_pips"],
+            rr_checked=rr_checked,
+        )
         if not rr_ok:
             return engine.build_decision(
                 signal=signal,
@@ -578,8 +681,12 @@ class ScalpingRiskManager:
                 tp2=geometry.take_profit2,
                 sl_pips=sl_pips,
                 tp1_pips=tp1_pips,
-                tp2_pips=geometry.tp2_pips,
+                tp2_pips=tp2_pips,
                 min_rr=min_rr,
+                rr_tp1=rr_tp1,
+                rr_tp2=rr_tp2 if tp2_enabled else None,
+                rr_checked=rr_checked,
+                rr_validate_mode=rr_validate_mode,
             )
 
         account_equity = float(config.get("ACCOUNT_BALANCE") or config.get("account_balance") or 10000.0)
@@ -607,8 +714,12 @@ class ScalpingRiskManager:
                 tp2=geometry.take_profit2,
                 sl_pips=sl_pips,
                 tp1_pips=tp1_pips,
-                tp2_pips=geometry.tp2_pips,
+                tp2_pips=tp2_pips,
                 min_rr=min_rr,
+                rr_tp1=rr_tp1,
+                rr_tp2=rr_tp2 if tp2_enabled else None,
+                rr_checked=rr_checked,
+                rr_validate_mode=rr_validate_mode,
             )
 
         return engine.build_decision(
@@ -624,15 +735,19 @@ class ScalpingRiskManager:
             deviation_pips=deviation_pips,
             decision_notes=[
                 "Deterministic entry policy accepted.",
-                f"RR_TP1={rr:.4f} MIN_RR={min_rr:.4f}",
+                f"RR_VALIDATION level={rr_checked} mode={rr_validate_mode} SL={sl_pips:.2f} TP1={tp1_pips:.2f} TP2={tp2_pips:.2f} RR={rr:.4f} MIN_RR={min_rr:.4f}",
             ],
             is_trade_allowed=True,
             reject_reason=None,
             tp2=geometry.take_profit2,
             sl_pips=sl_pips,
             tp1_pips=tp1_pips,
-            tp2_pips=geometry.tp2_pips,
+            tp2_pips=tp2_pips,
             min_rr=min_rr,
+            rr_tp1=rr_tp1,
+            rr_tp2=rr_tp2 if tp2_enabled else None,
+            rr_checked=rr_checked,
+            rr_validate_mode=rr_validate_mode,
         )
 
     def add_position(self, position_size: float):
