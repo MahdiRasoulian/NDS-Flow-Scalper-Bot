@@ -17,6 +17,8 @@ import queue
 from collections import deque
 from decimal import Decimal
 from contextlib import nullcontext
+import unicodedata
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -437,10 +439,43 @@ class MT5Client:
     def sanitize_mt5_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         sanitized: Dict[str, Any] = {}
         for key, value in request.items():
+            key_name = str(key)
+            if key_name == "comment":
+                sanitized[key_name] = self._sanitize_mt5_comment(value)
+                continue
             if value is None:
                 continue
-            sanitized[str(key)] = self._to_native_value(value)
+            sanitized[key_name] = self._to_native_value(value)
+
+        if "comment" not in sanitized:
+            sanitized["comment"] = "BOT"
         return sanitized
+
+    def _sanitize_mt5_comment(self, comment: Any) -> str:
+        """Normalize request comments to broker-safe ASCII token (max 31 chars)."""
+        if comment is None:
+            text = ""
+        elif isinstance(comment, bytes):
+            text = comment.decode("utf-8", errors="ignore")
+        else:
+            native_comment = self._to_native_value(comment)
+            text = native_comment if isinstance(native_comment, str) else str(native_comment)
+
+        stripped = text.strip()
+        if stripped.lower() in {"", "none", "nan", "null"}:
+            stripped = "BOT"
+
+        normalized = unicodedata.normalize("NFKD", stripped)
+        ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+        printable_ascii = "".join(ch for ch in ascii_only if 32 <= ord(ch) <= 126)
+        compact = " ".join(printable_ascii.split())
+
+        # Some brokers reject spaces/special chars in comment; keep strict token set only.
+        strict = re.sub(r"[^A-Za-z0-9_.-]", "", compact)
+        if not strict:
+            strict = "BOT"
+
+        return str(strict[:31])
 
     def build_order_request(
         self,
@@ -1839,6 +1874,10 @@ class MT5Client:
             sanitized_request = self.sanitize_mt5_request(request_local)
             lock_ctx = getattr(self, "_mt5_lock", None)
             lock_ctx = lock_ctx if lock_ctx is not None else nullcontext()
+            print(
+                f"DEBUG: Final MT5 Request Comment: '{sanitized_request.get('comment')}' "
+                f"(Type: {type(sanitized_request.get('comment'))})"
+            )
             with lock_ctx:
                 result = mt5.order_send(sanitized_request)
 
