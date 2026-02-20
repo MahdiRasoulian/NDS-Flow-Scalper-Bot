@@ -158,7 +158,7 @@ class RiskEngine:
         take_profit2: Optional[float],
         point_size: float,
         tp2_enabled: bool,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Union[float, str]]:
         sl_pips, tp1_pips, rr_tp1 = RiskEngine.compute_rr(
             entry_price=entry_price,
             stop_loss=stop_loss,
