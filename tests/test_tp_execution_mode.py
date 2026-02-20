@@ -45,12 +45,12 @@ def test_tp1_partial_without_tp2_sends_no_tp():
     assert reason == "sl_only_fsm_managed"
 
 
-def test_single_tp_mode_sends_tp1():
+def test_single_tp_mode_sends_no_tp_to_broker():
     finalized = _finalized_with_tp(tp1=2005.0, tp2=None, mode="SINGLE_TP")
     flow_settings = {"FLOW_TRAIL_AFTER_TP1": False, "FLOW_TP1_PARTIAL_CLOSE_PCT": 0.0}
     risk_settings = {"TP2_ENABLED": False}
 
     tp_sent, reason = NDSBot._resolve_broker_tp(finalized, flow_settings, risk_settings)
 
-    assert tp_sent == finalized.take_profit
-    assert reason == "single_tp"
+    assert tp_sent == 0.0
+    assert reason == "sl_only_internal_tp"

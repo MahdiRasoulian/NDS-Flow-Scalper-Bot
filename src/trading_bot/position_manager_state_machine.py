@@ -181,6 +181,7 @@ class PositionManager:
                 return
 
             if plan.status == PositionStatus.STATUS_WAIT_TP2:
+                self._maybe_trail_after_tp1(plan, market_price)
                 if not self._crossed_tp2(plan, market_price):
                     return
                 self._logger.info("[PM][EVENT] TP2 reached ticket=%s price=%.2f", plan.ticket, float(market_price))
@@ -366,6 +367,37 @@ class PositionManager:
         if plan.direction == "BUY":
             return plan.entry_price + offset
         return plan.entry_price - offset
+
+    def _maybe_trail_after_tp1(self, plan: PositionPlan, market_price: float) -> None:
+        flow_settings = self.config.get("flow_settings", {}) if isinstance(self.config, dict) else {}
+        if not bool(flow_settings.get("FLOW_TRAIL_AFTER_TP1", False)):
+            return
+        point_size = self._resolve_point_size()
+        trail_pips = float(flow_settings.get("FLOW_TRAIL_DISTANCE_PIPS", 20.0) or 20.0)
+        trail_distance = pips_to_price(trail_pips, point_size)
+        if trail_distance <= 0:
+            return
+
+        if plan.direction == "BUY":
+            desired_sl = float(market_price) - float(trail_distance)
+            if desired_sl <= plan.sl_price or desired_sl <= plan.entry_price:
+                return
+        else:
+            desired_sl = float(market_price) + float(trail_distance)
+            if desired_sl >= plan.sl_price or desired_sl >= plan.entry_price:
+                return
+
+        if self._modify_sl(plan, desired_sl):
+            self._logger.info(
+                "[PM][TRAIL] ticket=%s direction=%s market=%.2f old_sl=%.2f new_sl=%.2f trail_pips=%.2f",
+                plan.ticket,
+                plan.direction,
+                float(market_price),
+                float(plan.sl_price),
+                float(desired_sl),
+                float(trail_pips),
+            )
+            plan.sl_price = float(desired_sl)
 
     def _crossed_tp1(self, plan: PositionPlan, price: float) -> bool:
         eps = max(self._resolve_point_size() * 0.2, 1e-6)
