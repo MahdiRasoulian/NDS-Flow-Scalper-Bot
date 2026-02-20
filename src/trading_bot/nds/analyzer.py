@@ -2505,16 +2505,16 @@ class GoldNDSAnalyzer:
                         entry_model = "MARKET"
                         entry_reason = "tier=C momentum triggered"
                     else:
-                        entry_model = "STOP"
-                        entry_reason = "tier=C momentum breakout"
+                        entry_model = "MARKET"
+                        entry_reason = "tier=C momentum confirmed"
                 else:
                     entry_level = prev_low - buffer_price
                     if current_price <= entry_level:
                         entry_model = "MARKET"
                         entry_reason = "tier=C momentum triggered"
                     else:
-                        entry_model = "STOP"
-                        entry_reason = "tier=C momentum breakout"
+                        entry_model = "MARKET"
+                        entry_reason = "tier=C momentum confirmed"
 
                 entry_type = "MOMENTUM"
                 entry_source = {
@@ -2580,7 +2580,7 @@ class GoldNDSAnalyzer:
                     float(entry_context.get("dist_usd") or 0.0),
                     float(entry_context.get("dist_atr") or 0.0),
                 )
-            if entry_type == "MOMENTUM" and entry_model == "STOP":
+            if entry_type == "MOMENTUM" and entry_model == "MARKET":
                 max_dist_atr = float(settings.get("FLOW_MOMENTUM_MAX_DIST_ATR", 0.35))
                 max_dist_pips = float(settings.get("FLOW_MOMENTUM_MAX_DIST_PIPS", 60.0))
                 dist_pips = float(entry_context.get("dist_pips") or 0.0)
@@ -4665,7 +4665,7 @@ class GoldNDSAnalyzer:
                     if bottom_f <= float(current_price) <= top_f:
                         idea["entry_model"] = "MARKET"
                     else:
-                        idea["entry_model"] = "STOP"
+                        idea["entry_model"] = "LIMIT"
                 except Exception:
                     pass
 

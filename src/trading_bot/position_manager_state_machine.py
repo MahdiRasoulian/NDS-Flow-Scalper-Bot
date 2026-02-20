@@ -184,6 +184,15 @@ class PositionManager:
                 if not self._crossed_tp2(plan, market_price):
                     return
                 self._logger.info("[PM][EVENT] TP2 reached ticket=%s price=%.2f", plan.ticket, float(market_price))
+                plan.status = PositionStatus.STATUS_CLOSED
+                plan.close_summary = {
+                    "position": plan.ticket,
+                    "resolved": True,
+                    "exit_reason": "TP2_HIT_INTERNAL",
+                    "exit_price": float(market_price),
+                }
+                self._logger.info("[PM][STATE] %s WAIT_TP2 -> CLOSED", plan.ticket)
+                self._plans.pop(plan.ticket, None)
                 return
 
             if plan.status in {PositionStatus.STATUS_CLOSED, PositionStatus.STATUS_FAILED}:
