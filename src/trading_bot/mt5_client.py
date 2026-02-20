@@ -17,6 +17,8 @@ import queue
 from collections import deque
 from decimal import Decimal
 from contextlib import nullcontext
+import unicodedata
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -437,10 +439,72 @@ class MT5Client:
     def sanitize_mt5_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         sanitized: Dict[str, Any] = {}
         for key, value in request.items():
+            key_name = str(key)
+            if key_name == "comment":
+                sanitized[key_name] = self._sanitize_mt5_comment(value)
+                continue
             if value is None:
                 continue
-            sanitized[str(key)] = self._to_native_value(value)
+            sanitized[key_name] = self._to_native_value(value)
+
+        if "comment" not in sanitized:
+            sanitized["comment"] = "BOT"
         return sanitized
+
+    def _sanitize_mt5_comment(self, comment: Any) -> str:
+        """Normalize request comments to broker-safe ASCII token (max 31 chars)."""
+        if comment is None:
+            text = ""
+        elif isinstance(comment, bytes):
+            text = comment.decode("utf-8", errors="ignore")
+        else:
+            native_comment = self._to_native_value(comment)
+            text = native_comment if isinstance(native_comment, str) else str(native_comment)
+
+        stripped = text.strip()
+        if stripped.lower() in {"", "none", "nan", "null"}:
+            stripped = "BOT"
+
+        normalized = unicodedata.normalize("NFKD", stripped)
+        ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+        printable_ascii = "".join(ch for ch in ascii_only if 32 <= ord(ch) <= 126)
+        compact = " ".join(printable_ascii.split())
+
+        # Some brokers reject spaces/special chars in comment; keep strict token set only.
+        strict = re.sub(r"[^A-Za-z0-9_.-]", "", compact)
+        if not strict:
+            strict = "BOT"
+
+        return str(strict[:31])
+
+    def _build_comment_fallback_requests(self, request: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build safe request variants for brokers that reject comment payloads."""
+        base = dict(request or {})
+        variants: List[Dict[str, Any]] = [base]
+
+        if "comment" in base:
+            bot_variant = dict(base)
+            bot_variant["comment"] = "BOT"
+            variants.append(bot_variant)
+
+            empty_variant = dict(base)
+            empty_variant["comment"] = ""
+            variants.append(empty_variant)
+
+            no_comment_variant = dict(base)
+            no_comment_variant.pop("comment", None)
+            variants.append(no_comment_variant)
+
+        deduped: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for variant in variants:
+            marker = repr(sorted(variant.items(), key=lambda item: item[0]))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(variant)
+        return deduped
+
 
     def build_order_request(
         self,
@@ -1839,8 +1903,35 @@ class MT5Client:
             sanitized_request = self.sanitize_mt5_request(request_local)
             lock_ctx = getattr(self, "_mt5_lock", None)
             lock_ctx = lock_ctx if lock_ctx is not None else nullcontext()
-            with lock_ctx:
-                result = mt5.order_send(sanitized_request)
+
+            result = None
+            send_request = sanitized_request
+            for variant in self._build_comment_fallback_requests(sanitized_request):
+                self._logger.debug(
+                    "[MT5][ORDER_SEND][REQUEST] context=%s attempt=%s comment=%r comment_type=%s",
+                    context,
+                    i + 1,
+                    variant.get("comment"),
+                    type(variant.get("comment")).__name__,
+                )
+                with lock_ctx:
+                    variant_result = mt5.order_send(variant)
+
+                if variant_result is not None:
+                    result = variant_result
+                    send_request = variant
+                    break
+
+                last_err = self._mt5_last_error()
+                if str(last_err).find('Invalid "comment" argument') == -1:
+                    break
+                self._logger.warning(
+                    "[MT5][ORDER_SEND][COMMENT_FALLBACK] context=%s attempt=%s variant_comment=%r last_error=%s",
+                    context,
+                    i + 1,
+                    variant.get("comment"),
+                    last_err,
+                )
 
             if result is None:
                 last_err = self._mt5_last_error()
@@ -1883,7 +1974,7 @@ class MT5Client:
                     order=getattr(result, "order", None),
                     price=getattr(result, "price", None),
                     volume=getattr(result, "volume", None),
-                    request_comment=sanitized_request.get("comment"),
+                    request_comment=send_request.get("comment"),
                     magic=sanitized_request.get("magic"),
                 )
 
