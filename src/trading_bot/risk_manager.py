@@ -1,4 +1,4 @@
-"""Deterministic live risk manager (MARKET/LIMIT only)."""
+"""Deterministic live risk manager (MARKET/STOP only)."""
 
 from __future__ import annotations
 
@@ -69,22 +69,22 @@ class RiskEngine:
         point_size: float,
     ) -> Tuple[bool, str, float, str, float]:
         model = str(entry_model or "MARKET").upper()
-        if model == "STOP":
-            return False, "NONE", 0.0, "STOP entry model is disabled in live mode.", 0.0
-
-        if model not in {"MARKET", "LIMIT"}:
+        if model not in {"MARKET", "STOP"}:
+            if model in {"LIMIT", "BUY_LIMIT", "SELL_LIMIT"}:
+                logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+                return False, "NONE", 0.0, "Limit entries are permanently disabled.", 0.0
             model = "MARKET"
 
         if model == "MARKET":
             entry_price = float(market_entry)
         else:
             if planned_entry is None:
-                return False, "NONE", 0.0, "LIMIT entry missing planned_entry.", 0.0
+                return False, "NONE", 0.0, "STOP entry missing planned_entry.", 0.0
             entry_price = float(planned_entry)
-            if signal == "BUY" and entry_price >= market_entry:
-                return False, "NONE", 0.0, "LIMIT BUY must be below market.", 0.0
-            if signal == "SELL" and entry_price <= market_entry:
-                return False, "NONE", 0.0, "LIMIT SELL must be above market.", 0.0
+            if signal == "BUY" and entry_price <= market_entry:
+                return False, "NONE", 0.0, "STOP BUY must be above market.", 0.0
+            if signal == "SELL" and entry_price >= market_entry:
+                return False, "NONE", 0.0, "STOP SELL must be below market.", 0.0
 
         deviation_pips = float(
             calculate_distance_metrics(

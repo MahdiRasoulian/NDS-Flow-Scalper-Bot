@@ -437,6 +437,15 @@ class MT5Client:
         return str(value)
 
     def sanitize_mt5_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        order_type_value = request.get("type") if isinstance(request, dict) else None
+        blocked_limit_types = {
+            getattr(mt5, "ORDER_TYPE_BUY_LIMIT", None),
+            getattr(mt5, "ORDER_TYPE_SELL_LIMIT", None),
+        }
+        if order_type_value in blocked_limit_types:
+            self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+            raise ValueError("Limit order types are permanently disabled")
+
         sanitized: Dict[str, Any] = {}
         for key, value in request.items():
             key_name = str(key)
@@ -523,10 +532,12 @@ class MT5Client:
     ) -> Dict[str, Any]:
         order_action_upper = order_action.upper()
         order_type_upper = order_type.upper()
+        if order_type_upper in {"BUY_LIMIT", "SELL_LIMIT"}:
+            self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+            raise ValueError("Limit order types are permanently disabled")
 
         action_map = {
             "MARKET": mt5.TRADE_ACTION_DEAL,
-            "LIMIT": mt5.TRADE_ACTION_PENDING,
             "STOP": mt5.TRADE_ACTION_PENDING,
         }
         if order_action_upper not in action_map:
@@ -536,10 +547,6 @@ class MT5Client:
             "MARKET": {
                 "BUY": mt5.ORDER_TYPE_BUY,
                 "SELL": mt5.ORDER_TYPE_SELL,
-            },
-            "LIMIT": {
-                "BUY_LIMIT": mt5.ORDER_TYPE_BUY_LIMIT,
-                "SELL_LIMIT": mt5.ORDER_TYPE_SELL_LIMIT,
             },
             "STOP": {
                 "BUY_STOP": mt5.ORDER_TYPE_BUY_STOP,
@@ -605,10 +612,6 @@ class MT5Client:
             return f"BUY_STOP must be >= ask + min_distance ({ask:.5f} + {min_distance:.5f})"
         if order_type == "SELL_STOP" and pending_price > bid - min_distance:
             return f"SELL_STOP must be <= bid - min_distance ({bid:.5f} - {min_distance:.5f})"
-        if order_type == "BUY_LIMIT" and pending_price > bid - min_distance:
-            return f"BUY_LIMIT must be <= bid - min_distance ({bid:.5f} - {min_distance:.5f})"
-        if order_type == "SELL_LIMIT" and pending_price < ask + min_distance:
-            return f"SELL_LIMIT must be >= ask + min_distance ({ask:.5f} + {min_distance:.5f})"
         return None
 
     def _validate_pending_sl_tp(
@@ -1630,64 +1633,9 @@ class MT5Client:
     def send_limit_order(self, symbol: str, order_type: str, volume: float, 
                         limit_price: float, stop_loss: float = None, 
                         take_profit: float = None, comment: str = "") -> Dict[str, Any]:
-        """
-        📌 ارسال سفارش Limit (پندینگ)
-        """
-        if not self.connected:
-            return {'error': 'Not connected to MT5', 'success': False}
-        
-        try:
-            symbol_info = self._get_symbol_info(symbol)
-            if symbol_info is None:
-                return {'error': f'Symbol info not available for {symbol}', 'success': False}
-
-            digits = symbol_info.digits
-            min_distance = self._pending_min_distance(symbol_info)
-
-            tick = self.get_current_tick(symbol)
-            if not tick:
-                return {'error': 'Failed to get real-time price', 'success': False}
-            current_bid = tick.get('bid')
-            current_ask = tick.get('ask')
-            
-            # نرمال‌سازی داده‌ها (Float Conversion)
-            limit_price = float(limit_price)
-            volume = float(volume)
-            normalized_price = self._normalize_price(limit_price, digits)
-            stop_loss = self._normalize_price(stop_loss, digits) if stop_loss else 0.0
-            take_profit = self._normalize_price(take_profit, digits) if take_profit else 0.0
-
-            # ساخت درخواست به صورت دستی برای اطمینان از صحت آرگومان‌ها
-            # نگاشت نوع سفارش
-            mt5_type = mt5.ORDER_TYPE_BUY_LIMIT if order_type.upper() == 'BUY_LIMIT' else mt5.ORDER_TYPE_SELL_LIMIT
-
-            request = {
-                "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": symbol,
-                "volume": volume,
-                "type": mt5_type,
-                "price": normalized_price,
-                "sl": stop_loss,
-                "tp": take_profit,
-                "deviation": 10,
-                "magic": 202402,
-                "comment": f"{comment} | Limit",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_RETURN, # Default filling
-            }
-
-            self._logger.info(
-                "🧾 Pending LIMIT request | symbol=%s type=%s price=%.5f sl=%.5f tp=%.5f",
-                symbol, order_type, normalized_price, stop_loss, take_profit
-            )
-            
-            # ارسال به متد اصلاح شده اجرایی
-            return self._order_send_with_retry(request, symbol, "limit")
-            
-        except Exception as e:
-            error_msg = f"Limit order error: {e}"
-            self._logger.error(error_msg, exc_info=True)
-            return {'error': error_msg, 'success': False}
+        """LIMIT orders are permanently disabled."""
+        self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+        return {'error': 'Limit orders are permanently disabled', 'success': False}
 
     def send_stop_order(self, symbol: str, order_type: str, volume: float, 
                         stop_price: float, stop_loss: float = None, 
@@ -1748,9 +1696,9 @@ class MT5Client:
         ⏳ ارسال سفارش Pending (مستعار برای send_limit_order و send_stop_order)
         """
         if order_type.upper() in ['BUY_LIMIT', 'SELL_LIMIT']:
-            return self.send_limit_order(
-                symbol, order_type, volume, pending_price, stop_loss, take_profit, comment
-            )
+            self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+            self._logger.critical("[EXEC][LEGACY_LIMIT_BLOCKED] order_type=%s symbol=%s", order_type, symbol)
+            return {'error': f'Blocked legacy limit order type: {order_type}', 'success': False}
         elif order_type.upper() in ['BUY_STOP', 'SELL_STOP']:
             return self.send_stop_order(
                 symbol, order_type, volume, pending_price, stop_loss, take_profit, comment
@@ -1781,9 +1729,9 @@ class MT5Client:
                 )
             
             elif order_action_upper == 'LIMIT':
-                if not limit_price:
-                    return {'error': 'Limit price required', 'success': False}
-                return self.send_limit_order(symbol, order_type, volume, limit_price, stop_loss, take_profit, comment)
+                self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+                self._logger.critical("[EXEC][LEGACY_LIMIT_BLOCKED] action=%s type=%s symbol=%s", order_action, order_type, symbol)
+                return {'error': 'Limit orders are permanently disabled', 'success': False}
             
             elif order_action_upper == 'STOP':
                 if not stop_price:
@@ -1791,10 +1739,8 @@ class MT5Client:
                 return self.send_stop_order(symbol, order_type, volume, stop_price, stop_loss, take_profit, comment)
             
             elif order_action_upper == 'STOP_LIMIT':
-                self._logger.warning("⚠️ MT5 native STOP_LIMIT not implemented perfectly, using STOP order fallback")
-                if not stop_price:
-                     return {'error': 'Stop price required', 'success': False}
-                return self.send_stop_order(symbol, order_type, volume, stop_price, stop_loss, take_profit, f"{comment} | Stop-Limit Fallback")
+                self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+                return {'error': 'STOP_LIMIT is not supported', 'success': False}
             
             else:
                 return {'error': f'Invalid order action: {order_action}', 'success': False}
@@ -1900,6 +1846,14 @@ class MT5Client:
             pass
 
         for i in range(max_retries):
+            order_type_value = request_local.get("type")
+            blocked_limit_types = {
+                getattr(mt5, "ORDER_TYPE_BUY_LIMIT", None),
+                getattr(mt5, "ORDER_TYPE_SELL_LIMIT", None),
+            }
+            if order_type_value in blocked_limit_types:
+                self._logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+                raise ValueError("Blocked limit order request in order_send wrapper")
             sanitized_request = self.sanitize_mt5_request(request_local)
             lock_ctx = getattr(self, "_mt5_lock", None)
             lock_ctx = lock_ctx if lock_ctx is not None else nullcontext()
@@ -2111,8 +2065,6 @@ class MT5Client:
         type_map = {
             mt5.ORDER_TYPE_BUY: 'BUY',
             mt5.ORDER_TYPE_SELL: 'SELL',
-            mt5.ORDER_TYPE_BUY_LIMIT: 'BUY_LIMIT',
-            mt5.ORDER_TYPE_SELL_LIMIT: 'SELL_LIMIT',
             mt5.ORDER_TYPE_BUY_STOP: 'BUY_STOP',
             mt5.ORDER_TYPE_SELL_STOP: 'SELL_STOP',
             mt5.ORDER_TYPE_BUY_STOP_LIMIT: 'BUY_STOP_LIMIT',

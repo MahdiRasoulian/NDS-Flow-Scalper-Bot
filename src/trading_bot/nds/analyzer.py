@@ -2290,14 +2290,14 @@ class GoldNDSAnalyzer:
                 front_edge = zone_top + buffer_price
                 conservative_level = zone_top - (zone_width * depth_ratio)
                 if setup_score >= aggressive_thr:
-                    return "LIMIT", float(front_edge), f"aggressive_limit_front_run_setup_score:{setup_score:.2f}", False
-                return "LIMIT", float(conservative_level), f"conservative_limit_depth_setup_score:{setup_score:.2f}", False
+                    return "STOP", float(front_edge), f"aggressive_stop_breakout_setup_score:{setup_score:.2f}", False
+                return "STOP", float(conservative_level), f"conservative_stop_depth_setup_score:{setup_score:.2f}", False
 
             front_edge = zone_bottom - buffer_price
             conservative_level = zone_bottom + (zone_width * depth_ratio)
             if setup_score >= aggressive_thr:
-                return "LIMIT", float(front_edge), f"aggressive_limit_front_run_setup_score:{setup_score:.2f}", False
-            return "LIMIT", float(conservative_level), f"conservative_limit_depth_setup_score:{setup_score:.2f}", False
+                return "STOP", float(front_edge), f"aggressive_stop_breakout_setup_score:{setup_score:.2f}", False
+            return "STOP", float(conservative_level), f"conservative_stop_depth_setup_score:{setup_score:.2f}", False
 
         brk_max_dist = float(settings.get("BRK_MAX_DIST_ATR", 0.5))
         brk_max_age = int(settings.get("BRK_MAX_AGE_BARS", 60))
@@ -4665,7 +4665,7 @@ class GoldNDSAnalyzer:
                     if bottom_f <= float(current_price) <= top_f:
                         idea["entry_model"] = "MARKET"
                     else:
-                        idea["entry_model"] = "LIMIT"
+                        idea["entry_model"] = "STOP"
                 except Exception:
                     pass
 

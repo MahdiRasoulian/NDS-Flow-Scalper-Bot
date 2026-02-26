@@ -40,8 +40,7 @@ def test_blocks_when_open_and_pending_same_direction(monkeypatch):
         "get_pending_orders_info",
         lambda: [
             {"ticket": 10, "type": "BUY_STOP"},
-            {"ticket": 11, "type": "BUY_LIMIT"},
-            {"ticket": 12, "type": "BUY_STOP"},
+                        {"ticket": 12, "type": "BUY_STOP"},
         ],
     )
 
