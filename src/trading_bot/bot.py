@@ -2327,18 +2327,13 @@ class NDSBot:
                         comment=order_comment,
                     )
             elif str(order_type).lower() == "stop":
-                logger.error("[EXEC][ORDER_TYPE_ERROR] STOP intent reached broker router")
-                return False
-            else:
-                # Limit/Pending
-                limit_order_type = f"{signal_data['signal']}_LIMIT"  # BUY_LIMIT / SELL_LIMIT
-
-                if hasattr(self.mt5_client, "send_limit_order"):
-                    order_result = self.mt5_client.send_limit_order(
+                stop_order_type = f"{signal_data['signal']}_STOP"
+                if hasattr(self.mt5_client, "send_stop_order"):
+                    order_result = self.mt5_client.send_stop_order(
                         symbol=SYMBOL,
-                        order_type=limit_order_type,
+                        order_type=stop_order_type,
                         volume=lot_size,
-                        limit_price=finalized.entry_price,
+                        stop_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
                         comment=order_comment,
@@ -2346,7 +2341,7 @@ class NDSBot:
                 elif hasattr(self.mt5_client, "send_pending_order"):
                     order_result = self.mt5_client.send_pending_order(
                         symbol=SYMBOL,
-                        order_type=limit_order_type,
+                        order_type=stop_order_type,
                         volume=lot_size,
                         pending_price=finalized.entry_price,
                         stop_loss=finalized.stop_loss,
@@ -2356,13 +2351,17 @@ class NDSBot:
                 else:
                     order_result = self.mt5_client.send_order(
                         symbol=SYMBOL,
-                        order_type=limit_order_type,
+                        order_type=stop_order_type,
                         volume=lot_size,
                         stop_loss=finalized.stop_loss,
                         take_profit=tp_sent_to_broker,
                         comment=order_comment,
-                        order_action="LIMIT",
+                        order_action="STOP",
                     )
+            else:
+                logger.error("LIMIT ORDER PATH SHOULD NOT EXIST")
+                logger.critical("[EXEC][ORDER_TYPE_BLOCK] blocked_order_type=%s", order_type)
+                return False
 
             # ارزیابی نتیجه
             success = False

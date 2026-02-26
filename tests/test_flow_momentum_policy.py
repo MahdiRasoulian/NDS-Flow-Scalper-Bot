@@ -250,8 +250,8 @@ def test_flow_execution_high_setup_score_uses_aggressive_limit():
         log_decisions=False,
     )
 
-    assert entry["entry_model"] == "LIMIT"
-    assert "aggressive_limit_front_run" in entry["entry_reason"]
+    assert entry["entry_model"] == "STOP"
+    assert "aggressive_stop_breakout" in entry["entry_reason"]
 
 
 def test_flow_execution_mid_setup_score_waits_for_confirmation_and_skips_momo():
